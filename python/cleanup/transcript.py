@@ -31,6 +31,10 @@ def _segment_words_from_tokens(segment) -> list[dict] | None:
 
     usable = []
     for token in tokens:
+        # Some servers report tokens as bare ids rather than objects; there is
+        # no timing to recover from those.
+        if not isinstance(token, dict):
+            return None
         text = token.get("text", "")
         if _is_special(text) or not text.strip():
             continue
@@ -88,13 +92,24 @@ def _segment_words_by_proportion(segment) -> list[dict]:
 
 
 def parse_whisper_json(path: str, participant: str) -> dict:
-    """Read a whisper JSON file into {participant, language, segments, words}."""
+    """Read a whisper-cli JSON file into {participant, language, segments, words}."""
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
 
-    raw_segments = data.get("transcription") or []
-    language = (data.get("result") or {}).get("language", "")
+    return build_from_segments(
+        data.get("transcription") or [],
+        participant,
+        (data.get("result") or {}).get("language", ""),
+    )
 
+
+def build_from_segments(raw_segments, participant: str, language: str = "") -> dict:
+    """Assemble words and segments from raw whisper segments.
+
+    Segments carry millisecond `offsets` and optionally a `tokens` list. This is
+    the shape whisper-cli writes; the remote client in `asr.py` converts a
+    server's response into it, so both paths reassemble words identically.
+    """
     segments: list[dict] = []
     words: list[dict] = []
     approximated = 0

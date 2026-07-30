@@ -59,6 +59,20 @@ duration_of() {
     ffprobe -v error -show_entries format=duration -of csv=p=0 "$1"
 }
 
+# peak_db <file> <start> <end> — peak level in dB over one window. Digital
+# silence reports as -inf or -91; both are normalised to a very low number.
+peak_db() {
+    local out
+    out=$(ffmpeg -v info -nostdin -i "$1" \
+        -af "atrim=start=$2:end=$3,volumedetect" -f null - 2>&1 |
+        sed -n 's/.*max_volume: \(-\?[0-9.a-z]*\) dB.*/\1/p' | tail -1)
+    [[ -z "$out" || "$out" == *inf* ]] && out="-999"
+    printf '%s' "$out"
+}
+
+quieter_than() { awk -v v="$1" -v t="$2" 'BEGIN{exit !(v < t)}'; }
+louder_than()  { awk -v v="$1" -v t="$2" 'BEGIN{exit !(v > t)}'; }
+
 json_number() {  # json_number <file> <dotted.path>
     python3 -c '
 import json, sys
@@ -410,19 +424,6 @@ if [[ -s "$OUT6/alice.flac" && -s "$OUT6/bob.flac" ]]; then
     check "bob keeps his original length"   approx "$D6B" 20 0.05
     fail_note "alice=${D6A}s bob=${D6B}s (input was 20s)"
 
-    # peak_db <file> <start> <end> — peak level in dB over one window.
-    peak_db() {
-        local out
-        out=$(ffmpeg -v info -nostdin -i "$1" \
-            -af "atrim=start=$2:end=$3,volumedetect" -f null - 2>&1 |
-            sed -n 's/.*max_volume: \(-\?[0-9.a-z]*\) dB.*/\1/p' | tail -1)
-        [[ -z "$out" || "$out" == *inf* ]] && out="-999"
-        printf '%s' "$out"
-    }
-
-    quieter_than() { awk -v v="$1" -v t="$2" 'BEGIN{exit !(v < t)}'; }
-    louder_than()  { awk -v v="$1" -v t="$2" 'BEGIN{exit !(v > t)}'; }
-
     ALICE_MUTED=$(peak_db "$OUT6/alice.flac" 4.95 5.55)
     ALICE_BEFORE=$(peak_db "$OUT6/alice.flac" 1.0 3.0)
     BOB_SAME_SPOT=$(peak_db "$OUT6/bob.flac" 5.0 5.5)
@@ -445,6 +446,181 @@ if "acho" not in alice:
     sys.exit(1)
 ' "$OUT6/ep006_transcript.json"
 fi
+
+# ============================================================================
+printf '\n%sCase 7: the full pipeline against remote Whisper and remote LLM%s\n' \
+    "$BOLD" "$RESET"
+# ============================================================================
+#
+# All eight stages, with both models served over HTTP by stubs. This is the only
+# case that exercises the remote transcription client and the LLM detection
+# client, and the same crosstalk scenario as case 6 rides along on top: a
+# repetition Alice makes while Bob is talking has to end up muted, not cut.
+
+CASE7="$SANDBOX/case7"
+build_episode ep007 "$CASE7/incoming" 'between(t,0,20)' 'between(t,4,6)' 20
+
+# whisper-server verbose_json, one word per segment (what max_len=1 produces).
+cat >"$SANDBOX/whisper-replies.json" <<'EOF'
+[
+  {"task": "transcribe", "language": "pt", "duration": 20.0,
+   "text": " a eu eu acho",
+   "segments": [
+     {"id": 0, "start": 3.00, "end": 3.20, "text": " a"},
+     {"id": 1, "start": 5.00, "end": 5.25, "text": " eu"},
+     {"id": 2, "start": 5.25, "end": 5.50, "text": " eu"},
+     {"id": 3, "start": 7.00, "end": 7.50, "text": " acho"}
+   ]},
+  {"task": "transcribe", "language": "pt", "duration": 20.0,
+   "text": " sim",
+   "segments": [
+     {"id": 0, "start": 4.50, "end": 5.00, "text": " sim"}
+   ]}
+]
+EOF
+
+# The model's replies, in the order the tracks are processed (alice, then bob).
+cat >"$SANDBOX/llama-replies.json" <<'EOF'
+[
+  {"edits": [{"first": 1, "last": 2, "kind": "repetition", "confidence": 0.95}]},
+  {"edits": []}
+]
+EOF
+
+start_stub() {  # start_stub <role> <responses> <port-file> <request-log>
+    python3 "$ROOT/tests/stub_servers.py" "$1" \
+        --responses "$2" --port-file "$3" --request-log "$4" \
+        >>"$SANDBOX/stubs.log" 2>&1 &
+    printf '%s' "$!"
+}
+
+wait_for_port_file() {
+    local file="$1" waited=0
+    while [[ ! -f "$file" ]] && (( waited < 100 )); do
+        sleep 0.05
+        waited=$(( waited + 1 ))
+    done
+    [[ -f "$file" ]]
+}
+
+W_PORT_FILE="$SANDBOX/whisper.port"
+L_PORT_FILE="$SANDBOX/llama.port"
+W_PID=$(start_stub whisper "$SANDBOX/whisper-replies.json" "$W_PORT_FILE" "$SANDBOX/whisper-requests.jsonl")
+L_PID=$(start_stub llama "$SANDBOX/llama-replies.json" "$L_PORT_FILE" "$SANDBOX/llama-requests.jsonl")
+stop_stubs() { kill "$W_PID" "$L_PID" 2>/dev/null || true; }
+trap 'stop_stubs; cleanup' EXIT
+
+if wait_for_port_file "$W_PORT_FILE" && wait_for_port_file "$L_PORT_FILE"; then
+    check "stub servers started" true
+else
+    check "stub servers started" false
+    fail_note "$(cat "$SANDBOX/stubs.log" 2>/dev/null)"
+fi
+
+WHISPER_URL="http://127.0.0.1:$(cat "$W_PORT_FILE")"
+LLAMA_URL="http://127.0.0.1:$(cat "$L_PORT_FILE")"
+
+if "$ROOT/clean-podcast.sh" \
+    --input "$CASE7/incoming" --output "$CASE7/output" --work "$CASE7/work" \
+    --config "$CONF" --keep-work --quiet \
+    --whisper-endpoint "$WHISPER_URL" --llama-endpoint "$LLAMA_URL" \
+    >"$SANDBOX/case7.stdout" 2>&1
+then
+    check "pipeline completed with both models remote" true
+else
+    check "pipeline completed with both models remote" false
+    fail_note "$(tail -n 30 "$SANDBOX/case7.stdout")"
+fi
+
+WORK7="$CASE7/work/ep007"
+OUT7="$CASE7/output/ep007"
+
+check "no local whisper or llama process was needed" bash -c \
+    '! grep -qE "whisper-cli not found|llama-server not found" "$1"' _ \
+    "$SANDBOX/case7.stdout"
+
+check "audio was uploaded as multipart with a file part" python3 -c '
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+if len(rows) != 2:
+    print(f"expected 2 uploads (one per track), got {len(rows)}")
+    sys.exit(1)
+for row in rows:
+    if "multipart/form-data" not in row["content_type"]:
+        print("not multipart:", row["content_type"])
+        sys.exit(1)
+    if not row["has_file_part"]:
+        print("no file part in upload", row)
+        sys.exit(1)
+    if "response_format" not in row["fields"]:
+        print("response_format was not sent:", row["fields"])
+        sys.exit(1)
+    # 20 s of 16 kHz mono 16-bit is ~640 KB; anything tiny means the audio
+    # never made it into the body.
+    if row["length"] < 500_000:
+        print("upload suspiciously small, bytes:", row["length"])
+        sys.exit(1)
+' "$SANDBOX/whisper-requests.jsonl"
+
+check "remote segments became word timings" python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+texts = [w["text"] for w in data["words"]]
+if texts != ["a", "eu", "eu", "acho"]:
+    print("unexpected words:", texts)
+    sys.exit(1)
+spans = [(w["start"], w["end"]) for w in data["words"]]
+if spans != [(3.0, 3.2), (5.0, 5.25), (5.25, 5.5), (7.0, 7.5)]:
+    print("timings did not survive the round trip:", spans)
+    sys.exit(1)
+' "$WORK7/words/alice.words.json"
+
+check "the LLM was asked with a JSON schema" python3 -c '
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+if not rows:
+    print("the llama endpoint was never called")
+    sys.exit(1)
+payload = rows[0]["payload"]
+if "json_schema" not in payload:
+    print("no json_schema in the request:", sorted(payload))
+    sys.exit(1)
+if "eu" not in payload["prompt"]:
+    print("the transcript did not reach the prompt")
+    sys.exit(1)
+' "$SANDBOX/llama-requests.jsonl"
+
+if [[ -f "$WORK7/plan.json" ]]; then
+    check "the remote finding became a mute on alice only" python3 -c '
+import json, sys
+plan = json.load(open(sys.argv[1]))
+if plan["cuts"]:
+    print("expected no cuts at all, got:", plan["cuts"])
+    sys.exit(1)
+if len(plan["mutes"]["alice"]) != 1 or plan["mutes"]["bob"]:
+    print("mutes are wrong:", plan["mutes"])
+    sys.exit(1)
+mute = plan["mutes"]["alice"][0]
+if abs(mute["start"] - 4.9) > 0.001 or abs(mute["end"] - 5.6) > 0.001:
+    print("mute is", mute["start"], "-", mute["end"], "expected 4.9-5.6")
+    sys.exit(1)
+' "$WORK7/plan.json"
+fi
+
+if [[ -s "$OUT7/alice.flac" && -s "$OUT7/bob.flac" ]]; then
+    D7A=$(duration_of "$OUT7/alice.flac")
+    D7B=$(duration_of "$OUT7/bob.flac")
+    check "both tracks keep their original length" approx "$D7A" "$D7B" 0.0005
+    check "length is unchanged at 20 s" approx "$D7A" 20 0.05
+    A7_MUTED=$(peak_db "$OUT7/alice.flac" 4.95 5.55)
+    B7_SAME=$(peak_db "$OUT7/bob.flac" 5.0 5.5)
+    check "alice is silent across the muted span" quieter_than "$A7_MUTED" -60
+    check "bob is unaffected at the same instant"  louder_than  "$B7_SAME" -20
+    fail_note "alice muted=${A7_MUTED}dB bob=${B7_SAME}dB"
+fi
+
+stop_stubs
+trap cleanup EXIT
 
 # ============================================================================
 

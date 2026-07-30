@@ -328,7 +328,12 @@ stage_vad() {
 # ============================================================================
 
 stage_transcribe() {
-    stage_begin transcribe "transcribing with Whisper"
+    if [[ -n "$WHISPER_ENDPOINT" ]]; then
+        stage_transcribe_remote
+        return $?
+    fi
+
+    stage_begin transcribe "transcribing with Whisper (local)"
     config_need_whisper
 
     local -a markers=()
@@ -385,6 +390,56 @@ stage_transcribe() {
     log_ok "all Whisper processes have exited; memory released"
     state_mark transcribe
     stage_end "${#PARTICIPANTS[@]} tracks transcribed"
+}
+
+# Transcription against a whisper-server someone else is running. No local
+# process, so nothing to serialise against the LLM stage on this machine.
+stage_transcribe_remote() {
+    stage_begin transcribe "transcribing via $WHISPER_ENDPOINT"
+    config_need_python
+
+    if [[ "$DRY_RUN" != 1 ]]; then
+        py whisper-wait --endpoint "$WHISPER_ENDPOINT" \
+            --path "$WHISPER_ENDPOINT_PATH" --timeout 60 \
+            || die "the whisper endpoint at $WHISPER_ENDPOINT is not reachable"
+    fi
+
+    local participant target wav index=0
+    local total="${#PARTICIPANTS[@]}"
+
+    for participant in "${PARTICIPANTS[@]}"; do
+        index=$(( index + 1 ))
+        target="$WORK/words/$participant.words.json"
+        wav="$WORK/prep/$participant.wav"
+
+        if [[ -s "$target" && -f "$STAGE_DIR/asr-$participant.ok" ]]; then
+            log_debug "$participant already transcribed"
+            continue
+        fi
+        [[ -s "$wav" || "$DRY_RUN" == 1 ]] || die "missing prepared track: $wav"
+
+        log_info "whisper (remote): $participant ($index/$total)"
+        local -a args=(
+            transcribe-remote
+            --wav "$wav" --participant "$participant" --out "$target"
+            --endpoint "$WHISPER_ENDPOINT" --path "$WHISPER_ENDPOINT_PATH"
+            --vad "$WORK/vad/$participant.json"
+            --chunk-seconds "$WHISPER_CHUNK_SECONDS"
+            --language "$WHISPER_LANG"
+            --request-timeout "$WHISPER_REQUEST_TIMEOUT"
+        )
+        if [[ "$DRY_RUN" == 1 ]]; then
+            run py "${args[@]}"
+        else
+            run_streaming parse_python_progress "$participant" \
+                "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}" \
+                || die "remote transcription failed for $participant"
+            state_touch "$STAGE_DIR/asr-$participant.ok"
+        fi
+    done
+
+    state_mark transcribe
+    stage_end "$total tracks transcribed remotely"
 }
 
 # ============================================================================

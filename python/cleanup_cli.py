@@ -21,7 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cleanup import intervals as iv  # noqa: E402
-from cleanup import llm, plan as planner, render, transcript as tr, vad  # noqa: E402
+from cleanup import asr, llm, plan as planner, render, transcript as tr, vad  # noqa: E402
 
 
 def _read_json(path):
@@ -192,6 +192,55 @@ def cmd_words(args):
 
 
 # --- detection ----------------------------------------------------------------
+
+
+def cmd_transcribe_remote(args):
+    speech = None
+    if args.vad and os.path.isfile(args.vad):
+        speech = [tuple(span) for span in _read_json(args.vad)["speech"]]
+
+    client = asr.WhisperClient(
+        args.endpoint, timeout=args.request_timeout, path=args.path
+    )
+    parsed = asr.transcribe(
+        client,
+        args.wav,
+        args.participant,
+        language=args.language,
+        chunk_seconds=args.chunk_seconds,
+        speech=speech,
+        temperature=args.temperature,
+        on_progress=_progress,
+    )
+    _write_json(args.out, parsed)
+
+    words, segments = len(parsed["words"]), len(parsed["segments"])
+    print(
+        f"{words} words in {segments} segments over {parsed['chunks']} chunk(s)"
+    )
+    if parsed["approximated_segments"]:
+        # Worth saying plainly: it decides how tightly a stutter can be cut.
+        share = parsed["approximated_segments"] / max(segments, 1)
+        detail = (
+            f"{parsed['approximated_segments']}/{segments} segments arrived without "
+            "per-token timings"
+        )
+        if words and words / max(segments, 1) < 1.5:
+            print(f"note: {detail}, but they are one word each, so timings are exact")
+        else:
+            print(
+                f"warning: {detail} ({share * 100:.0f}%), so word positions inside "
+                "them are interpolated and cuts will be less tight. A local "
+                "whisper-cli run, or a server build that honours max_len, gives "
+                "better boundaries."
+            )
+
+
+def cmd_whisper_wait(args):
+    client = asr.WhisperClient(args.endpoint, path=args.path)
+    if not client.wait_until_ready(args.timeout):
+        raise SystemExit(1)
+    print("whisper endpoint reachable")
 
 
 def cmd_llm_wait(args):
@@ -428,6 +477,27 @@ def build_parser():
     p.add_argument("--participant", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_words)
+
+    p = sub.add_parser(
+        "transcribe-remote", help="transcribe a track via a whisper-server endpoint"
+    )
+    p.add_argument("--wav", required=True)
+    p.add_argument("--participant", required=True)
+    p.add_argument("--endpoint", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--vad", help="VAD result, used to place chunk boundaries in silence")
+    p.add_argument("--chunk-seconds", type=float, default=600.0)
+    p.add_argument("--language", default="auto")
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--request-timeout", type=float, default=1800.0)
+    p.add_argument("--path", default="/inference")
+    p.set_defaults(func=cmd_transcribe_remote)
+
+    p = sub.add_parser("whisper-wait", help="check a whisper endpoint is reachable")
+    p.add_argument("--endpoint", required=True)
+    p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument("--path", default="/inference")
+    p.set_defaults(func=cmd_whisper_wait)
 
     p = sub.add_parser("llm-wait", help="block until the llama endpoint is ready")
     p.add_argument("--endpoint", required=True)

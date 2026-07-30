@@ -20,6 +20,17 @@ config_defaults() {
     : "${TRACK_SEPARATOR:=_}"
 
     # Whisper ---------------------------------------------------------------
+    # WHISPER_ENDPOINT: when set, transcription is sent to that whisper-server
+    # instead of running whisper-cli locally, and no local process is managed.
+    # Independent of how the LLM stage is served: local Whisper with a remote
+    # llama, or the reverse, are both fine.
+    : "${WHISPER_ENDPOINT:=}"
+    : "${WHISPER_ENDPOINT_PATH:=/inference}"
+    # Audio is uploaded in chunks of this many seconds (0 sends the whole
+    # track). Boundaries are nudged into silence found by the VAD stage.
+    : "${WHISPER_CHUNK_SECONDS:=600}"
+    : "${WHISPER_REQUEST_TIMEOUT:=1800}"
+
     : "${WHISPER_BIN:=/opt/whisper.cpp/bin/whisper-cli}"
     : "${WHISPER_MODEL:=/srv/llm/models/whisper/ggml-large-v3-turbo.bin}"
     : "${WHISPER_THREADS:=$(nproc 2>/dev/null || echo 4)}"
@@ -156,7 +167,8 @@ config_validate() {
     local v
     for v in SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \
              MUTE_FADE LLM_MAX_EDIT_SECONDS LLM_MIN_CONFIDENCE DURATION_TOLERANCE \
-             SILERO_THRESHOLD MAX_CUT_FRACTION VAD_MIN_SILENCE; do
+             SILERO_THRESHOLD MAX_CUT_FRACTION VAD_MIN_SILENCE \
+             WHISPER_CHUNK_SECONDS WHISPER_REQUEST_TIMEOUT; do
         _require_number "$v"
     done
     for v in LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP LLM_MAX_EDIT_WORDS WHISPER_JOBS \
@@ -203,10 +215,38 @@ config_need_ffmpeg() {
 }
 
 config_need_whisper() {
+    if [[ -n "$WHISPER_ENDPOINT" ]]; then
+        log_debug "whisper: using remote endpoint $WHISPER_ENDPOINT"
+        return 0
+    fi
     [[ -n "${WHISPER:-}" ]] && return 0
-    WHISPER=$(require_bin whisper-cli "$WHISPER_BIN") || exit 1
-    [[ -f "$WHISPER_MODEL" ]] || die "Whisper model not found: $WHISPER_MODEL"
+    # A dry run is a preview, so a missing model is reported and stepped over
+    # rather than being the end of it. ffmpeg and python3 stay hard
+    # requirements — nothing can be previewed without them.
+    if ! WHISPER=$(require_bin whisper-cli "$WHISPER_BIN"); then
+        [[ "$DRY_RUN" == 1 ]] || exit 1
+        WHISPER="$WHISPER_BIN"
+        log_warn "dry run: carrying on without whisper-cli"
+    fi
+    if [[ ! -f "$WHISPER_MODEL" ]]; then
+        [[ "$DRY_RUN" == 1 ]] || die "Whisper model not found: $WHISPER_MODEL"
+        log_warn "dry run: no Whisper model at $WHISPER_MODEL"
+    fi
     log_debug "whisper: $WHISPER ($(basename "$WHISPER_MODEL"))"
+}
+
+# Which halves of the run this script is responsible for keeping out of memory's
+# way. Anything remote is the other machine's problem, and worth saying so.
+config_describe_models() {
+    local whisper_where llama_where
+    [[ -n "$WHISPER_ENDPOINT" ]] && whisper_where="remote" || whisper_where="local"
+    [[ -n "$LLAMA_ENDPOINT" ]] && llama_where="remote" || llama_where="local"
+    log_info "Whisper: $whisper_where${WHISPER_ENDPOINT:+ ($WHISPER_ENDPOINT)}   LLM: $llama_where${LLAMA_ENDPOINT:+ ($LLAMA_ENDPOINT)}"
+    if [[ "$whisper_where" == local && "$llama_where" == local ]]; then
+        log_debug "both models are local, so this run serialises them itself"
+    elif [[ "$whisper_where" == remote && "$llama_where" == remote ]]; then
+        log_warn "both models are remote: if they share a machine, keeping them from overlapping in memory is that machine's business, not this script's"
+    fi
 }
 
 config_need_llama() {
@@ -215,8 +255,15 @@ config_need_llama() {
         return 0
     fi
     [[ -n "${LLAMA_SERVER:-}" ]] && return 0
-    LLAMA_SERVER=$(require_bin llama-server "$LLAMA_SERVER_BIN") || exit 1
-    [[ -f "$LLAMA_MODEL" ]] || die "llama model not found: $LLAMA_MODEL"
+    if ! LLAMA_SERVER=$(require_bin llama-server "$LLAMA_SERVER_BIN"); then
+        [[ "$DRY_RUN" == 1 ]] || exit 1
+        LLAMA_SERVER="$LLAMA_SERVER_BIN"
+        log_warn "dry run: carrying on without llama-server"
+    fi
+    if [[ ! -f "$LLAMA_MODEL" ]]; then
+        [[ "$DRY_RUN" == 1 ]] || die "llama model not found: $LLAMA_MODEL"
+        log_warn "dry run: no llama model at $LLAMA_MODEL"
+    fi
     log_debug "llama: $LLAMA_SERVER ($(basename "$LLAMA_MODEL"))"
 }
 
@@ -231,6 +278,8 @@ config_dump() {
     local v
     log_debug "config file: ${CONFIG_FILE:-<none, using defaults>}"
     for v in INPUT_DIR OUTPUT_DIR WORK_ROOT FAILED_DIR TRACK_EXT TRACK_SEPARATOR \
+             WHISPER_ENDPOINT WHISPER_ENDPOINT_PATH WHISPER_CHUNK_SECONDS \
+             WHISPER_REQUEST_TIMEOUT \
              WHISPER_BIN WHISPER_MODEL WHISPER_THREADS WHISPER_LANG WHISPER_JOBS \
              LLAMA_ENDPOINT LLAMA_SERVER_BIN LLAMA_MODEL LLAMA_HOST LLAMA_PORT \
              LLAMA_CTX LLAMA_NGL VAD_BACKEND SILENCE_THRESHOLD SILERO_THRESHOLD \

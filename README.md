@@ -38,14 +38,41 @@ entirely, so the edit keeps its breathing room instead of sounding gasped.
 | --- | --- | --- |
 | ffmpeg + ffprobe | everything | the only hard dependency |
 | python3 | everything | standard library only |
-| whisper.cpp (`whisper-cli`) | the `transcribe` stage | plus a ggml model |
-| llama.cpp (`llama-server`) | the `detect` stage | plus a GGUF model |
+| whisper.cpp | the `transcribe` stage | `whisper-cli` locally, or a `whisper-server` endpoint |
+| llama.cpp | the `detect` stage | `llama-server` locally, or an endpoint |
 | torch + `silero-vad` | only for `VAD_BACKEND=silero` | optional |
 
-Whisper and llama.cpp are **never resident at the same time**. Every track is
-transcribed and each Whisper process exits before a model is loaded for
-detection, and the llama server is shut down before rendering begins — so the
-peak memory of a run is whichever single model is largest, not their sum.
+## Where the models run
+
+Whisper and the LLM are configured independently, so all four combinations work:
+
+| | local Whisper | remote Whisper |
+| --- | --- | --- |
+| **local LLM** | both managed here | `--whisper-endpoint URL` |
+| **remote LLM** | `--llama-endpoint URL` | both endpoints |
+
+Local means the binary is run here and its lifetime is managed here. Remote means
+an endpoint is used as-is and no process is ever spawned or stopped. Config keys
+are `WHISPER_ENDPOINT` and `LLAMA_ENDPOINT` — empty for local; `--local-whisper`
+and `--local-llama` force local for one run when the config names an endpoint.
+Every run prints which arrangement it is using.
+
+**Memory.** When both are local they are **never resident at the same time**:
+every track is transcribed and each Whisper process exits before a model is
+loaded for detection, and the llama server is shut down before rendering begins,
+so peak memory is whichever single model is largest rather than their sum. That
+guarantee only covers processes this script manages — if both endpoints are
+remote and share a machine, keeping them out of each other's way is that
+machine's business, and the run says so.
+
+**One caveat on remote Whisper.** Word timings are only as good as what the
+server returns. A build honouring `max_len=1` returns one word per segment and
+the timings are exact; one that ignores it returns sentence segments, and word
+positions inside them are interpolated, which makes stutter cuts less tight. The
+run warns when that happens. Local `whisper-cli` always gives per-token timings.
+Audio is uploaded in chunks (`WHISPER_CHUNK_SECONDS`, 0 for one request), with
+boundaries nudged onto silence the VAD stage already found so no chunk edge lands
+inside a word.
 
 ## Setup
 
@@ -129,6 +156,9 @@ clean-podcast.sh --dry-run                        # show the commands, touch not
 clean-podcast.sh --list-stages
 ```
 
+A note on `transcribe` and `detect`: their stage boundary is also the memory
+boundary when both models are local, so re-running only one of them is safe.
+
 ## How the LLM stage is kept honest
 
 A model asked for timestamps will confidently invent them. So it never sees or
@@ -168,8 +198,8 @@ word, so padding cannot eat into real speech.
 ## Tests
 
 ```sh
-python3 tests/test_pipeline.py    # 53 unit tests, no external tools needed
-./tests/selftest.sh               # 35 end-to-end checks, needs only ffmpeg
+python3 tests/test_pipeline.py    # 85 unit tests, no external tools needed
+./tests/selftest.sh               # 46 end-to-end checks, needs only ffmpeg
 ```
 
 The unit tests cover the interval algebra, transcript parsing, LLM response
@@ -184,8 +214,10 @@ other things it confirms that a stutter over crosstalk leaves both tracks exactl
 their original length, that the affected track is silent across the muted span,
 and that the *other* speaker's audio at that same instant is untouched.
 
-Whisper and llama.cpp are out of scope for both — their stages are left out
-rather than stubbed, so run one real episode with `--keep-work` the first time.
+Its last case runs all eight stages against stub HTTP servers standing in for
+whisper-server and llama-server, which covers the remote clients, the multipart
+upload, and the response handling. Real models are still never exercised, so run
+one real episode with `--keep-work` the first time.
 
 ## Layout
 
@@ -198,9 +230,12 @@ python/cleanup_cli.py         subcommands the shell calls
 python/cleanup/intervals.py   interval algebra and timeline remapping
 python/cleanup/vad.py         silencedetect parsing and Silero
 python/cleanup/transcript.py  Whisper tokens to words
+python/cleanup/asr.py         remote whisper-server client and chunking
 python/cleanup/llm.py         chunking, prompting, response validation
 python/cleanup/plan.py        the cut-versus-mute decision
 python/cleanup/render.py      ffmpeg expressions, duration prediction, transcript
+tests/stub_servers.py         stand-ins for both servers, for the self-test
+DESIGN.md                     how it all fits together, and why
 ```
 
 The shell drives ffmpeg and the models; everything under `python/cleanup/` reads

@@ -25,6 +25,32 @@ TRACK_SEPARATOR="_"
 
 # ------------------------------------------------------------------- whisper --
 
+# Leave WHISPER_ENDPOINT empty to run whisper-cli locally, once per track. Set
+# it to a running whisper-server and transcription is sent there instead, with
+# no local process managed.
+#
+# This is independent of how the LLM stage is served, so all four combinations
+# work: both local, both remote, local Whisper with a remote LLM, or a remote
+# Whisper with a local LLM. --whisper-endpoint / --local-whisper override this
+# per run, as --llama-endpoint / --local-llama do for the LLM.
+#
+# One caveat: word timings are only as good as what the server returns. A build
+# that honours max_len=1 returns one word per segment and the timings are exact;
+# one that ignores it returns sentence segments, and word positions inside them
+# are interpolated, which makes stutter cuts less tight. The run warns when that
+# happens. Local whisper-cli always gives per-token timings.
+WHISPER_ENDPOINT=""
+#WHISPER_ENDPOINT="http://gpu-box.lan:8080"
+WHISPER_ENDPOINT_PATH="/inference"
+
+# Audio is uploaded in chunks of this many seconds; 0 sends the whole track in
+# one request. Boundaries are nudged onto the middle of a silence found by the
+# VAD stage, so a chunk edge does not land inside a word. Chunking also means
+# progress is reported as the run goes rather than only at the end.
+WHISPER_CHUNK_SECONDS="600"
+WHISPER_REQUEST_TIMEOUT="1800"
+
+# Used only when WHISPER_ENDPOINT is empty.
 WHISPER_BIN="/opt/whisper.cpp/bin/whisper-cli"
 WHISPER_MODEL="/srv/llm/models/whisper/ggml-large-v3-turbo.bin"
 WHISPER_THREADS="$(nproc)"
@@ -37,17 +63,18 @@ WHISPER_LANG="auto"
 # Passed through verbatim, e.g. --prompt for domain vocabulary.
 WHISPER_EXTRA_ARGS=""
 
-# Whisper never runs at the same time as llama-server; every track is
-# transcribed and the process exits before the LLM stage begins. Raise this
-# only if there is RAM for several Whisper instances at once.
+# Local Whisper never runs at the same time as a locally managed llama-server:
+# every track is transcribed and the process exits before the LLM stage begins.
+# Raise this only if there is RAM for several Whisper instances at once.
 WHISPER_JOBS="1"
 
 # ----------------------------------------------------------------- llama.cpp --
 
 # Leave LLAMA_ENDPOINT empty to have the script start llama-server itself for
 # the detection stage and shut it down immediately afterwards. Set it to an
-# existing server to use that instead — the script then never manages a
-# process, and it is on you to keep Whisper and llama from overlapping in RAM.
+# existing server to use that instead — the script then never manages a process,
+# and keeping that server from competing with anything else for memory is the
+# other machine's business.
 LLAMA_ENDPOINT=""
 #LLAMA_ENDPOINT="http://127.0.0.1:8081"
 

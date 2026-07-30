@@ -21,7 +21,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
 from cleanup import intervals as iv
-from cleanup import llm, plan as planner, render, transcript as tr, vad
+from cleanup import asr, llm, plan as planner, render, transcript as tr, vad
 
 
 # --- a tiny evaluator for the ffmpeg expression subset we generate ------------
@@ -298,6 +298,210 @@ class TestLlmValidation(unittest.TestCase):
         self.assertIn("at most 6 words", prompt)
         # Only the enabled kinds are described.
         self.assertNotIn("hesitation sound", prompt)
+
+
+class TestRemoteAsrTimeParsing(unittest.TestCase):
+    def test_numbers_and_numeric_strings(self):
+        self.assertEqual(asr.to_seconds(12), 12.0)
+        self.assertEqual(asr.to_seconds(12.5), 12.5)
+        self.assertEqual(asr.to_seconds("12.5"), 12.5)
+        self.assertEqual(asr.to_seconds(" 12.5 "), 12.5)
+
+    def test_clock_strings(self):
+        self.assertAlmostEqual(asr.to_seconds("00:00:01.500"), 1.5)
+        self.assertAlmostEqual(asr.to_seconds("00:00:01,500"), 1.5)
+        self.assertAlmostEqual(asr.to_seconds("01:02:03.250"), 3723.25)
+        self.assertAlmostEqual(asr.to_seconds("02:03"), 123.0)
+
+    def test_rejects_junk(self):
+        for value in (None, "", "  ", "abc", True, [], {}, "1:2:3:4"):
+            self.assertIsNone(asr.to_seconds(value), repr(value))
+
+
+class TestRemoteAsrNormalization(unittest.TestCase):
+    def test_openai_style_segments(self):
+        payload = {
+            "text": " hello there",
+            "segments": [
+                {"id": 0, "start": 1.0, "end": 1.5, "text": " hello"},
+                {"id": 1, "start": 1.5, "end": 2.25, "text": " there"},
+            ],
+        }
+        segments = asr.normalize_response(payload)
+        self.assertEqual(
+            [(s["offsets"]["from"], s["offsets"]["to"]) for s in segments],
+            [(1000, 1500), (1500, 2250)],
+        )
+        self.assertEqual([s["text"] for s in segments], ["hello", "there"])
+
+    def test_offset_shifts_a_chunk_onto_the_episode_timeline(self):
+        payload = {"segments": [{"start": 2.0, "end": 3.0, "text": "x"}]}
+        segments = asr.normalize_response(payload, offset=600.0)
+        self.assertEqual(segments[0]["offsets"], {"from": 602000, "to": 603000})
+
+    def test_whisper_cli_shape_is_accepted_too(self):
+        payload = {
+            "transcription": [
+                {"text": " word", "offsets": {"from": 500, "to": 900}}
+            ]
+        }
+        segments = asr.normalize_response(payload)
+        self.assertEqual(segments[0]["offsets"], {"from": 500, "to": 900})
+
+    def test_clock_string_timings(self):
+        payload = {
+            "segments": [
+                {"start": "00:00:01.250", "end": "00:00:02.000", "text": "a"}
+            ]
+        }
+        segments = asr.normalize_response(payload)
+        self.assertEqual(segments[0]["offsets"], {"from": 1250, "to": 2000})
+
+    def test_token_ids_are_discarded_rather_than_crashing(self):
+        """whisper-server's verbose_json lists tokens as bare ids."""
+        payload = {
+            "segments": [
+                {"start": 1.0, "end": 2.0, "text": "hi there",
+                 "tokens": [50364, 2088, 616]}
+            ]
+        }
+        segments = asr.normalize_response(payload)
+        self.assertNotIn("tokens", segments[0])
+        # And the words still come out, interpolated across the segment.
+        parsed = tr.build_from_segments(segments, "alice")
+        self.assertEqual([w["text"] for w in parsed["words"]], ["hi", "there"])
+        self.assertEqual(parsed["approximated_segments"], 1)
+
+    def test_token_objects_with_timings_are_kept_and_shifted(self):
+        payload = {
+            "segments": [{
+                "start": 1.0, "end": 2.0, "text": "hi there",
+                "tokens": [
+                    {"text": " hi", "offsets": {"from": 1000, "to": 1400}},
+                    {"text": " there", "offsets": {"from": 1400, "to": 2000}},
+                ],
+            }]
+        }
+        segments = asr.normalize_response(payload, offset=10.0)
+        self.assertEqual(len(segments[0]["tokens"]), 2)
+        self.assertEqual(segments[0]["tokens"][0]["offsets"]["from"], 11000)
+        parsed = tr.build_from_segments(segments, "alice")
+        self.assertEqual(parsed["approximated_segments"], 0)
+        self.assertAlmostEqual(parsed["words"][0]["start"], 11.0)
+
+    def test_text_without_timings_is_a_clear_error(self):
+        with self.assertRaises(ValueError) as caught:
+            asr.normalize_response({"text": "just a transcript"})
+        self.assertIn("verbose_json", str(caught.exception))
+
+    def test_segments_missing_timings_are_skipped(self):
+        payload = {
+            "segments": [
+                {"text": "no timing here"},
+                {"start": 1.0, "end": 2.0, "text": "good"},
+            ]
+        }
+        segments = asr.normalize_response(payload)
+        self.assertEqual([s["text"] for s in segments], ["good"])
+
+    def test_empty_result_is_an_error_not_a_silent_pass(self):
+        with self.assertRaises(ValueError):
+            asr.normalize_response({"segments": []})
+        with self.assertRaises(ValueError):
+            asr.normalize_response({"nothing": True})
+
+    def test_accepts_a_json_string(self):
+        segments = asr.normalize_response(
+            '{"segments": [{"start": 0, "end": 1, "text": "x"}]}'
+        )
+        self.assertEqual(len(segments), 1)
+
+
+class TestRemoteAsrChunking(unittest.TestCase):
+    def test_short_track_is_one_chunk(self):
+        self.assertEqual(asr.plan_audio_chunks(300.0, 600.0, []), [(0.0, 300.0)])
+
+    def test_zero_target_disables_chunking(self):
+        self.assertEqual(asr.plan_audio_chunks(7200.0, 0, []), [(0.0, 7200.0)])
+
+    def test_chunks_cover_the_track_without_gaps_or_overlap(self):
+        for duration in (601.0, 1000.0, 3600.0, 7231.5):
+            chunks = asr.plan_audio_chunks(duration, 600.0, [])
+            self.assertEqual(chunks[0][0], 0.0)
+            self.assertAlmostEqual(chunks[-1][1], duration)
+            for before, after in zip(chunks, chunks[1:]):
+                self.assertAlmostEqual(before[1], after[0])
+            for start, end in chunks:
+                self.assertGreater(end - start, 0)
+
+    def test_boundaries_move_into_silence(self):
+        # Speech everywhere except a gap at 590-610, straddling the ideal 600 s
+        # boundary. The split should land in the middle of that gap.
+        speech = [(0.0, 590.0), (610.0, 1200.0)]
+        chunks = asr.plan_audio_chunks(1200.0, 600.0, speech)
+        self.assertEqual(len(chunks), 2)
+        self.assertAlmostEqual(chunks[0][1], 600.0, places=3)
+
+    def test_boundary_prefers_nearby_silence_over_the_exact_target(self):
+        speech = [(0.0, 500.0), (530.0, 1200.0)]
+        chunks = asr.plan_audio_chunks(1200.0, 600.0, speech)
+        # The gap's midpoint is 515 s, well inside the quarter-target window,
+        # so it is chosen over cutting a word at 600 s.
+        self.assertAlmostEqual(chunks[0][1], 515.0, places=3)
+
+    def test_distant_silence_is_not_worth_the_detour(self):
+        # The only silence is at the very start, far from the 600 s mark.
+        speech = [(0.0, 10.0), (20.0, 1200.0)]
+        chunks = asr.plan_audio_chunks(1200.0, 600.0, speech)
+        self.assertAlmostEqual(chunks[0][1], 600.0, places=3)
+
+    def test_no_runt_final_chunk(self):
+        # 605 s with a 600 s target would leave a 5 s tail; it stays whole.
+        chunks = asr.plan_audio_chunks(605.0, 600.0, [])
+        self.assertEqual(chunks, [(0.0, 605.0)])
+        for start, end in asr.plan_audio_chunks(1900.0, 600.0, []):
+            self.assertGreaterEqual(end - start, asr.MIN_CHUNK_SECONDS)
+
+
+class TestWavSlicing(unittest.TestCase):
+    def _make_wav(self, path, seconds, rate=16000):
+        import struct
+        import wave as wavemod
+
+        with wavemod.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            # A ramp, so a slice can be identified by its content.
+            handle.writeframes(
+                b"".join(
+                    struct.pack("<h", (index % 1000) - 500)
+                    for index in range(int(seconds * rate))
+                )
+            )
+
+    def test_slice_is_sample_accurate(self):
+        directory = tempfile.mkdtemp()
+        source = os.path.join(directory, "src.wav")
+        target = os.path.join(directory, "cut.wav")
+        self._make_wav(source, 3.0)
+
+        duration, rate = asr.wav_info(source)
+        self.assertAlmostEqual(duration, 3.0)
+        self.assertEqual(rate, 16000)
+
+        asr.slice_wav(source, 1.0, 2.5, target)
+        sliced, _ = asr.wav_info(target)
+        self.assertAlmostEqual(sliced, 1.5, places=6)
+
+    def test_slice_clamps_to_the_file(self):
+        directory = tempfile.mkdtemp()
+        source = os.path.join(directory, "src.wav")
+        target = os.path.join(directory, "cut.wav")
+        self._make_wav(source, 1.0)
+        asr.slice_wav(source, 0.5, 99.0, target)
+        sliced, _ = asr.wav_info(target)
+        self.assertAlmostEqual(sliced, 0.5, places=6)
 
 
 class _StubLlamaServer:

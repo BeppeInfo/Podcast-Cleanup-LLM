@@ -57,10 +57,19 @@ Options:
 
       --vad BACKEND     ffmpeg (level based) or silero (speech based)
       --no-llm          silence editing only; skip Qwen entirely
-      --llama-endpoint URL
-                        use a llama server that is already running
   -j, --jobs N          parallel ffmpeg jobs
       --force           proceed even when the plan trips a safety limit
+
+  Where the models run. The two are independent, so any combination works:
+  local Whisper with a remote LLM, a remote Whisper with a local LLM, both
+  local, or both remote. An endpoint is used as-is and its process is never
+  managed here; without one, the local binary is run instead.
+      --whisper-endpoint URL    transcribe via a running whisper-server
+      --local-whisper           run whisper-cli locally, even if the config
+                                file names an endpoint
+      --llama-endpoint URL      detect via a running llama-server
+      --local-llama             start and stop llama-server here, even if the
+                                config file names an endpoint
 
       --keep-inputs     do not delete the originals after a successful run
       --keep-work       do not delete the work directory
@@ -97,7 +106,10 @@ parse_args() {
                 exit 0 ;;
             --vad)         ARG_VAD_BACKEND="${2:?--vad needs a backend}"; shift 2 ;;
             --no-llm)      ARG_LLM_ENABLE=0; shift ;;
-            --llama-endpoint) ARG_LLAMA_ENDPOINT="${2:?--llama-endpoint needs a URL}"; shift 2 ;;
+            --whisper-endpoint) ARG_WHISPER_ENDPOINT="${2:?--whisper-endpoint needs a URL}"; shift 2 ;;
+            --local-whisper)    ARG_LOCAL_WHISPER=1; shift ;;
+            --llama-endpoint)   ARG_LLAMA_ENDPOINT="${2:?--llama-endpoint needs a URL}"; shift 2 ;;
+            --local-llama)      ARG_LOCAL_LLAMA=1; shift ;;
             -j|--jobs)     ARG_FFMPEG_JOBS="${2:?--jobs needs a number}"; shift 2 ;;
             --force)       FORCE=1; shift ;;
             --keep-inputs) ARG_KEEP_INPUTS=1; shift ;;
@@ -121,7 +133,11 @@ apply_overrides() {
     [[ -n "${ARG_WORK_ROOT:-}" ]]       && WORK_ROOT="$ARG_WORK_ROOT"
     [[ -n "${ARG_VAD_BACKEND:-}" ]]     && VAD_BACKEND="$ARG_VAD_BACKEND"
     [[ -n "${ARG_LLM_ENABLE:-}" ]]      && LLM_ENABLE="$ARG_LLM_ENABLE"
+    [[ -n "${ARG_WHISPER_ENDPOINT:-}" ]] && WHISPER_ENDPOINT="$ARG_WHISPER_ENDPOINT"
     [[ -n "${ARG_LLAMA_ENDPOINT:-}" ]]  && LLAMA_ENDPOINT="$ARG_LLAMA_ENDPOINT"
+    # These force local even when the config file names an endpoint.
+    [[ -n "${ARG_LOCAL_WHISPER:-}" ]]   && WHISPER_ENDPOINT=""
+    [[ -n "${ARG_LOCAL_LLAMA:-}" ]]     && LLAMA_ENDPOINT=""
     [[ -n "${ARG_FFMPEG_JOBS:-}" ]]     && FFMPEG_JOBS="$ARG_FFMPEG_JOBS"
     [[ -n "${ARG_KEEP_INPUTS:-}" ]]     && KEEP_INPUTS="$ARG_KEEP_INPUTS"
     [[ -n "${ARG_KEEP_WORK:-}" ]]       && KEEP_WORK="$ARG_KEEP_WORK"
@@ -233,6 +249,7 @@ main() {
 
     log_line ""
     log_line "${C_BOLD}Podcast cleanup${C_RESET}${C_DIM} — stages: ${stages[*]}${C_RESET}"
+    config_describe_models
     [[ "$DRY_RUN" == 1 ]] && log_warn "dry run: no files will be written or removed"
 
     stage_total "${#stages[@]}"
