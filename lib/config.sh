@@ -1,0 +1,245 @@
+# shellcheck shell=bash
+#
+# Defaults, config-file loading and validation.
+#
+# The config file is sourced as bash, so it can only set variables (and may
+# reference earlier ones). Tool resolution is deliberately lazy: a run that
+# only re-renders should not require whisper or llama to be installed.
+
+# --- defaults ----------------------------------------------------------------
+
+config_defaults() {
+    # Filesystem layout ------------------------------------------------------
+    : "${INPUT_DIR:=/srv/media/podcast/incoming}"
+    : "${OUTPUT_DIR:=/srv/media/podcast/output}"
+    : "${WORK_ROOT:=/srv/media/podcast/work}"
+    : "${FAILED_DIR:=/srv/media/podcast/failed}"
+
+    # Track naming: <episode><SEP><participant>.<ext>
+    : "${TRACK_EXT:=flac}"
+    : "${TRACK_SEPARATOR:=_}"
+
+    # Whisper ---------------------------------------------------------------
+    : "${WHISPER_BIN:=/opt/whisper.cpp/bin/whisper-cli}"
+    : "${WHISPER_MODEL:=/srv/llm/models/whisper/ggml-large-v3-turbo.bin}"
+    : "${WHISPER_THREADS:=$(nproc 2>/dev/null || echo 4)}"
+    : "${WHISPER_LANG:=auto}"
+    : "${WHISPER_EXTRA_ARGS:=}"
+
+    # llama.cpp -------------------------------------------------------------
+    # LLAMA_ENDPOINT: if set, an already-running server is used as-is and this
+    # script never spawns or stops one.
+    : "${LLAMA_ENDPOINT:=}"
+    : "${LLAMA_SERVER_BIN:=/opt/llama.cpp/bin/llama-server}"
+    : "${LLAMA_MODEL:=/srv/llm/models/qwen/Qwen3.6-35B-A3B.gguf}"
+    : "${LLAMA_HOST:=127.0.0.1}"
+    : "${LLAMA_PORT:=8081}"
+    : "${LLAMA_CTX:=8192}"
+    : "${LLAMA_NGL:=99}"
+    : "${LLAMA_EXTRA_ARGS:=}"
+    : "${LLAMA_STARTUP_TIMEOUT:=600}"     # seconds to wait for /health
+    : "${LLAMA_REQUEST_TIMEOUT:=600}"     # seconds per completion request
+
+    # Voice activity / silence ----------------------------------------------
+    : "${VAD_BACKEND:=ffmpeg}"            # ffmpeg | silero
+    : "${SILENCE_THRESHOLD:=-35dB}"       # ffmpeg backend only
+    # Detection granularity, not the editing threshold: the speech map is built
+    # at this resolution and SILENCE_MIN_DURATION decides what to act on.
+    : "${VAD_MIN_SILENCE:=0.30}"
+    : "${SILERO_THRESHOLD:=0.5}"          # silero backend only
+    : "${SILERO_MODEL_DIR:=}"             # optional local torch.hub cache dir
+
+    # A gap where no track has speech becomes a candidate only past this length.
+    : "${SILENCE_MIN_DURATION:=1.5}"
+    # Residual silence left in place of a shortened gap.
+    : "${SILENCE_KEEP:=0.40}"
+    # Silence retained at the very start and end of the episode.
+    : "${EDGE_KEEP:=0.25}"
+    # Speech margin preserved on both sides of every cut.
+    : "${CUT_PADDING:=0.10}"
+    # Cuts shorter than this are not worth the splice.
+    : "${MIN_CUT:=0.15}"
+    # Fade applied at both ends of a per-track mute, to avoid clicks.
+    : "${MUTE_FADE:=0.030}"
+
+    # LLM edit detection ----------------------------------------------------
+    : "${LLM_ENABLE:=1}"
+    : "${LLM_CHUNK_WORDS:=350}"
+    : "${LLM_CHUNK_OVERLAP:=40}"
+    : "${LLM_MAX_EDIT_WORDS:=12}"
+    : "${LLM_MAX_EDIT_SECONDS:=4.0}"
+    : "${LLM_MIN_CONFIDENCE:=0.6}"
+    : "${LLM_TEMP:=0}"
+    # Accepted edit kinds. "filler" (um/uh/like) is available but off by
+    # default: removing every filler tends to over-edit natural speech.
+    : "${LLM_ACCEPT_KINDS:=stutter,repetition,false_start}"
+
+    # Safety ----------------------------------------------------------------
+    # A plan that removes more than this fraction of the episode is refused
+    # unless --force is given: it almost always means bad VAD settings.
+    : "${MAX_CUT_FRACTION:=0.5}"
+
+    # Rendering -------------------------------------------------------------
+    : "${OUTPUT_COMPRESSION:=8}"
+    : "${OUTPUT_SUFFIX:=}"                # e.g. "_clean"
+    # Frame size used for cut and mute decisions. Cuts land on frame
+    # boundaries, so this is the timing granularity of the edit — and it must
+    # be the same for every track of an episode, which is what keeps them in
+    # sync. Smaller is more precise and smoother-fading but slower to render.
+    : "${RENDER_FRAME_SAMPLES:=512}"
+
+    # Concurrency -----------------------------------------------------------
+    # Whisper runs one track at a time by default: the model is large and must
+    # not compete with itself for RAM/VRAM.
+    : "${WHISPER_JOBS:=1}"
+    : "${FFMPEG_JOBS:=$(( $(nproc 2>/dev/null || echo 2) / 2 ))}"
+    (( FFMPEG_JOBS < 1 )) && FFMPEG_JOBS=1
+
+    # Behaviour -------------------------------------------------------------
+    : "${KEEP_WORK:=0}"
+    : "${KEEP_INPUTS:=0}"
+    # What a failure does with the originals.
+    #   log   keep them where they are, copy the run log to FAILED_DIR
+    #   move  additionally move them into FAILED_DIR/<episode>, so an
+    #         unattended run cannot retry the same broken episode forever
+    : "${FAILED_ACTION:=log}"
+    # Rendered output must be within this fraction of the planned duration.
+    : "${DURATION_TOLERANCE:=0.02}"
+}
+
+# --- loading -----------------------------------------------------------------
+
+# config_load [explicit-file]
+# Sources the first config file found. An explicit path that does not exist is
+# an error; the implicit search path silently falls through to defaults.
+config_load() {
+    local explicit="${1:-}"
+    local candidates=()
+
+    if [[ -n "$explicit" ]]; then
+        [[ -f "$explicit" ]] || die "config file not found: $explicit"
+        candidates=("$explicit")
+    else
+        candidates=(
+            "${PODCAST_CLEANUP_CONF:-}"
+            "$PWD/podcast-cleanup.conf"
+            "${XDG_CONFIG_HOME:-$HOME/.config}/podcast-cleanup/config"
+            "/etc/podcast-cleanup.conf"
+        )
+    fi
+
+    local f
+    for f in "${candidates[@]}"; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        # shellcheck disable=SC1090
+        source "$f" || die "failed to parse config file: $f"
+        CONFIG_FILE="$f"
+        break
+    done
+
+    config_defaults
+}
+
+# --- validation --------------------------------------------------------------
+
+_is_number() { [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; }
+
+_require_number() {
+    _is_number "${!1}" || die "config $1 must be a number, got '${!1}'"
+}
+
+_require_int() {
+    [[ "${!1}" =~ ^[0-9]+$ ]] || die "config $1 must be a non-negative integer, got '${!1}'"
+}
+
+config_validate() {
+    local v
+    for v in SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \
+             MUTE_FADE LLM_MAX_EDIT_SECONDS LLM_MIN_CONFIDENCE DURATION_TOLERANCE \
+             SILERO_THRESHOLD MAX_CUT_FRACTION VAD_MIN_SILENCE; do
+        _require_number "$v"
+    done
+    for v in LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP LLM_MAX_EDIT_WORDS WHISPER_JOBS \
+             FFMPEG_JOBS LLAMA_PORT LLAMA_CTX OUTPUT_COMPRESSION \
+             RENDER_FRAME_SAMPLES; do
+        _require_int "$v"
+    done
+
+    (( RENDER_FRAME_SAMPLES >= 64 && RENDER_FRAME_SAMPLES <= 8192 )) \
+        || die "RENDER_FRAME_SAMPLES must be between 64 and 8192, got $RENDER_FRAME_SAMPLES"
+
+    case "$VAD_BACKEND" in
+        ffmpeg|silero) ;;
+        *) die "VAD_BACKEND must be 'ffmpeg' or 'silero', got '$VAD_BACKEND'" ;;
+    esac
+
+    case "$FAILED_ACTION" in
+        log|move) ;;
+        *) die "FAILED_ACTION must be 'log' or 'move', got '$FAILED_ACTION'" ;;
+    esac
+
+    (( LLM_CHUNK_OVERLAP < LLM_CHUNK_WORDS )) \
+        || die "LLM_CHUNK_OVERLAP ($LLM_CHUNK_OVERLAP) must be smaller than LLM_CHUNK_WORDS ($LLM_CHUNK_WORDS)"
+
+    (( WHISPER_JOBS > 1 )) && log_warn \
+        "WHISPER_JOBS=$WHISPER_JOBS runs several Whisper instances at once; make sure the RAM is there"
+
+    awk -v k="$SILENCE_KEEP" -v m="$SILENCE_MIN_DURATION" 'BEGIN{exit !(k < m)}' \
+        || die "SILENCE_KEEP ($SILENCE_KEEP) must be smaller than SILENCE_MIN_DURATION ($SILENCE_MIN_DURATION)"
+
+    [[ "$TRACK_SEPARATOR" == ?* ]] || die "TRACK_SEPARATOR must not be empty"
+}
+
+# --- lazy tool resolution ----------------------------------------------------
+#
+# Each of these is called by the stage that actually needs the tool, so the
+# absence of (say) llama-server never blocks a silence-only run.
+
+config_need_ffmpeg() {
+    [[ -n "${FFMPEG:-}" ]] && return 0
+    FFMPEG=$(require_bin ffmpeg "${FFMPEG_BIN:-ffmpeg}") || exit 1
+    FFPROBE=$(require_bin ffprobe "${FFPROBE_BIN:-ffprobe}") || exit 1
+    log_debug "ffmpeg: $FFMPEG"
+}
+
+config_need_whisper() {
+    [[ -n "${WHISPER:-}" ]] && return 0
+    WHISPER=$(require_bin whisper-cli "$WHISPER_BIN") || exit 1
+    [[ -f "$WHISPER_MODEL" ]] || die "Whisper model not found: $WHISPER_MODEL"
+    log_debug "whisper: $WHISPER ($(basename "$WHISPER_MODEL"))"
+}
+
+config_need_llama() {
+    if [[ -n "$LLAMA_ENDPOINT" ]]; then
+        log_debug "llama: using external endpoint $LLAMA_ENDPOINT"
+        return 0
+    fi
+    [[ -n "${LLAMA_SERVER:-}" ]] && return 0
+    LLAMA_SERVER=$(require_bin llama-server "$LLAMA_SERVER_BIN") || exit 1
+    [[ -f "$LLAMA_MODEL" ]] || die "llama model not found: $LLAMA_MODEL"
+    log_debug "llama: $LLAMA_SERVER ($(basename "$LLAMA_MODEL"))"
+}
+
+config_need_python() {
+    [[ -n "${PYTHON:-}" ]] && return 0
+    PYTHON=$(require_bin python3 "${PYTHON_BIN:-python3}") || exit 1
+    log_debug "python: $PYTHON"
+}
+
+# config_dump — every effective setting, to the log (and to stderr at -v).
+config_dump() {
+    local v
+    log_debug "config file: ${CONFIG_FILE:-<none, using defaults>}"
+    for v in INPUT_DIR OUTPUT_DIR WORK_ROOT FAILED_DIR TRACK_EXT TRACK_SEPARATOR \
+             WHISPER_BIN WHISPER_MODEL WHISPER_THREADS WHISPER_LANG WHISPER_JOBS \
+             LLAMA_ENDPOINT LLAMA_SERVER_BIN LLAMA_MODEL LLAMA_HOST LLAMA_PORT \
+             LLAMA_CTX LLAMA_NGL VAD_BACKEND SILENCE_THRESHOLD SILERO_THRESHOLD \
+             SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \
+             MUTE_FADE LLM_ENABLE LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP \
+             LLM_MAX_EDIT_WORDS LLM_MAX_EDIT_SECONDS LLM_MIN_CONFIDENCE \
+             LLM_ACCEPT_KINDS MAX_CUT_FRACTION OUTPUT_COMPRESSION OUTPUT_SUFFIX \
+             RENDER_FRAME_SAMPLES FFMPEG_JOBS KEEP_WORK KEEP_INPUTS \
+             DURATION_TOLERANCE; do
+        log_raw "  config $v=${!v}"
+    done
+}

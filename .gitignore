@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+# A local config is machine-specific; the example is the tracked one.
+podcast-cleanup.conf

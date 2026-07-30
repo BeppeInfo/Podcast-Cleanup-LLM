@@ -1,0 +1,141 @@
+# Podcast-Cleanup-LLM configuration.
+#
+# Copy to one of the locations searched at startup (first match wins):
+#
+#   the path given to --config
+#   $PODCAST_CLEANUP_CONF
+#   ./podcast-cleanup.conf
+#   ${XDG_CONFIG_HOME:-~/.config}/podcast-cleanup/config
+#   /etc/podcast-cleanup.conf
+#
+# Sourced as bash: only assignments, no logic worth speaking of. Anything left
+# unset falls back to the default shown in the comment.
+
+# ---------------------------------------------------------------- filesystem --
+
+INPUT_DIR="/srv/media/podcast/incoming"
+OUTPUT_DIR="/srv/media/podcast/output"
+WORK_ROOT="/srv/media/podcast/work"
+FAILED_DIR="/srv/media/podcast/failed"
+
+# Input tracks are named <episode><SEP><participant>.<ext>, e.g.
+# "ep042_leonardo.flac" -> episode "ep042", participant "leonardo".
+TRACK_EXT="flac"
+TRACK_SEPARATOR="_"
+
+# ------------------------------------------------------------------- whisper --
+
+WHISPER_BIN="/opt/whisper.cpp/bin/whisper-cli"
+WHISPER_MODEL="/srv/llm/models/whisper/ggml-large-v3-turbo.bin"
+WHISPER_THREADS="$(nproc)"
+
+# Language code, or "auto" to detect. Setting it explicitly is both faster and
+# more accurate than detection on a two-hour recording.
+WHISPER_LANG="auto"
+#WHISPER_LANG="pt"
+
+# Passed through verbatim, e.g. --prompt for domain vocabulary.
+WHISPER_EXTRA_ARGS=""
+
+# Whisper never runs at the same time as llama-server; every track is
+# transcribed and the process exits before the LLM stage begins. Raise this
+# only if there is RAM for several Whisper instances at once.
+WHISPER_JOBS="1"
+
+# ----------------------------------------------------------------- llama.cpp --
+
+# Leave LLAMA_ENDPOINT empty to have the script start llama-server itself for
+# the detection stage and shut it down immediately afterwards. Set it to an
+# existing server to use that instead — the script then never manages a
+# process, and it is on you to keep Whisper and llama from overlapping in RAM.
+LLAMA_ENDPOINT=""
+#LLAMA_ENDPOINT="http://127.0.0.1:8081"
+
+LLAMA_SERVER_BIN="/opt/llama.cpp/bin/llama-server"
+LLAMA_MODEL="/srv/llm/models/qwen/Qwen3.6-35B-A3B.gguf"
+LLAMA_HOST="127.0.0.1"
+LLAMA_PORT="8081"
+
+# Context per request. Transcripts are chunked to fit comfortably inside this.
+LLAMA_CTX="8192"
+
+# Layers offloaded to GPU (99 = all, 0 = CPU only).
+LLAMA_NGL="99"
+
+LLAMA_EXTRA_ARGS=""
+LLAMA_STARTUP_TIMEOUT="600"
+LLAMA_REQUEST_TIMEOUT="600"
+
+# ------------------------------------------------------- silence definition --
+
+# "ffmpeg"  — silencedetect, level based. No extra dependencies.
+# "silero"  — Silero VAD, speech based. Needs python torch + silero-vad, and is
+#             markedly better at not mistaking breathing or room tone for
+#             speech (or speech for silence).
+VAD_BACKEND="ffmpeg"
+
+SILENCE_THRESHOLD="-35dB"
+SILERO_THRESHOLD="0.5"
+
+# A stretch of time counts as silence only when *no* track has speech in it.
+# Gaps longer than SILENCE_MIN_DURATION are shortened to SILENCE_KEEP rather
+# than removed outright, so the edit keeps its breathing room.
+SILENCE_MIN_DURATION="1.5"
+SILENCE_KEEP="0.40"
+
+# Silence kept at the very beginning and end of the episode.
+EDGE_KEEP="0.25"
+
+# Speech margin preserved either side of every cut, guarding against a VAD
+# boundary that clips a consonant.
+CUT_PADDING="0.10"
+
+# Splices shorter than this are not worth making.
+MIN_CUT="0.15"
+
+# Fade length at both ends of a per-track mute, to avoid a click.
+MUTE_FADE="0.030"
+
+# ------------------------------------------------------------ edit detection --
+
+LLM_ENABLE="1"
+
+# Transcripts are sent as indexed words, in overlapping windows. The model
+# replies with word-index ranges, never timestamps — indices are validated
+# against the transcript, so it cannot invent a position in the audio.
+LLM_CHUNK_WORDS="350"
+LLM_CHUNK_OVERLAP="40"
+
+# Sanity bounds on a single edit. Anything larger is rejected as a
+# misunderstanding rather than trusted.
+LLM_MAX_EDIT_WORDS="12"
+LLM_MAX_EDIT_SECONDS="4.0"
+
+LLM_MIN_CONFIDENCE="0.6"
+LLM_TEMP="0"
+
+# Available kinds: stutter, repetition, false_start, filler.
+# "filler" (um, uh, like, né) is off by default — removing every one of them
+# reads as over-editing.
+LLM_ACCEPT_KINDS="stutter,repetition,false_start"
+
+# --------------------------------------------------------------- rendering ---
+
+OUTPUT_COMPRESSION="8"
+
+# Appended to each participant name in the output filename.
+OUTPUT_SUFFIX=""
+
+FFMPEG_JOBS="2"
+
+# Rendered duration must land within this fraction of the planned duration or
+# the run fails and the inputs are preserved.
+DURATION_TOLERANCE="0.02"
+
+# ---------------------------------------------------------------- behaviour ---
+
+# Both default to 0: the work directory is removed and the original inputs are
+# deleted, but only after every output track has been verified. Any failure
+# preserves both and moves the inputs to FAILED_DIR.
+KEEP_WORK="0"
+KEEP_INPUTS="0"
