@@ -20,8 +20,23 @@ FAILED_DIR="/srv/media/podcast/failed"
 
 # Input tracks are named <episode><SEP><participant>.<ext>, e.g.
 # "ep042_leonardo.flac" -> episode "ep042", participant "leonardo".
-TRACK_EXT="flac"
 TRACK_SEPARATOR="_"
+
+# Which extensions to look for, matched case-insensitively. Anything ffmpeg can
+# decode works — the prepare stage decodes to PCM regardless, so the container is
+# only a matter of finding the files. Video containers are fine too; the first
+# audio stream is taken.
+#
+# Two tracks of one episode may be in different formats: decoders handle encoder
+# delay correctly, so they stay sample-aligned. What they may *not* do is differ
+# in sample rate — see RESAMPLE_TO below.
+INPUT_EXTS="flac wav wave aiff aif m4a mp4 mka mkv mp3 ogg oga opus wv ape alac"
+
+# Narrow it if the input directory holds other things you do not want swept up:
+#INPUT_EXTS="flac"
+
+# (TRACK_EXT is the old name for this and still works, but it only filters
+# inputs now — the output format is set below.)
 
 # ------------------------------------------------------------------- whisper --
 
@@ -148,10 +163,34 @@ LLM_ACCEPT_KINDS="stutter,repetition,false_start"
 
 # --------------------------------------------------------------- rendering ---
 
-OUTPUT_COMPRESSION="8"
+# The output format, independent of whatever came in. FLAC by default: these
+# tracks are going on to be mixed, so losing nothing matters more than size.
+OUTPUT_CODEC="flac"
+OUTPUT_EXT="flac"
+OUTPUT_COMPRESSION="8"          # FLAC only
+OUTPUT_EXTRA_ARGS=""            # e.g. "-b:a 192k" for a lossy codec
+
+# 24-bit WAV instead:
+#OUTPUT_CODEC="pcm_s24le"
+#OUTPUT_EXT="wav"
+# The encoder is checked for at startup, so a codec this ffmpeg lacks fails
+# immediately rather than after transcribing two hours of audio.
 
 # Appended to each participant name in the output filename.
 OUTPUT_SUFFIX=""
+
+# Cuts land on frame boundaries, so every track of an episode has to be
+# frame-aligned at the same rate — otherwise one cut list removes slightly
+# different spans from each track and they drift apart over hundreds of cuts.
+#
+#   ""       a rate mismatch is an error (resample beforehand yourself)
+#   "auto"   resample everything to the highest rate present
+#   48000    resample everything to this rate
+#
+# Off by default because resampling is a real transformation of the audio, not
+# just repackaging. When on, the resample happens before frames are fixed, which
+# is what keeps the tracks aligned.
+RESAMPLE_TO=""
 
 FFMPEG_JOBS="2"
 

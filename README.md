@@ -103,10 +103,29 @@ Input tracks are named `<episode><separator><participant>.<ext>`:
     ep042_guest.flac
 ```
 
-All tracks of an episode must **share a sample rate** — cuts land on frame
-boundaries, and identical frame sizes across tracks are what keeps them aligned.
-A mismatch is refused rather than allowed to drift silently. They must also
-already be aligned at sample 0; this tool does not synchronise anything.
+**Any format ffmpeg can decode** works — FLAC, WAV, AIFF, ALAC, MP3, AAC, Opus,
+Vorbis, WavPack, or a video container with an audio track. `INPUT_EXTS` lists what
+to look for (case-insensitively); the `prepare` stage decodes to PCM regardless,
+so the container is only a matter of finding the files. Two tracks of one episode
+may even be in different formats: decoders handle encoder delay correctly, so
+they stay sample-aligned.
+
+Output format is **independent of input** — FLAC by default via `OUTPUT_CODEC` /
+`OUTPUT_EXT`, since the tracks are going on to be mixed. A lossy input is
+accepted and noted: cutting and re-encoding cannot recover what the codec already
+discarded, and a lossless output of it will be larger for no gain.
+
+Two requirements remain. Tracks must be **aligned at sample 0** — nothing here
+synchronises them. And they must **share a sample rate**, because cuts land on
+frame boundaries and a track quantising at its own rate would drift from the
+others; a mismatch is refused unless `RESAMPLE_TO` (`auto`, or a rate) tells the
+run to resample, which it then does *before* frames are fixed so alignment holds.
+
+Container headers are not trusted for length. AAC decodes a few milliseconds
+longer than it claims, Opus shorter, and a truncated file of any format can claim
+anything — so once `prepare` has decoded each track, its true length is measured
+from the decode. That keeps the frame-exact output prediction exact whatever the
+input format was.
 
 After a successful run:
 
@@ -198,8 +217,8 @@ word, so padding cannot eat into real speech.
 ## Tests
 
 ```sh
-python3 tests/test_pipeline.py    # 85 unit tests, no external tools needed
-./tests/selftest.sh               # 46 end-to-end checks, needs only ffmpeg
+python3 tests/test_pipeline.py    # 88 unit tests, no external tools needed
+./tests/selftest.sh               # 63 end-to-end checks, needs only ffmpeg
 ```
 
 The unit tests cover the interval algebra, transcript parsing, LLM response
@@ -245,6 +264,9 @@ and writes JSON and never touches audio.
 
 - `SILENCE_THRESHOLD` is the first thing to adjust if too much or too little is
   being cut. Read `ep042_edit-report.txt` before trusting a run.
+- `INPUT_EXTS` is worth narrowing to just your own format if the input directory
+  holds anything else you would rather not sweep up. The same participant present
+  in two formats is an error, not a preference.
 - `VAD_BACKEND="silero"` is markedly better at telling speech from breathing and
   room tone, at the cost of a torch dependency.
 - `LLM_ACCEPT_KINDS` excludes `filler` by default; removing every "um" tends to

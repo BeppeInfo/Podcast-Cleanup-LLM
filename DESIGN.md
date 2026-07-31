@@ -12,9 +12,9 @@ break without any test noticing.
 
 ## 1. The problem
 
-Several `.flac` tracks, one per participant, from a single ~2 h podcast
-recording. They are already synchronised: sample 0 of each is the same instant.
-Wanted, per episode:
+Several audio tracks, one per participant, from a single ~2 h podcast recording
+(FLAC in practice, but any format ffmpeg decodes). They are already
+synchronised: sample 0 of each is the same instant. Wanted, per episode:
 
 1. dead air shortened, where *nobody* is speaking;
 2. stutters, accidental repetitions and false starts removed;
@@ -82,11 +82,12 @@ Everything lives in `$WORK_ROOT/<episode>/` and is JSON, so any stage can be
 re-run by hand.
 
 ```
-inputs/<episode>_<participant>.flac
+inputs/<episode>_<participant>.<ext>       any format ffmpeg can decode
    │
-   ├─ discover ──→ meta.json         participants, durations, sample rates
+   ├─ discover ──→ meta.json         participants, codecs, rates, durations
    │
    ├─ prepare ───→ prep/<p>.wav      16 kHz mono, what Whisper and Silero want
+   │               meta.json         durations replaced with measured ones
    │
    ├─ vad ───────→ vad/<p>.json      {"speech": [[start, end], ...]}
    │
@@ -117,10 +118,15 @@ through `shlex.quote`.
 One ffmpeg pass per track:
 
 ```
-[0:a] asetnsamples → volume (mutes) → aselect (cuts) → asetpts → [out]
+[0:a] aresample? → asetnsamples → volume (mutes) → aselect (cuts) → asetpts → [out]
 ```
 
-- `asetnsamples=n=RENDER_FRAME_SAMPLES` fixes the frame size first, because
+- `aresample` is only present when `RESAMPLE_TO` is in play, and it must come
+  **first**. Cuts are decided per frame, so resampling on the output side
+  instead would leave each track chunked at its own rate, and one cut list would
+  remove slightly different spans from each — the one arrangement that breaks
+  sync. There is a test asserting this ordering.
+- `asetnsamples=n=RENDER_FRAME_SAMPLES` fixes the frame size next, because
   everything downstream decides per frame.
 - `volume=eval=frame` with a gain expression applies the mutes. Mutes are fused
   when closer together than twice the fade, so their trapezoidal ramps can never
@@ -150,6 +156,35 @@ Being deterministic, the output length is *predictable*, so
 `render.expected_output_samples` replicates the frame decision and verification
 compares against an exact figure rather than a tolerance. In the self-test the
 prediction lands within a millisecond of the rendered file.
+
+That prediction depends on knowing the true input length, which **is not what the
+container says**. Measured on this machine: AAC decodes 5.33 ms longer than its
+container claims, and Opus's container claims 6.5 ms more than it decodes. A
+truncated file of any format can claim anything. So the `prepare` stage — which
+has just fully decoded every track anyway — hands its output to `meta-refresh`,
+and the decoded length replaces the container's figure for everything downstream.
+`container_duration` is kept for reference. The error was within the 50 ms
+verification tolerance, so nothing was failing; this keeps the word "exact"
+honest.
+
+### Input and output formats
+
+`INPUT_EXTS` is only a discovery filter — `prepare` decodes to PCM, so the
+container never reaches the editing logic. `OUTPUT_CODEC` / `OUTPUT_EXT` are
+independent of it, defaulting to FLAC. `TRACK_EXT` used to mean both at once and
+survives as a deprecated input-only alias.
+
+Mixed formats within one episode are safe. This was checked rather than assumed:
+a click placed at exactly 5.000 s round-trips through FLAC, MP3, AAC, Opus and
+Vorbis and comes back at the identical sample in every case, because ffmpeg's
+decoders account for encoder delay and pre-skip. What is *not* safe is mixed
+sample rates, for the frame-quantisation reason above — refused unless
+`RESAMPLE_TO` is set.
+
+The render's "nothing to change" shortcut copies the source file only when it is
+already in the requested codec and extension; otherwise a track with no edits is
+still transcoded. Getting this wrong would produce a file named `.flac`
+containing MP3.
 
 Sample-accurate alternatives were considered and rejected: `atrim` with
 `start_sample` is exact but needs `asplit` into one branch per kept segment,
@@ -246,7 +281,9 @@ The properties a change must not break. Most have a test; the ones that do not
 are marked.
 
 1. **All output tracks of an episode have identical length.** Guaranteed by
-   global cuts, one frame size, and one shared cut expression.
+   global cuts, one frame size, one shared cut expression, and — when resampling
+   — `aresample` sitting ahead of `asetnsamples` so every track is chunked at the
+   same rate.
 2. **Mutes never change the timeline.** They are `volume`, never `aselect`.
 3. **A cut never overlaps any track's speech**, beyond the deliberate
    `CUT_PADDING`.
@@ -274,13 +311,16 @@ with a miniature interpreter of the grammar we emit** — a wrong expression wou
 mangle audio without failing anything else. The llama client is exercised against
 a stub HTTP server: schema payload, retries, malformed responses, dedupe.
 
-`./tests/selftest.sh` — 46 end-to-end checks needing only ffmpeg. Synthetic
+`./tests/selftest.sh` — 63 end-to-end checks needing only ffmpeg. Synthetic
 episodes with silences in known places, run through the real pipeline in a
 sandbox, with the *rendered audio* inspected. Cases: sub-threshold gaps left
 alone; a long gap shortened to its residual; the safety limit refusing and
 `--force` overriding; a dry run touching nothing; mixed sample rates rejected; a
-stutter over crosstalk muted with the other speaker measurably intact; and the
-full eight stages against stub whisper and llama servers.
+stutter over crosstalk muted with the other speaker measurably intact; the full
+eight stages against stub whisper and llama servers; a mixed-format episode
+(WAV + AAC in, FLAC out) staying length-identical and matching its prediction;
+the same participant in two formats refused; and mixed rates working under
+`RESAMPLE_TO=auto`.
 
 Neither suite runs a real model. **Run one real episode with `--keep-work` after
 changing anything in `transcribe` or `detect`.**
@@ -288,8 +328,11 @@ changing anything in `transcribe` or `detect`.**
 ## 11. Known limitations
 
 - Tracks must already be synchronised at sample 0. Nothing here aligns them.
-- All tracks of an episode must share a sample rate; resample beforehand.
+- All tracks of an episode must end up at one sample rate — either they already
+  agree, or `RESAMPLE_TO` converts them.
 - Cut boundaries are frame-quantised (~11 ms by default).
+- Lossy input is accepted but cannot be improved: what the codec discarded stays
+  discarded, and a FLAC output of it is merely a larger file.
 - One episode per run. Several in `INPUT_DIR` at once is an error, not a queue.
 - Mute rendering evaluates a per-frame expression over the whole track; with
   very many mutes on a long track it is the slowest part of a render.
@@ -307,6 +350,9 @@ authority. The ones whose meaning is easy to get wrong:
 
 | Setting | Meaning |
 | --- | --- |
+| `INPUT_EXTS` | a discovery filter only; the format never reaches the editing logic |
+| `OUTPUT_CODEC`/`OUTPUT_EXT` | the output format, unrelated to what came in |
+| `RESAMPLE_TO` | empty means a rate mismatch is an error, not that nothing happens |
 | `VAD_MIN_SILENCE` | detection *granularity* of the speech map, not the editing threshold |
 | `SILENCE_MIN_DURATION` | how long a gap must be before it is worth shortening |
 | `SILENCE_KEEP` | quiet left behind in place of a shortened gap |

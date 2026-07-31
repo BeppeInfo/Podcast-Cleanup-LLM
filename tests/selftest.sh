@@ -85,6 +85,20 @@ print(data)
 
 # --- synthetic audio ----------------------------------------------------------
 
+has_encoder() {
+    ffmpeg -hide_banner -h "encoder=$1" 2>/dev/null | grep -q "Encoder $1"
+}
+
+# make_track_as <output> <codec> <extra-args> <sample-rate> <duration> <windows>
+# Same synthetic signal, written through an arbitrary encoder.
+make_track_as() {
+    local output="$1" codec="$2" extra="$3" rate="$4" duration="$5" windows="$6"
+    # shellcheck disable=SC2086
+    ffmpeg -v error -y -f lavfi \
+        -i "aevalsrc=exprs='0.4*sin(2*PI*440*t)*(${windows})':s=${rate}:d=${duration}" \
+        -c:a "$codec" $extra "$output"
+}
+
 # make_track <output> <sample-rate> <duration> <expr-of-speech-windows>
 make_track() {
     local output="$1" rate="$2" duration="$3" windows="$4"
@@ -621,6 +635,179 @@ fi
 
 stop_stubs
 trap cleanup EXIT
+
+# ============================================================================
+printf '\n%sCase 8: input format is independent of output format%s\n' "$BOLD" "$RESET"
+# ============================================================================
+#
+# The same episode as case 1, but each track arrives in a different container
+# and codec, and the output is asked for as FLAC regardless. Also checks the
+# thing that makes lossy input safe to accept: a container's duration is not
+# always the length of the audio inside it, so the real length is measured from
+# the decode rather than believed from the header.
+
+CASE8="$SANDBOX/case8"
+mkdir -p "$CASE8/incoming"
+
+# alice as WAV (lossless, honest header), bob as AAC in m4a if it is available —
+# AAC decodes a few ms longer than its container claims, which is the case worth
+# covering. Falls back to MP3, then to plain WAV.
+make_track_as "$CASE8/incoming/ep008_alice.wav" pcm_s16le "" 48000 30 "$A_WINDOWS"
+BOB_KIND="wav"
+if has_encoder aac; then
+    make_track_as "$CASE8/incoming/ep008_bob.m4a" aac "-b:a 192k" 48000 30 "$B_WINDOWS"
+    BOB_KIND="m4a/aac"
+elif has_encoder libmp3lame; then
+    make_track_as "$CASE8/incoming/ep008_bob.mp3" libmp3lame "-b:a 192k" 48000 30 "$B_WINDOWS"
+    BOB_KIND="mp3"
+else
+    make_track_as "$CASE8/incoming/ep008_bob.wav" pcm_s16le "" 48000 30 "$B_WINDOWS"
+fi
+fail_note "alice=wav bob=$BOB_KIND, output requested as flac"
+
+CONF8="$SANDBOX/case8.conf"
+cat "$CONF" >"$CONF8"
+cat >>"$CONF8" <<'EOF'
+INPUT_EXTS="flac wav m4a mp3"
+OUTPUT_CODEC="flac"
+OUTPUT_EXT="flac"
+EOF
+
+if run_pipeline "$CASE8/incoming" "$CASE8/output" "$CASE8/work" \
+    --config "$CONF8" --keep-work >"$SANDBOX/case8.stdout" 2>&1
+then
+    check "mixed-format episode completed" true
+else
+    check "mixed-format episode completed" false
+    fail_note "$(tail -n 25 "$SANDBOX/case8.stdout")"
+fi
+
+OUT8="$CASE8/output/ep008"
+WORK8="$CASE8/work/ep008"
+
+check "output is flac whatever went in" test -s "$OUT8/alice.flac"
+check "the other track too"             test -s "$OUT8/bob.flac"
+check "no input extension leaked into the output names" bash -c \
+    '[[ -z "$(find "$1" -maxdepth 1 \( -name "*.wav" -o -name "*.m4a" -o -name "*.mp3" \) -print -quit)" ]]' \
+    _ "$OUT8"
+
+if [[ -f "$OUT8/alice.flac" ]]; then
+    check "outputs really are FLAC streams" bash -c \
+        '[[ "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$1")" == flac ]]' \
+        _ "$OUT8/alice.flac"
+fi
+
+if [[ -f "$WORK8/meta.json" ]]; then
+    check "durations were measured, not taken from the container" python3 -c '
+import json, sys
+meta = json.load(open(sys.argv[1]))
+if not meta.get("durations_measured"):
+    print("meta.json was never refreshed from the decoded audio")
+    sys.exit(1)
+for track in meta["tracks"]:
+    if "container_duration" not in track:
+        print("no container duration recorded for", track["participant"])
+        sys.exit(1)
+    # The measured value is what the rest of the pipeline uses.
+    if track["duration"] <= 0:
+        print("bad measured duration:", track)
+        sys.exit(1)
+' "$WORK8/meta.json"
+
+    check "the input codec of each track was recorded" python3 -c '
+import json, sys
+meta = json.load(open(sys.argv[1]))
+codecs = {t["participant"]: t["codec"] for t in meta["tracks"]}
+if not all(codecs.values()):
+    print("a codec was not identified:", codecs)
+    sys.exit(1)
+print("codecs:", codecs)
+' "$WORK8/meta.json"
+fi
+
+if [[ -s "$OUT8/alice.flac" && -s "$OUT8/bob.flac" ]]; then
+    D8A=$(duration_of "$OUT8/alice.flac")
+    D8B=$(duration_of "$OUT8/bob.flac")
+    # The invariant that matters, now across two different input formats.
+    check "both tracks are identically long across formats" approx "$D8A" "$D8B" 0.0005
+    EXPECT8=$(json_number "$WORK8/expected.json" tracks.alice.expected_duration)
+    check "still matches the frame-exact prediction" approx "$D8A" "$EXPECT8" 0.05
+    fail_note "alice=${D8A}s bob=${D8B}s predicted=${EXPECT8}s"
+fi
+
+# ============================================================================
+printf '\n%sCase 9: the same participant in two formats is refused%s\n' "$BOLD" "$RESET"
+# ============================================================================
+
+CASE9="$SANDBOX/case9"
+mkdir -p "$CASE9/incoming"
+make_track "$CASE9/incoming/ep009_alice.flac" 48000 10 'between(t,0,5)'
+make_track_as "$CASE9/incoming/ep009_alice.wav" pcm_s16le "" 48000 10 'between(t,0,5)'
+
+if run_pipeline "$CASE9/incoming" "$CASE9/output" "$CASE9/work" \
+    --config "$CONF8" >"$SANDBOX/case9.stdout" 2>&1
+then
+    check "duplicate track in two formats refused" false
+    fail_note "the run should have failed but did not"
+else
+    check "duplicate track in two formats refused" true
+fi
+check "the error names both files" \
+    grep -qE "appears twice.*alice" "$SANDBOX/case9.stdout"
+
+# ============================================================================
+printf '\n%sCase 10: mixed sample rates, refused by default and fixed by RESAMPLE_TO%s\n' \
+    "$BOLD" "$RESET"
+# ============================================================================
+#
+# Two tracks at different rates cannot be cut consistently: the same cut list
+# quantised at 48 kHz and at 44.1 kHz removes slightly different spans, and the
+# error compounds over hundreds of cuts. Refused unless resampling is asked for.
+
+CASE10="$SANDBOX/case10"
+mkdir -p "$CASE10/incoming"
+make_track "$CASE10/incoming/ep010_alice.flac" 48000 30 "$A_WINDOWS"
+make_track "$CASE10/incoming/ep010_bob.flac"   44100 30 "$B_WINDOWS"
+
+if run_pipeline "$CASE10/incoming" "$CASE10/output" "$CASE10/work" \
+    --config "$CONF" >"$SANDBOX/case10a.stdout" 2>&1
+then
+    check "mixed rates refused without RESAMPLE_TO" false
+else
+    check "mixed rates refused without RESAMPLE_TO" true
+fi
+check "the refusal explains the consequence" \
+    grep -qi "same span from every track" "$SANDBOX/case10a.stdout"
+
+CONF10="$SANDBOX/case10.conf"
+cat "$CONF" >"$CONF10"
+printf 'RESAMPLE_TO="auto"\n' >>"$CONF10"
+
+if run_pipeline "$CASE10/incoming" "$CASE10/output" "$CASE10/work" \
+    --config "$CONF10" --keep-work >"$SANDBOX/case10b.stdout" 2>&1
+then
+    check "RESAMPLE_TO=auto makes it work" true
+else
+    check "RESAMPLE_TO=auto makes it work" false
+    fail_note "$(tail -n 25 "$SANDBOX/case10b.stdout")"
+fi
+
+OUT10="$CASE10/output/ep010"
+if [[ -s "$OUT10/alice.flac" && -s "$OUT10/bob.flac" ]]; then
+    R10A=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$OUT10/alice.flac")
+    R10B=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$OUT10/bob.flac")
+    check "both outputs are at the higher rate" bash -c \
+        '[[ "$1" == 48000 && "$2" == 48000 ]]' _ "$R10A" "$R10B"
+    D10A=$(duration_of "$OUT10/alice.flac")
+    D10B=$(duration_of "$OUT10/bob.flac")
+    # The point of resampling: after it, the sync invariant holds again.
+    check "resampled tracks are identically long" approx "$D10A" "$D10B" 0.0005
+    fail_note "rates ${R10A}/${R10B} Hz, lengths ${D10A}s/${D10B}s"
+
+    check "the resample runs before frames are fixed" bash -c \
+        'head -c 200 "$1" | grep -q "aresample=48000,asetnsamples"' \
+        _ "$CASE10/work/ep010/render/bob.filter"
+fi
 
 # ============================================================================
 

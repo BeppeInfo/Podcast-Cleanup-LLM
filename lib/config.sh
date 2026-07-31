@@ -16,8 +16,17 @@ config_defaults() {
     : "${FAILED_DIR:=/srv/media/podcast/failed}"
 
     # Track naming: <episode><SEP><participant>.<ext>
-    : "${TRACK_EXT:=flac}"
     : "${TRACK_SEPARATOR:=_}"
+
+    # Input extensions to look for, space separated and matched
+    # case-insensitively. Anything ffmpeg can decode works; the prepare stage
+    # decodes to PCM regardless, so the container is only a discovery matter.
+    # Video containers are fine too — the first audio stream is taken.
+    : "${INPUT_EXTS:=flac wav wave aiff aif m4a mp4 mka mkv mp3 ogg oga opus wv ape alac}"
+
+    # Deprecated: TRACK_EXT used to mean both "what to look for" and "what to
+    # write". Honoured as an input filter so existing configs keep working.
+    : "${TRACK_EXT:=}"
 
     # Whisper ---------------------------------------------------------------
     # WHISPER_ENDPOINT: when set, transcription is sent to that whisper-server
@@ -91,8 +100,20 @@ config_defaults() {
     : "${MAX_CUT_FRACTION:=0.5}"
 
     # Rendering -------------------------------------------------------------
-    : "${OUTPUT_COMPRESSION:=8}"
+    # Output format, independent of what came in. FLAC by default: the tracks
+    # are going on to be mixed, so losing nothing matters more than size.
+    : "${OUTPUT_CODEC:=flac}"
+    : "${OUTPUT_EXT:=flac}"
+    : "${OUTPUT_COMPRESSION:=8}"          # FLAC only
+    : "${OUTPUT_EXTRA_ARGS:=}"            # e.g. "-b:a 192k" for a lossy codec
     : "${OUTPUT_SUFFIX:=}"                # e.g. "_clean"
+
+    # Cuts land on frame boundaries, so every track has to be frame-aligned at
+    # the same rate or they drift apart. Empty means a rate mismatch is an
+    # error; "auto" resamples everything to the highest rate present; a number
+    # resamples everything to that. Resampling is a real transformation of the
+    # audio, hence opt-in.
+    : "${RESAMPLE_TO:=}"
     # Frame size used for cut and mute decisions. Cuts land on frame
     # boundaries, so this is the timing granularity of the edit — and it must
     # be the same for every track of an episode, which is what keeps them in
@@ -190,6 +211,22 @@ config_validate() {
         *) die "FAILED_ACTION must be 'log' or 'move', got '$FAILED_ACTION'" ;;
     esac
 
+    case "$RESAMPLE_TO" in
+        ""|auto) ;;
+        *[!0-9]*) die "RESAMPLE_TO must be empty, 'auto', or a sample rate, got '$RESAMPLE_TO'" ;;
+        *) (( RESAMPLE_TO >= 8000 )) || die "RESAMPLE_TO looks too low: $RESAMPLE_TO" ;;
+    esac
+
+    # The old single setting meant input filter and output format at once.
+    if [[ -n "$TRACK_EXT" ]]; then
+        INPUT_EXTS="$TRACK_EXT"
+        log_warn "TRACK_EXT is deprecated: it now only restricts which inputs are found. Use INPUT_EXTS for that and OUTPUT_CODEC/OUTPUT_EXT to choose the output format (currently $OUTPUT_CODEC/.$OUTPUT_EXT)"
+    fi
+    [[ -n "${INPUT_EXTS// /}" ]] || die "INPUT_EXTS is empty; nothing could ever be found"
+    [[ "$OUTPUT_EXT" == *[!a-zA-Z0-9]* ]] \
+        && die "OUTPUT_EXT should be a bare extension, got '$OUTPUT_EXT'"
+    return 0
+
     (( LLM_CHUNK_OVERLAP < LLM_CHUNK_WORDS )) \
         || die "LLM_CHUNK_OVERLAP ($LLM_CHUNK_OVERLAP) must be smaller than LLM_CHUNK_WORDS ($LLM_CHUNK_WORDS)"
 
@@ -212,6 +249,13 @@ config_need_ffmpeg() {
     FFMPEG=$(require_bin ffmpeg "${FFMPEG_BIN:-ffmpeg}") || exit 1
     FFPROBE=$(require_bin ffprobe "${FFPROBE_BIN:-ffprobe}") || exit 1
     log_debug "ffmpeg: $FFMPEG"
+
+    # Catch an unbuildable output format now rather than after transcribing two
+    # hours of audio.
+    if ! "$FFMPEG" -hide_banner -h "encoder=$OUTPUT_CODEC" 2>/dev/null \
+        | grep -q "Encoder $OUTPUT_CODEC"; then
+        die "this ffmpeg has no '$OUTPUT_CODEC' encoder (see: ffmpeg -encoders)"
+    fi
 }
 
 config_need_whisper() {
@@ -277,7 +321,8 @@ config_need_python() {
 config_dump() {
     local v
     log_debug "config file: ${CONFIG_FILE:-<none, using defaults>}"
-    for v in INPUT_DIR OUTPUT_DIR WORK_ROOT FAILED_DIR TRACK_EXT TRACK_SEPARATOR \
+    for v in INPUT_DIR OUTPUT_DIR WORK_ROOT FAILED_DIR INPUT_EXTS TRACK_SEPARATOR \
+             OUTPUT_CODEC OUTPUT_EXT OUTPUT_EXTRA_ARGS RESAMPLE_TO \
              WHISPER_ENDPOINT WHISPER_ENDPOINT_PATH WHISPER_CHUNK_SECONDS \
              WHISPER_REQUEST_TIMEOUT \
              WHISPER_BIN WHISPER_MODEL WHISPER_THREADS WHISPER_LANG WHISPER_JOBS \

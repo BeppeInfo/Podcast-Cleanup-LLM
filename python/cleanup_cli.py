@@ -44,13 +44,22 @@ def _fail(message):
 # --- meta ---------------------------------------------------------------------
 
 
+# Codecs that reproduce their input exactly. Anything else is assumed lossy,
+# which is worth saying out loud before it gets re-encoded.
+LOSSLESS_CODECS = {
+    "flac", "alac", "wavpack", "tta", "ape", "monkeysaudio", "shorten",
+    "mlp", "truehd", "als", "pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_s24be",
+    "pcm_s32le", "pcm_s32be", "pcm_f32le", "pcm_f64le", "pcm_u8", "pcm_s8",
+}
+
+
 def _probe(ffprobe, path):
     result = subprocess.run(
         [
             ffprobe, "-v", "error", "-select_streams", "a:0",
             "-show_entries",
-            "stream=sample_rate,channels,sample_fmt,bits_per_raw_sample",
-            "-show_entries", "format=duration",
+            "stream=codec_name,sample_rate,channels,sample_fmt,bits_per_raw_sample",
+            "-show_entries", "format=duration,format_name",
             "-of", "json", path,
         ],
         capture_output=True, text=True, check=False,
@@ -60,13 +69,19 @@ def _probe(ffprobe, path):
     data = json.loads(result.stdout)
     streams = data.get("streams") or []
     if not streams:
-        _fail(f"{path}: no audio stream")
+        _fail(f"{path}: no audio stream ffmpeg can see")
     stream = streams[0]
     duration = float((data.get("format") or {}).get("duration") or 0.0)
     if duration <= 0:
         _fail(f"{path}: could not determine duration")
+    codec = stream.get("codec_name") or ""
     return {
+        # Renamed once the prepare stage has measured the real thing.
+        "container_duration": round(duration, 3),
         "duration": round(duration, 3),
+        "codec": codec,
+        "lossless": codec in LOSSLESS_CODECS,
+        "container": (data.get("format") or {}).get("format_name", ""),
         "sample_rate": int(stream["sample_rate"]),
         "channels": int(stream.get("channels") or 1),
         "sample_fmt": stream.get("sample_fmt") or "",
@@ -86,14 +101,29 @@ def cmd_meta(args):
         tracks.append({"participant": participant, "source": os.path.abspath(path), **probe})
 
     tracks.sort(key=lambda t: t["participant"])
-    rates = {t["sample_rate"] for t in tracks}
-    if len(rates) > 1:
+    rates = sorted({t["sample_rate"] for t in tracks})
+
+    # Every track must be frame-aligned at the same rate, or identical cuts
+    # would remove different amounts of time from each and they would drift.
+    resample_to = None
+    if args.resample_to == "auto":
+        resample_to = max(rates)
+    elif args.resample_to:
+        resample_to = int(args.resample_to)
+
+    if resample_to is None and len(rates) > 1:
         detail = ", ".join(f"{t['participant']}={t['sample_rate']}Hz" for t in tracks)
         _fail(
-            "all tracks of an episode must share a sample rate so that cuts land "
-            f"on identical samples on every track ({detail}). Resample the odd one "
-            "out before running."
+            "all tracks of an episode must share a sample rate, so that one cut "
+            f"removes the same span from every track ({detail}). Either resample "
+            "beforehand, or set RESAMPLE_TO (or --resample-to auto) to have this "
+            "run do it."
         )
+
+    target_rate = resample_to if resample_to is not None else rates[0]
+    for track in tracks:
+        track["render_rate"] = target_rate
+        track["resampled"] = track["sample_rate"] != target_rate
 
     durations = [t["duration"] for t in tracks]
     spread = max(durations) - min(durations)
@@ -101,18 +131,71 @@ def cmd_meta(args):
         "episode_id": args.episode,
         "duration": max(durations),
         "duration_spread": round(spread, 3),
-        "sample_rate": rates.pop(),
+        "sample_rate": target_rate,
+        "resample_to": resample_to,
+        "durations_measured": False,
         "tracks": tracks,
     }
     _write_json(args.out, meta)
+
+    formats = ", ".join(sorted({f"{t['codec']}" for t in tracks}))
     print(
-        f"{len(tracks)} tracks, {meta['sample_rate']} Hz, "
+        f"{len(tracks)} tracks, {formats}, {target_rate} Hz, "
         f"{meta['duration']:.1f}s (spread {spread:.3f}s)"
     )
+    changed = [t for t in tracks if t["resampled"]]
+    if changed:
+        print(
+            "resampling to "
+            f"{target_rate} Hz: "
+            + ", ".join(f"{t['participant']} from {t['sample_rate']}" for t in changed)
+        )
+    lossy = [t for t in tracks if not t["lossless"]]
+    if lossy:
+        print(
+            "note: lossy input ("
+            + ", ".join(f"{t['participant']}={t['codec']}" for t in lossy)
+            + "). Cutting and re-encoding cannot recover what the codec already "
+            "discarded, and a lossless output will be larger for no gain."
+        )
     if spread > 1.0:
         print(
             f"warning: track lengths differ by {spread:.1f}s — if they are not "
             "aligned at sample 0 the cleanup will drift"
+        )
+
+
+def cmd_meta_refresh(args):
+    """Replace container durations with the length of the decoded audio.
+
+    A container's header is not always right: AAC decodes longer than it claims,
+    Opus shorter, and a truncated file of any format can claim anything. The
+    prepare stage has already decoded every track, so its output is the
+    authority — and the frame-exact render prediction depends on it.
+    """
+    meta = _read_json(args.meta)
+    changes = []
+    for track in meta["tracks"]:
+        prepared = os.path.join(args.prep_dir, f"{track['participant']}.wav")
+        if not os.path.isfile(prepared):
+            _fail(f"prepared track missing, cannot measure: {prepared}")
+        measured = round(vad.wav_duration(prepared), 4)
+        before = track["duration"]
+        track["duration"] = measured
+        if abs(measured - before) > 0.002:
+            changes.append((track["participant"], before, measured))
+
+    meta["duration"] = max(t["duration"] for t in meta["tracks"])
+    durations = [t["duration"] for t in meta["tracks"]]
+    meta["duration_spread"] = round(max(durations) - min(durations), 3)
+    meta["durations_measured"] = True
+    _write_json(args.meta, meta)
+
+    print(f"measured length of {len(meta['tracks'])} tracks: {meta['duration']:.3f}s")
+    for participant, before, after in changes:
+        print(
+            f"  {participant}: container said {before:.3f}s, decodes to "
+            f"{after:.3f}s ({(after - before) * 1000:+.0f} ms)"
         )
 
 
@@ -138,9 +221,10 @@ def cmd_meta_shell(args):
         ("TRACK_SOURCE", "source"),
         ("TRACK_DURATION", "duration"),
         ("TRACK_SAMPLE_FMT", "sample_fmt"),
+        ("TRACK_CODEC", "codec"),
     ):
         pairs = " ".join(
-            f"[{shlex.quote(t['participant'])}]={shlex.quote(str(t[field]))}"
+            f"[{shlex.quote(t['participant'])}]={shlex.quote(str(t.get(field, '')))}"
             for t in tracks
         )
         print(f"{key}=({pairs})")
@@ -343,8 +427,12 @@ def cmd_filters(args):
     for track in meta["tracks"]:
         participant = track["participant"]
         mutes = current["mutes"].get(participant, [])
+        # The rate the filter graph works at, which is the output rate too.
+        render_rate = int(track.get("render_rate") or track["sample_rate"])
+        resample = render_rate if render_rate != track["sample_rate"] else None
+
         graph = render.build_filter(
-            current["cuts"], mutes, args.frame_samples, args.fade
+            current["cuts"], mutes, args.frame_samples, args.fade, resample=resample
         )
         path = os.path.join(args.dir, f"{participant}.filter")
         if graph is None:
@@ -357,7 +445,7 @@ def cmd_filters(args):
         # The track may be shorter than the episode; cuts past its end are moot.
         samples = render.expected_output_samples(
             min(track["duration"], current["duration"]),
-            track["sample_rate"],
+            render_rate,
             args.frame_samples,
             current["cuts"],
         )
@@ -365,17 +453,26 @@ def cmd_filters(args):
             "filter": path if graph is not None else None,
             "passthrough": graph is None,
             "mutes": len(mutes),
+            "resampled_from": track["sample_rate"] if resample else None,
             "expected_samples": samples,
-            "expected_duration": round(samples / float(track["sample_rate"]), 3),
-            "sample_rate": track["sample_rate"],
+            "expected_duration": round(samples / float(render_rate), 3),
+            "sample_rate": render_rate,
             "sample_fmt": track["sample_fmt"],
+            "source_lossless": track.get("lossless", True),
         }
 
     _write_json(args.out, {"frame_samples": args.frame_samples, "tracks": expectations})
     for participant, values in expectations.items():
-        kind = "passthrough" if values["passthrough"] else f"{values['mutes']} mutes"
+        notes = []
+        if values["passthrough"]:
+            notes.append("nothing to change")
+        else:
+            notes.append(f"{values['mutes']} mutes")
+        if values["resampled_from"]:
+            notes.append(f"resampled from {values['resampled_from']} Hz")
         print(
-            f"{participant}: {values['expected_duration']:.3f}s expected ({kind})"
+            f"{participant}: {values['expected_duration']:.3f}s expected "
+            f"({', '.join(notes)})"
         )
 
 
@@ -450,8 +547,20 @@ def build_parser():
     p.add_argument("--episode", required=True)
     p.add_argument("--ffprobe", default="ffprobe")
     p.add_argument("--out", required=True)
+    p.add_argument(
+        "--resample-to", default="",
+        help="'auto' for the highest rate present, or an explicit rate; "
+             "empty makes a rate mismatch an error",
+    )
     p.add_argument("track", nargs="+", help="participant=path")
     p.set_defaults(func=cmd_meta)
+
+    p = sub.add_parser(
+        "meta-refresh", help="replace container durations with measured ones"
+    )
+    p.add_argument("--meta", required=True)
+    p.add_argument("--prep-dir", required=True)
+    p.set_defaults(func=cmd_meta_refresh)
 
     p = sub.add_parser("meta-shell", help="meta.json as shell assignments")
     p.add_argument("--meta", required=True)

@@ -26,6 +26,7 @@ declare -a INPUT_FILES=()
 declare -A TRACK_SOURCE=()
 declare -A TRACK_DURATION=()
 declare -A TRACK_SAMPLE_FMT=()
+declare -A TRACK_CODEC=()
 
 LLAMA_PID=""
 LLAMA_URL=""
@@ -110,13 +111,21 @@ stage_discover() {
 
     if (( ${#INPUT_FILES[@]} == 0 )); then
         [[ -d "$INPUT_DIR" ]] || die "input directory does not exist: $INPUT_DIR"
+        # Any of the configured extensions, matched case-insensitively — some
+        # recorders write .WAV, and ffmpeg does not care either way.
+        local -a name_test=()
+        local ext
+        for ext in $INPUT_EXTS; do
+            (( ${#name_test[@]} )) && name_test+=(-o)
+            name_test+=(-iname "*.${ext}")
+        done
         mapfile -t INPUT_FILES < <(
-            find "$INPUT_DIR" -maxdepth 1 -type f -name "*.${TRACK_EXT}" | sort
+            find "$INPUT_DIR" -maxdepth 1 -type f \( "${name_test[@]}" \) | sort
         )
     fi
 
     if (( ${#INPUT_FILES[@]} == 0 )); then
-        log_warn "no .${TRACK_EXT} files in $INPUT_DIR — nothing to do"
+        log_warn "no files matching [$INPUT_EXTS] in $INPUT_DIR — nothing to do"
         return 2
     fi
 
@@ -130,7 +139,7 @@ stage_discover() {
         base=$(basename "$file")
         base="${base%.*}"
         if [[ "$base" != *"$TRACK_SEPARATOR"* ]]; then
-            die "cannot parse '$base': expected <episode>${TRACK_SEPARATOR}<participant>.${TRACK_EXT}"
+            die "cannot parse '$base': expected <episode>${TRACK_SEPARATOR}<participant>.<ext>"
         fi
         episode="${base%%"$TRACK_SEPARATOR"*}"
         participant="${base#*"$TRACK_SEPARATOR"}"
@@ -149,8 +158,10 @@ stage_discover() {
             die "found tracks from two episodes ('$EPISODE_ID' and '$episode'); process them separately or pass --episode"
         fi
 
+        # Also catches the same track present in two formats, which would
+        # otherwise silently pick whichever sorted first.
         [[ -z "${seen[$participant]:-}" ]] \
-            || die "duplicate participant '$participant' ($file and ${seen[$participant]})"
+            || die "participant '$participant' appears twice: $(basename "${seen[$participant]}") and $(basename "$file"). Keep one and remove the other, or narrow INPUT_EXTS."
         seen["$participant"]="$file"
         track_args+=("$participant=$file")
     done
@@ -195,9 +206,19 @@ stage_discover() {
             log_warn "no meta.json yet, so later stages can only be listed"
         fi
     else
-        run py meta --episode "$EPISODE_ID" --ffprobe "$FFPROBE" \
-            --out "$WORK/meta.json" "${track_args[@]}" \
-            || die "could not build meta.json"
+        local -a meta_args=(
+            meta --episode "$EPISODE_ID" --ffprobe "$FFPROBE"
+            --out "$WORK/meta.json"
+        )
+        [[ -n "$RESAMPLE_TO" ]] && meta_args+=(--resample-to "$RESAMPLE_TO")
+        local probe_report
+        if ! probe_report=$(py "${meta_args[@]}" "${track_args[@]}" 2>&1); then
+            # log_line, not log_report: an explanation of a failure has to be
+            # visible even under --quiet.
+            log_line "$probe_report"
+            die "could not inspect the input tracks"
+        fi
+        log_report "$probe_report"
         load_meta
     fi
 
@@ -266,6 +287,23 @@ stage_prepare() {
     done
 
     pool_wait "decoding" "${markers[@]}"
+
+    # Now that every track has actually been decoded, take its length from the
+    # decoded audio rather than from a container header that may be wrong — an
+    # AAC file decodes longer than it claims, an Opus one shorter, and a
+    # truncated file of any format can claim anything. The frame-exact render
+    # prediction is only exact if this is right.
+    if [[ "$DRY_RUN" != 1 ]]; then
+        local measure_report
+        if ! measure_report=$(py meta-refresh --meta "$WORK/meta.json" \
+            --prep-dir "$WORK/prep" 2>&1); then
+            log_line "$measure_report"
+            die "could not measure the decoded track lengths"
+        fi
+        log_report "$measure_report"
+        load_meta
+    fi
+
     state_mark prepare
     stage_end "${#PARTICIPANTS[@]} tracks decoded"
 }
@@ -632,30 +670,54 @@ stage_render() {
     [[ "$DRY_RUN" == 1 ]] || mkdir -p "$STAGING_DIR"
 
     local -a markers=()
-    local participant target marker filter fmt
-    local -a fmt_args=()
+    local participant target marker filter fmt source
+    local -a fmt_args=() encode_args=()
 
     for participant in "${PARTICIPANTS[@]}"; do
-        target="$STAGING_DIR/${participant}${OUTPUT_SUFFIX}.${TRACK_EXT}"
+        source="${TRACK_SOURCE[$participant]}"
+        target="$STAGING_DIR/${participant}${OUTPUT_SUFFIX}.${OUTPUT_EXT}"
         marker="$STAGE_DIR/render-$participant.ok"
         filter="$WORK/render/$participant.filter"
         markers+=("$marker")
         rm -f "$marker"
 
+        # Bit depth is only meaningful to encoders that have one to preserve.
         fmt="${TRACK_SAMPLE_FMT[$participant]:-}"
         fmt_args=()
-        case "$fmt" in
-            s16|s32) fmt_args=(-sample_fmt "$fmt") ;;
+        case "$OUTPUT_CODEC" in
+            flac|alac|pcm_*|wavpack)
+                case "$fmt" in
+                    s16|s32) fmt_args=(-sample_fmt "$fmt") ;;
+                esac
+                ;;
         esac
 
+        encode_args=(-c:a "$OUTPUT_CODEC")
+        [[ "$OUTPUT_CODEC" == flac ]] \
+            && encode_args+=(-compression_level "$OUTPUT_COMPRESSION")
+        # Deliberately unquoted: a user-supplied argument string.
+        # shellcheck disable=SC2206
+        [[ -n "$OUTPUT_EXTRA_ARGS" ]] && encode_args+=($OUTPUT_EXTRA_ARGS)
+        encode_args+=("${fmt_args[@]}")
+
         if [[ ! -f "$filter" ]]; then
-            # Nothing to edit on this track, so re-encoding would be pointless.
-            log_info "$participant needs no edits, copying it through"
-            if [[ "$DRY_RUN" == 1 ]]; then
-                :
-            else
-                cp -- "${TRACK_SOURCE[$participant]}" "$target" \
-                    || die "could not copy $participant"
+            # No edits and no resampling. Copying beats re-encoding, but only
+            # when the file is already in the format being asked for —
+            # otherwise it still has to be converted.
+            if [[ "${TRACK_CODEC[$participant]:-}" == "$OUTPUT_CODEC" \
+                  && "${source##*.}" == "$OUTPUT_EXT" ]]; then
+                log_info "$participant needs no edits and is already $OUTPUT_CODEC, copying it through"
+                if [[ "$DRY_RUN" != 1 ]]; then
+                    cp -- "$source" "$target" || die "could not copy $participant"
+                    state_touch "$marker"
+                fi
+                continue
+            fi
+            log_info "$participant needs no edits, converting to $OUTPUT_CODEC"
+            if [[ "$DRY_RUN" != 1 ]]; then
+                run "$FFMPEG" -nostdin -y -v warning -i "$source" \
+                    -map 0:a:0 "${encode_args[@]}" "$target" \
+                    || die "could not convert $participant"
                 state_touch "$marker"
             fi
             continue
@@ -663,10 +725,9 @@ stage_render() {
 
         local -a render_cmd=(
             "$FFMPEG" -nostdin -y -v warning -progress pipe:1 -nostats
-            -i "${TRACK_SOURCE[$participant]}"
+            -i "$source"
             -filter_complex_script "$filter" -map '[out]'
-            -c:a flac -compression_level "$OUTPUT_COMPRESSION"
-            "${fmt_args[@]}" "$target"
+            "${encode_args[@]}" "$target"
         )
 
         if (( FFMPEG_JOBS <= 1 )); then
@@ -695,7 +756,7 @@ stage_render() {
     # Verify against the frame-exact prediction, not a rule of thumb.
     local -a actual=()
     for participant in "${PARTICIPANTS[@]}"; do
-        target="$STAGING_DIR/${participant}${OUTPUT_SUFFIX}.${TRACK_EXT}"
+        target="$STAGING_DIR/${participant}${OUTPUT_SUFFIX}.${OUTPUT_EXT}"
         [[ -s "$target" ]] || die "rendered file is missing or empty: $target"
         actual+=("$participant=$(probe_duration "$target")")
     done
@@ -737,8 +798,8 @@ stage_finalize() {
     # directory so this is a rename on the same filesystem, not a copy.
     local participant staged final
     for participant in "${PARTICIPANTS[@]}"; do
-        staged="$STAGING_DIR/${participant}${OUTPUT_SUFFIX}.${TRACK_EXT}"
-        final="$OUT_DIR/${participant}${OUTPUT_SUFFIX}.${TRACK_EXT}"
+        staged="$STAGING_DIR/${participant}${OUTPUT_SUFFIX}.${OUTPUT_EXT}"
+        final="$OUT_DIR/${participant}${OUTPUT_SUFFIX}.${OUTPUT_EXT}"
         mv -f -- "$staged" "$final" || die "could not publish $final"
         log_ok "$(basename "$final") ($(du -h "$final" | cut -f1))"
     done

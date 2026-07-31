@@ -969,6 +969,44 @@ class TestFilterExpressions(unittest.TestCase):
     def test_build_filter_passthrough(self):
         self.assertIsNone(render.build_filter([], [], 512, 0.03))
 
+    def test_resample_alone_still_needs_a_graph(self):
+        graph = render.build_filter([], [], 512, 0.03, resample=48000)
+        self.assertIsNotNone(graph)
+        self.assertIn("aresample=48000", graph)
+        # Nothing is being cut, so there is no reason to re-chunk the frames.
+        self.assertNotIn("asetnsamples", graph)
+        self.assertNotIn("aselect", graph)
+
+    def test_resample_comes_before_frames_are_fixed(self):
+        """The ordering the whole sync guarantee rests on.
+
+        Cuts are decided per frame. If each track were resampled after its
+        frames were fixed, every track would quantise at its own rate and an
+        identical cut list would remove slightly different spans from each.
+        """
+        graph = render.build_filter(
+            [{"start": 1.0, "end": 2.0}],
+            [{"start": 5.0, "end": 5.5}],
+            512, 0.03, resample=48000,
+        )
+        order = [
+            graph.index("aresample="),
+            graph.index("asetnsamples="),
+            graph.index("volume="),
+            graph.index("aselect="),
+            graph.index("asetpts="),
+        ]
+        self.assertEqual(order, sorted(order), f"wrong filter order: {graph}")
+
+    def test_expected_samples_follow_the_render_rate(self):
+        """A resampled track's length is predicted at its output rate."""
+        cuts = [{"start": 1.0, "end": 2.0}]
+        at_44 = render.expected_output_samples(10.0, 44100, 512, cuts)
+        at_48 = render.expected_output_samples(10.0, 48000, 512, cuts)
+        # Same span removed either way, so the durations agree even though the
+        # sample counts do not.
+        self.assertAlmostEqual(at_44 / 44100, at_48 / 48000, places=2)
+
     def test_build_filter_shapes(self):
         cuts = [{"start": 1.0, "end": 2.0}]
         mutes = [{"start": 5.0, "end": 5.5}]

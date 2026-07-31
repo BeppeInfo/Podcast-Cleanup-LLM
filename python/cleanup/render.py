@@ -74,12 +74,25 @@ def mute_gain_expression(mutes, fade: float) -> str:
     return f"1-({tree})"
 
 
-def build_filter(cuts, mutes, frame_samples: int, fade: float) -> str | None:
-    """Full filtergraph for one track, or None when the track is untouched."""
-    if not cuts and not mutes:
+def build_filter(
+    cuts, mutes, frame_samples: int, fade: float, resample: int | None = None
+) -> str | None:
+    """Full filtergraph for one track, or None when the track is untouched.
+
+    `resample` must come first in the chain, before frames are fixed: cuts are
+    decided per frame, so every track has to be chunked at the same rate or an
+    identical cut list would remove slightly different spans from each and they
+    would drift apart. Resampling on the output side instead would leave each
+    track quantising at its own rate — the one arrangement that breaks sync.
+    """
+    if not cuts and not mutes and not resample:
         return None
 
-    chain = [f"asetnsamples=n={frame_samples}:p=0"]
+    chain = []
+    if resample:
+        chain.append(f"aresample={resample}")
+    if cuts or mutes:
+        chain.append(f"asetnsamples=n={frame_samples}:p=0")
     if mutes:
         chain.append(
             f"volume=volume='{mute_gain_expression(mutes, fade)}':eval=frame"
