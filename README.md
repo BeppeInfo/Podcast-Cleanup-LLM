@@ -80,6 +80,32 @@ If you serve either model remotely, these are the settings that matter to this
 pipeline. Both projects' flags drift between versions — check `--help` before
 copying.
 
+### Authentication
+
+Neither server requires a key by default, and on a trusted LAN neither needs
+one. If an endpoint is behind something that does — a reverse proxy in front of
+whisper-server, or `llama-server --api-key` — set the matching pair:
+
+| | inline | from a file |
+| --- | --- | --- |
+| **Whisper** | `WHISPER_API_KEY` | `WHISPER_API_KEY_FILE` |
+| **LLM** | `LLAMA_API_KEY` | `LLAMA_API_KEY_FILE` |
+
+Either form sends `Authorization: Bearer <key>`. Prefer the `_FILE` form: a key
+in the config file is also a key in your editor's backups, and readable by anyone
+who can read the config, whereas a key in its own file can be `chmod 600`. A file
+readable beyond its owner draws a warning.
+
+The key is never passed as a command-line argument, since argv is readable by
+every process on the machine, and the config dump records only whether one was
+set — the run log is copied into the output directory and outlives the episode.
+
+**A refused key fails fast rather than being retried.** The readiness check
+reports it before the episode starts instead of polling out its timeout, and the
+detection stage stops the whole run on the first refusal. Retrying cannot help,
+and since that stage drops a chunk it cannot process, carrying on would otherwise
+deliver an episode that had quietly found no edits at all.
+
 ### whisper-server
 
 ```sh

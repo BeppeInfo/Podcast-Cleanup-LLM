@@ -58,6 +58,17 @@ WHISPER_ENDPOINT=""
 #WHISPER_ENDPOINT="http://gpu-box.lan:8080"
 WHISPER_ENDPOINT_PATH="/inference"
 
+# Sent as "Authorization: Bearer <key>". whisper.cpp's own server has no
+# authentication, so this is for whatever you have put in front of it — a
+# reverse proxy, or a hosted endpoint that speaks the same API.
+#
+# Prefer the _FILE form. A key written here is also a key in your editor's
+# backups, and readable by anyone who can read this file; a key in its own file
+# can be chmod 600, and one that is readable more widely draws a warning. Either
+# way the key never reaches the run log or a command line.
+WHISPER_API_KEY=""
+#WHISPER_API_KEY_FILE="/etc/podcast-cleanup/whisper.key"
+
 # Audio is uploaded in chunks of this many seconds; 0 sends the whole track in
 # one request. Boundaries are nudged onto the middle of a silence found by the
 # VAD stage, so a chunk edge does not land inside a word. Chunking also means
@@ -92,6 +103,12 @@ WHISPER_JOBS="1"
 # other machine's business.
 LLAMA_ENDPOINT=""
 #LLAMA_ENDPOINT="http://127.0.0.1:8081"
+
+# Matches llama-server's own --api-key, and applies to a local server too if
+# LLAMA_EXTRA_ARGS starts one with that flag. Same advice as for the Whisper key
+# above: prefer the _FILE form.
+LLAMA_API_KEY=""
+#LLAMA_API_KEY_FILE="/etc/podcast-cleanup/llama.key"
 
 LLAMA_SERVER_BIN="/opt/llama.cpp/bin/llama-server"
 LLAMA_MODEL="/srv/llm/models/qwen/Qwen3.6-35B-A3B.gguf"
