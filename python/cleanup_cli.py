@@ -37,6 +37,17 @@ def _progress(done, total):
     print(f"PROGRESS {done} {total}", flush=True)
 
 
+# API keys arrive through the environment, never through argv: a command line is
+# readable by any process on the machine, and the shell logs every command it
+# runs into a file that outlives the episode.
+WHISPER_KEY_ENV = "PODCAST_WHISPER_API_KEY"
+LLAMA_KEY_ENV = "PODCAST_LLAMA_API_KEY"
+
+
+def _api_key(name):
+    return os.environ.get(name) or None
+
+
 def _fail(message):
     raise SystemExit(f"error: {message}")
 
@@ -284,7 +295,8 @@ def cmd_transcribe_remote(args):
         speech = [tuple(span) for span in _read_json(args.vad)["speech"]]
 
     client = asr.WhisperClient(
-        args.endpoint, timeout=args.request_timeout, path=args.path
+        args.endpoint, timeout=args.request_timeout, path=args.path,
+        api_key=_api_key(WHISPER_KEY_ENV),
     )
     parsed = asr.transcribe(
         client,
@@ -321,14 +333,16 @@ def cmd_transcribe_remote(args):
 
 
 def cmd_whisper_wait(args):
-    client = asr.WhisperClient(args.endpoint, path=args.path)
+    client = asr.WhisperClient(
+        args.endpoint, path=args.path, api_key=_api_key(WHISPER_KEY_ENV)
+    )
     if not client.wait_until_ready(args.timeout):
         raise SystemExit(1)
     print("whisper endpoint reachable")
 
 
 def cmd_llm_wait(args):
-    client = llm.LlamaClient(args.endpoint)
+    client = llm.LlamaClient(args.endpoint, api_key=_api_key(LLAMA_KEY_ENV))
     if not client.wait_until_ready(args.timeout):
         raise SystemExit(1)
     print("llama endpoint ready")
@@ -342,7 +356,8 @@ def cmd_detect(args):
         _fail(f"unknown edit kinds: {', '.join(unknown)} (known: {', '.join(llm.KINDS)})")
 
     client = llm.LlamaClient(
-        args.endpoint, timeout=args.request_timeout, temperature=args.temperature
+        args.endpoint, timeout=args.request_timeout, temperature=args.temperature,
+        api_key=_api_key(LLAMA_KEY_ENV),
     )
     result = llm.detect(
         client,
@@ -669,6 +684,10 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
+    except llm.AuthRejected as exc:
+        # A clear sentence beats a traceback for something this mundane.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except BrokenPipeError:
         return 1
     return 0

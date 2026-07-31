@@ -437,9 +437,10 @@ stage_transcribe_remote() {
     config_need_python
 
     if [[ "$DRY_RUN" != 1 ]]; then
-        py whisper-wait --endpoint "$WHISPER_ENDPOINT" \
+        PODCAST_WHISPER_API_KEY="$WHISPER_API_KEY" \
+            py whisper-wait --endpoint "$WHISPER_ENDPOINT" \
             --path "$WHISPER_ENDPOINT_PATH" --timeout 60 \
-            || die "the whisper endpoint at $WHISPER_ENDPOINT is not reachable"
+            || die "the whisper endpoint at $WHISPER_ENDPOINT is not usable"
     fi
 
     local participant target wav index=0
@@ -469,7 +470,8 @@ stage_transcribe_remote() {
         if [[ "$DRY_RUN" == 1 ]]; then
             run py "${args[@]}"
         else
-            run_streaming parse_python_progress "$participant" \
+            PODCAST_WHISPER_API_KEY="$WHISPER_API_KEY" \
+                run_streaming parse_python_progress "$participant" \
                 "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}" \
                 || die "remote transcription failed for $participant"
             state_touch "$STAGE_DIR/asr-$participant.ok"
@@ -493,8 +495,9 @@ llama_start() {
         LLAMA_URL="$LLAMA_ENDPOINT"
         log_info "using the llama server already at $LLAMA_URL"
         [[ "$DRY_RUN" == 1 ]] && return 0
-        py llm-wait --endpoint "$LLAMA_URL" --timeout 30 \
-            || die "the configured llama endpoint at $LLAMA_URL is not responding"
+        PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
+            py llm-wait --endpoint "$LLAMA_URL" --timeout 30 \
+            || die "the configured llama endpoint at $LLAMA_URL is not usable"
         log_ok "endpoint is responding"
         return 0
     fi
@@ -523,7 +526,8 @@ llama_start() {
     LLAMA_PID=$!
     log_debug "llama-server pid $LLAMA_PID, log $server_log"
 
-    if ! py llm-wait --endpoint "$LLAMA_URL" --timeout "$LLAMA_STARTUP_TIMEOUT"; then
+    if ! PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
+        py llm-wait --endpoint "$LLAMA_URL" --timeout "$LLAMA_STARTUP_TIMEOUT"; then
         log_error "llama-server never became ready; last lines of its log:"
         [[ -f "$server_log" ]] && log_line "$(tail -n 20 "$server_log")"
         llama_stop
@@ -588,16 +592,26 @@ stage_detect() {
         fi
 
         log_info "qwen: $participant ($index/$total)"
-        if run_streaming parse_python_progress "$participant" \
+        local rc=0
+        PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
+            run_streaming parse_python_progress "$participant" \
             "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" detect \
             --words "$words" --endpoint "$LLAMA_URL" --out "$target" \
             --audit "$WORK/llm/$participant.audit.jsonl" \
             --chunk-words "$LLM_CHUNK_WORDS" --overlap "$LLM_CHUNK_OVERLAP" \
             --max-words "$LLM_MAX_EDIT_WORDS" --max-seconds "$LLM_MAX_EDIT_SECONDS" \
             --min-confidence "$LLM_MIN_CONFIDENCE" --temperature "$LLM_TEMP" \
-            --request-timeout "$LLAMA_REQUEST_TIMEOUT" --kinds "$LLM_ACCEPT_KINDS"
-        then
+            --request-timeout "$LLAMA_REQUEST_TIMEOUT" --kinds "$LLM_ACCEPT_KINDS" \
+            || rc=$?
+
+        if (( rc == 0 )); then
             touch "$STAGE_DIR/llm-$participant.ok"
+        elif (( rc == 2 )); then
+            # Exit 2 is a refused API key. Every remaining track would fail the
+            # same way, and carrying on would deliver an episode that quietly
+            # found no edits at all — so this one stops the run.
+            llama_stop
+            die "the LLM endpoint refused our credentials. Fix the key, then resume with: $0 --episode $EPISODE_ID --from detect"
         else
             failed=$(( failed + 1 ))
             log_warn "edit detection failed for $participant; that track keeps its disfluencies"

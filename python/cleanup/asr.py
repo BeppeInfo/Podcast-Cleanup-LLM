@@ -29,6 +29,7 @@ import urllib.request
 import wave
 
 from . import intervals as iv
+from .llm import AuthRejected
 
 # Below this, a trailing chunk is merged into its predecessor rather than sent
 # on its own — whisper's accuracy suffers on very short fragments.
@@ -241,25 +242,59 @@ def _multipart(fields: dict, filename: str, content: bytes) -> tuple[bytes, str]
 
 
 class WhisperClient:
-    def __init__(self, endpoint: str, timeout: float = 1800.0, path: str = "/inference"):
+    def __init__(
+        self,
+        endpoint: str,
+        timeout: float = 1800.0,
+        path: str = "/inference",
+        api_key: str | None = None,
+    ):
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
         self.path = path
+        self.api_key = api_key or None
+
+    def _headers(self, **extra) -> dict:
+        headers = dict(extra)
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _auth_rejected(self, code: int) -> AuthRejected:
+        return AuthRejected(
+            f"the whisper endpoint rejected our credentials (HTTP {code}). "
+            + (
+                "Check WHISPER_API_KEY against whatever fronts the server."
+                if self.api_key
+                else "It requires an API key; set WHISPER_API_KEY or "
+                "WHISPER_API_KEY_FILE."
+            )
+        )
 
     def wait_until_ready(self, timeout: float, poll: float = 2.0) -> bool:
         """Any HTTP answer means a server is there; only a refused connection
         counts as absent. `/inference` rejects GET, and that rejection is proof
-        enough that it exists."""
+        enough that it exists.
+
+        A 401 is the exception: something is listening, but it will refuse the
+        real request too, so it is reported now rather than mid-episode.
+        """
         import time
 
         deadline = time.monotonic() + timeout
         last = "no response"
         while time.monotonic() < deadline:
             for probe in (self.path, "/"):
+                request = urllib.request.Request(
+                    f"{self.endpoint}{probe}", headers=self._headers()
+                )
                 try:
-                    with urllib.request.urlopen(f"{self.endpoint}{probe}", timeout=10):
+                    with urllib.request.urlopen(request, timeout=10):
                         return True
-                except urllib.error.HTTPError:
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (401, 403):
+                        print(self._auth_rejected(exc.code))
+                        return False
                     return True  # it spoke HTTP, so it is listening
                 except Exception as exc:
                     last = f"{type(exc).__name__} on {probe}"
@@ -274,11 +309,19 @@ class WhisperClient:
         request = urllib.request.Request(
             f"{self.endpoint}{self.path}",
             data=body,
-            headers={"Content-Type": content_type, "Accept": "application/json"},
+            headers=self._headers(
+                **{"Content-Type": content_type, "Accept": "application/json"}
+            ),
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            return json.loads(response.read().decode("utf-8", errors="replace"))
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                exc.close()  # or its buffered body leaks a ResourceWarning
+                raise self._auth_rejected(exc.code) from exc
+            raise
 
 
 def transcribe(

@@ -35,6 +35,11 @@ config_defaults() {
     # llama, or the reverse, are both fine.
     : "${WHISPER_ENDPOINT:=}"
     : "${WHISPER_ENDPOINT_PATH:=/inference}"
+    # Sent as "Authorization: Bearer <key>". whisper.cpp's own server has no
+    # auth, so this is for a reverse proxy in front of it. Prefer the _FILE form:
+    # a key in the config file is a key in your editor's backups.
+    : "${WHISPER_API_KEY:=}"
+    : "${WHISPER_API_KEY_FILE:=}"
     # Audio is uploaded in chunks of this many seconds (0 sends the whole
     # track). Boundaries are nudged into silence found by the VAD stage.
     : "${WHISPER_CHUNK_SECONDS:=600}"
@@ -50,6 +55,10 @@ config_defaults() {
     # LLAMA_ENDPOINT: if set, an already-running server is used as-is and this
     # script never spawns or stops one.
     : "${LLAMA_ENDPOINT:=}"
+    # Matches llama-server's own --api-key. Applies to a local server too, if
+    # LLAMA_EXTRA_ARGS starts one with --api-key.
+    : "${LLAMA_API_KEY:=}"
+    : "${LLAMA_API_KEY_FILE:=}"
     : "${LLAMA_SERVER_BIN:=/opt/llama.cpp/bin/llama-server}"
     : "${LLAMA_MODEL:=/srv/llm/models/qwen/Qwen3.6-35B-A3B.gguf}"
     : "${LLAMA_HOST:=127.0.0.1}"
@@ -170,6 +179,46 @@ config_load() {
     done
 
     config_defaults
+}
+
+# --- api keys ----------------------------------------------------------------
+#
+# Keys are resolved once, held only in shell variables, and handed to Python
+# through the environment — never as a command-line argument, since argv is
+# readable by any process on the machine, and never through the run log, which
+# outlives the episode.
+
+_read_key_file() {
+    local label="$1" path="$2"
+    [[ -f "$path" ]] || die "$label file not found: $path"
+    [[ -r "$path" ]] || die "$label file is not readable: $path"
+
+    # A secret readable by anyone on the box is not much of a secret.
+    local mode
+    if mode=$(stat -c '%a' "$path" 2>/dev/null) && [[ "$mode" =~ ^[0-7]+$ ]]; then
+        local group=$(( (10#$mode / 10) % 10 )) other=$(( 10#$mode % 10 ))
+        if (( (group & 4) || (other & 4) )); then
+            log_warn "$label file $path is readable beyond its owner (mode $mode); chmod 600 it"
+        fi
+    fi
+
+    local value
+    IFS= read -r value <"$path" || true
+    # Trim surrounding whitespace, which a stray newline or editor would add.
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    [[ -n "$value" ]] || die "$label file $path is empty"
+    printf '%s' "$value"
+}
+
+config_resolve_api_keys() {
+    if [[ -n "$WHISPER_API_KEY_FILE" ]]; then
+        WHISPER_API_KEY=$(_read_key_file WHISPER_API_KEY "$WHISPER_API_KEY_FILE") || exit 1
+    fi
+    if [[ -n "$LLAMA_API_KEY_FILE" ]]; then
+        LLAMA_API_KEY=$(_read_key_file LLAMA_API_KEY "$LLAMA_API_KEY_FILE") || exit 1
+    fi
+    return 0
 }
 
 # --- validation --------------------------------------------------------------
@@ -318,9 +367,21 @@ config_need_python() {
 }
 
 # config_dump — every effective setting, to the log (and to stderr at -v).
+#
+# API keys are reported as present or absent and never by value: this log is
+# copied into the output directory and kept after everything else is deleted.
 config_dump() {
     local v
     log_debug "config file: ${CONFIG_FILE:-<none, using defaults>}"
+    local secret
+    for v in WHISPER_API_KEY LLAMA_API_KEY; do
+        secret="${!v}"
+        if [[ -n "$secret" ]]; then
+            log_raw "  config $v=<set, ${#secret} chars, redacted>"
+        else
+            log_raw "  config $v=<unset>"
+        fi
+    done
     for v in INPUT_DIR OUTPUT_DIR WORK_ROOT FAILED_DIR INPUT_EXTS TRACK_SEPARATOR \
              OUTPUT_CODEC OUTPUT_EXT OUTPUT_EXTRA_ARGS RESAMPLE_TO \
              WHISPER_ENDPOINT WHISPER_ENDPOINT_PATH WHISPER_CHUNK_SECONDS \

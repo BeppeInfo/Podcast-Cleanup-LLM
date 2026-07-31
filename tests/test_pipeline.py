@@ -511,12 +511,13 @@ class _StubLlamaServer:
     records the requests it received so the payload contract can be checked.
     """
 
-    def __init__(self, replies, health_status=200):
+    def __init__(self, replies, health_status=200, api_key=None):
         import http.server
         import threading
 
         self.replies = list(replies)
         self.requests = []
+        self.seen_auth = []
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -530,13 +531,29 @@ class _StubLlamaServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _authorised(self):
+                outer.seen_auth.append(self.headers.get("Authorization"))
+                if not api_key:
+                    return True
+                if self.headers.get("Authorization") == f"Bearer {api_key}":
+                    return True
+                length = int(self.headers.get("Content-Length", 0))
+                if length:
+                    self.rfile.read(length)
+                self._send(401, {"error": "invalid api key"})
+                return False
+
             def do_GET(self):
+                if not self._authorised():
+                    return
                 if self.path == "/health":
                     self._send(health_status, {"status": "ok"})
                 else:
                     self._send(404, {})
 
             def do_POST(self):
+                if not self._authorised():
+                    return
                 length = int(self.headers.get("Content-Length", 0))
                 outer.requests.append(json.loads(self.rfile.read(length)))
                 reply = (
@@ -693,6 +710,145 @@ class TestAgainstStubServer(unittest.TestCase):
         self.assertEqual(len(result["edits"]), 1)
         self.assertEqual((result["edits"][0]["first"], result["edits"][0]["last"]),
                          (6, 7))
+
+
+class TestApiKeyAuth(unittest.TestCase):
+    """Authentication for both remote clients.
+
+    The properties that matter: the header is exactly what llama-server's
+    --api-key expects, a refusal is reported rather than retried into silence,
+    and the key never reaches a file we keep.
+    """
+
+    KEY = "sk-test-abc123"
+
+    def _words(self, texts=("eu", "eu", "acho")):
+        return {
+            "participant": "alice",
+            "language": "pt",
+            "words": [
+                {"i": i, "text": t, "start": i * 0.5, "end": i * 0.5 + 0.4,
+                 "segment": 0}
+                for i, t in enumerate(texts)
+            ],
+            "segments": [],
+        }
+
+    def _server(self, replies, api_key=None):
+        server = _StubLlamaServer(replies, api_key=api_key)
+        self.addCleanup(server.close)
+        return server
+
+    # --- llama client ---------------------------------------------------------
+
+    def test_bearer_header_is_sent(self):
+        server = self._server([{"edits": []}], api_key=self.KEY)
+        client = llm.LlamaClient(server.endpoint, timeout=10, api_key=self.KEY)
+        self.assertTrue(client.wait_until_ready(timeout=5))
+        client.complete("hi", llm.response_schema(["stutter"]))
+        self.assertIn(f"Bearer {self.KEY}", server.seen_auth)
+
+    def test_no_header_when_no_key_configured(self):
+        server = self._server([{"edits": []}])
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        client.complete("hi", llm.response_schema(["stutter"]))
+        self.assertEqual(server.seen_auth, [None])
+
+    def test_missing_key_raises_auth_rejected(self):
+        server = self._server([{"edits": []}], api_key=self.KEY)
+        client = llm.LlamaClient(server.endpoint, timeout=10)  # no key
+        with self.assertRaises(llm.AuthRejected) as caught:
+            client.complete("hi", llm.response_schema(["stutter"]))
+        message = str(caught.exception)
+        self.assertIn("401", message)
+        self.assertIn("LLAMA_API_KEY", message)
+
+    def test_wrong_key_names_the_setting_to_check(self):
+        server = self._server([{"edits": []}], api_key=self.KEY)
+        client = llm.LlamaClient(server.endpoint, timeout=10, api_key="wrong")
+        with self.assertRaises(llm.AuthRejected) as caught:
+            client.complete("hi", llm.response_schema(["stutter"]))
+        self.assertIn("--api-key", str(caught.exception))
+
+    def test_health_check_fails_fast_rather_than_waiting_out_the_timeout(self):
+        """A refused key is not a loading model; waiting cannot fix it."""
+        import time
+
+        server = self._server([], api_key=self.KEY)
+        client = llm.LlamaClient(server.endpoint, api_key="wrong")
+        started = time.monotonic()
+        self.assertFalse(client.wait_until_ready(timeout=30, poll=2.0))
+        self.assertLess(
+            time.monotonic() - started, 5.0,
+            "should give up at once on a 401, not poll for the full timeout",
+        )
+
+    def test_detection_aborts_instead_of_dropping_every_chunk(self):
+        """The failure mode this guards: an episode that quietly finds nothing.
+
+        detect() swallows most errors per chunk on purpose. A refused key must
+        not be swallowed, or a misconfiguration would look like clean speech.
+        """
+        server = self._server([{"edits": []}], api_key=self.KEY)
+        client = llm.LlamaClient(server.endpoint, timeout=10)  # no key
+        with self.assertRaises(llm.AuthRejected):
+            llm.detect(
+                client, self._words(),
+                chunk_words=2, overlap=0,
+                limits={"max_words": 4, "max_seconds": 3.0, "min_confidence": 0.6},
+                accepted=["stutter"], retries=2,
+            )
+        # One attempt, not three: an auth failure is never retried.
+        self.assertEqual(len(server.seen_auth), 1)
+
+    def test_key_is_not_written_to_the_audit_log(self):
+        server = self._server(
+            [{"edits": [{"first": 0, "last": 1, "kind": "stutter",
+                         "confidence": 0.9}]}],
+            api_key=self.KEY,
+        )
+        audit = os.path.join(tempfile.mkdtemp(), "audit.jsonl")
+        client = llm.LlamaClient(server.endpoint, timeout=10, api_key=self.KEY)
+        llm.detect(
+            client, self._words(),
+            chunk_words=100, overlap=10,
+            limits={"max_words": 4, "max_seconds": 3.0, "min_confidence": 0.6},
+            accepted=["stutter"], audit_path=audit,
+        )
+        with open(audit, encoding="utf-8") as handle:
+            self.assertNotIn(self.KEY, handle.read())
+
+    # --- whisper client -------------------------------------------------------
+
+    def test_whisper_sends_the_bearer_header(self):
+        server = self._server([{"segments": []}], api_key=self.KEY)
+        client = asr.WhisperClient(server.endpoint, timeout=10, path="/health",
+                                   api_key=self.KEY)
+        self.assertTrue(client.wait_until_ready(timeout=5))
+        self.assertIn(f"Bearer {self.KEY}", server.seen_auth)
+
+    def test_whisper_probe_distinguishes_401_from_alive(self):
+        """A 405 means the route exists; a 401 means it will refuse the upload.
+
+        Treating both as "alive" would defer the failure to mid-episode.
+        """
+        server = self._server([], api_key=self.KEY)
+        good = asr.WhisperClient(server.endpoint, path="/health", api_key=self.KEY)
+        self.assertTrue(good.wait_until_ready(timeout=5))
+
+        bad = asr.WhisperClient(server.endpoint, path="/health", api_key="wrong")
+        self.assertFalse(bad.wait_until_ready(timeout=3, poll=0.5))
+
+    def test_whisper_upload_raises_auth_rejected(self):
+        server = self._server([{"segments": []}], api_key=self.KEY)
+        directory = tempfile.mkdtemp()
+        audio = os.path.join(directory, "chunk.wav")
+        with open(audio, "wb") as handle:
+            handle.write(b"RIFF....WAVEfmt ")
+        client = asr.WhisperClient(server.endpoint, timeout=10, api_key=None)
+        with self.assertRaises(llm.AuthRejected) as caught:
+            client.transcribe_file(audio, {"response_format": "verbose_json"})
+        self.assertIn("WHISPER_API_KEY", str(caught.exception))
 
 
 PARAMS = {

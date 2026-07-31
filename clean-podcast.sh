@@ -242,6 +242,7 @@ main() {
     config_load "$CONFIG_FILE"
     apply_overrides
     config_validate
+    config_resolve_api_keys
     config_dump
 
     local -a stages=()

@@ -162,39 +162,87 @@ def plan_chunks(word_count: int, chunk_words: int, overlap: int):
     return chunks
 
 
+class AuthRejected(Exception):
+    """The server refused our credentials. Retrying cannot help."""
+
+
 class LlamaClient:
-    def __init__(self, endpoint: str, timeout: float = 600.0, temperature: float = 0.0):
+    def __init__(
+        self,
+        endpoint: str,
+        timeout: float = 600.0,
+        temperature: float = 0.0,
+        api_key: str | None = None,
+    ):
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
         self.temperature = temperature
+        self.api_key = api_key or None
+
+    def _headers(self, **extra) -> dict:
+        headers = dict(extra)
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     def _post(self, path: str, payload: dict, timeout: float | None = None) -> dict:
         request = urllib.request.Request(
             f"{self.endpoint}{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=self._headers(**{"Content-Type": "application/json"}),
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=timeout or self.timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(
+                request, timeout=timeout or self.timeout
+            ) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                exc.close()  # or its buffered body leaks a ResourceWarning
+                raise AuthRejected(
+                    f"the llama endpoint rejected our credentials (HTTP {exc.code}). "
+                    + (
+                        "Check LLAMA_API_KEY against the server's --api-key."
+                        if self.api_key
+                        else "It requires an API key; set LLAMA_API_KEY or "
+                        "LLAMA_API_KEY_FILE."
+                    )
+                ) from exc
+            raise
 
     def wait_until_ready(self, timeout: float, poll: float = 2.0) -> bool:
         """Block until the server reports it can serve, or the timeout expires.
 
         A loading model answers /health with 503, so a refused connection and a
-        busy server are treated the same way: keep waiting.
+        busy server are treated the same way: keep waiting. A rejected key is
+        different — no amount of waiting fixes it, so it fails at once rather
+        than after the full timeout.
         """
         deadline = time.monotonic() + timeout
         last_error = "no response"
         while time.monotonic() < deadline:
             for path in ("/health", "/v1/models"):
+                request = urllib.request.Request(
+                    f"{self.endpoint}{path}", headers=self._headers()
+                )
                 try:
-                    with urllib.request.urlopen(
-                        f"{self.endpoint}{path}", timeout=10
-                    ) as resp:
+                    with urllib.request.urlopen(request, timeout=10) as resp:
                         if resp.status == 200:
                             return True
                 except urllib.error.HTTPError as exc:
+                    if exc.code in (401, 403):
+                        print(
+                            f"llama endpoint rejected our credentials (HTTP {exc.code}) "
+                            f"on {path}: "
+                            + (
+                                "check LLAMA_API_KEY against the server's --api-key"
+                                if self.api_key
+                                else "it wants an API key; set LLAMA_API_KEY or "
+                                "LLAMA_API_KEY_FILE"
+                            )
+                        )
+                        return False
                     last_error = f"HTTP {exc.code} from {path}"
                 except Exception as exc:  # connection refused, DNS, timeout
                     last_error = f"{type(exc).__name__} on {path}"
@@ -329,6 +377,9 @@ def detect(
                     content = client.complete(prompt, schema)
                     parsed_response = json.loads(content)
                     break
+                # Deliberately not caught: AuthRejected. Retrying a refused key
+                # only wastes time, and dropping the chunk would turn a
+                # misconfiguration into an episode that quietly found no edits.
                 except (
                     urllib.error.URLError,
                     json.JSONDecodeError,

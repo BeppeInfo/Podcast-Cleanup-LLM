@@ -23,7 +23,7 @@ import sys
 import threading
 
 
-def build_handler(role, responses, request_log):
+def build_handler(role, responses, request_log, api_key=None):
     counter = {"n": 0}
     lock = threading.Lock()
 
@@ -38,7 +38,23 @@ def build_handler(role, responses, request_log):
             self.end_headers()
             self.wfile.write(body)
 
+        def _authorised(self):
+            """Reject like llama-server's --api-key does, on every route."""
+            if not api_key:
+                return True
+            if self.headers.get("Authorization") == f"Bearer {api_key}":
+                return True
+            # Drain any body first, or the client sees a closed connection
+            # instead of the 401.
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            self._send_json(401, {"error": {"message": "invalid api key"}})
+            return False
+
         def do_GET(self):
+            if not self._authorised():
+                return
             # llama-server answers /health; whisper-server has no such endpoint,
             # and its /inference rejects GET — both are treated as "alive".
             if role == "llama" and self.path == "/health":
@@ -49,6 +65,8 @@ def build_handler(role, responses, request_log):
                 self._send_json(404, {"error": "not found"})
 
         def do_POST(self):
+            if not self._authorised():
+                return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             with lock:
@@ -97,6 +115,11 @@ def main():
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--port-file", required=True)
     parser.add_argument("--request-log")
+    parser.add_argument(
+        "--api-key",
+        help="require this key as 'Authorization: Bearer <key>', like "
+             "llama-server's own --api-key",
+    )
     args = parser.parse_args()
 
     responses = []
@@ -106,7 +129,7 @@ def main():
 
     server = http.server.ThreadingHTTPServer(
         ("127.0.0.1", args.port),
-        build_handler(args.role, responses, args.request_log),
+        build_handler(args.role, responses, args.request_log, args.api_key),
     )
     port = server.server_address[1]
 
