@@ -274,7 +274,6 @@ config_validate() {
     [[ -n "${INPUT_EXTS// /}" ]] || die "INPUT_EXTS is empty; nothing could ever be found"
     [[ "$OUTPUT_EXT" == *[!a-zA-Z0-9]* ]] \
         && die "OUTPUT_EXT should be a bare extension, got '$OUTPUT_EXT'"
-    return 0
 
     (( LLM_CHUNK_OVERLAP < LLM_CHUNK_WORDS )) \
         || die "LLM_CHUNK_OVERLAP ($LLM_CHUNK_OVERLAP) must be smaller than LLM_CHUNK_WORDS ($LLM_CHUNK_WORDS)"
@@ -286,6 +285,7 @@ config_validate() {
         || die "SILENCE_KEEP ($SILENCE_KEEP) must be smaller than SILENCE_MIN_DURATION ($SILENCE_MIN_DURATION)"
 
     [[ "$TRACK_SEPARATOR" == ?* ]] || die "TRACK_SEPARATOR must not be empty"
+    return 0
 }
 
 # --- lazy tool resolution ----------------------------------------------------
