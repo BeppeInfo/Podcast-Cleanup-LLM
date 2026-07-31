@@ -98,7 +98,12 @@ LLAMA_MODEL="/srv/llm/models/qwen/Qwen3.6-35B-A3B.gguf"
 LLAMA_HOST="127.0.0.1"
 LLAMA_PORT="8081"
 
-# Context per request. Transcripts are chunked to fit comfortably inside this.
+# Context for a server this script starts. Ignored entirely when LLAMA_ENDPOINT
+# is set — a remote server's own -c governs, and nothing here checks the two
+# agree. At the default LLM_CHUNK_WORDS=350 a request is ~3.3k prompt tokens plus
+# 2048 reserved for the reply, so a slot needs about 6k. Note that llama-server
+# divides -c among --parallel slots: -c 8192 --parallel 4 leaves 2048 each and
+# truncates. See "Running the servers" in the README.
 LLAMA_CTX="8192"
 
 # Layers offloaded to GPU (99 = all, 0 = CPU only).

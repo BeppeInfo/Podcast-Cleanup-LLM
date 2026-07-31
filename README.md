@@ -74,6 +74,93 @@ Audio is uploaded in chunks (`WHISPER_CHUNK_SECONDS`, 0 for one request), with
 boundaries nudged onto silence the VAD stage already found so no chunk edge lands
 inside a word.
 
+## Running the servers
+
+If you serve either model remotely, these are the settings that matter to this
+pipeline. Both projects' flags drift between versions — check `--help` before
+copying.
+
+### whisper-server
+
+```sh
+whisper-server \
+    -m /srv/llm/models/whisper/ggml-large-v3-turbo.bin \
+    --host 0.0.0.0 --port 8080 \
+    -t "$(nproc)" \
+    -ml 1 -sow \
+    -fa
+```
+
+- **`--host 0.0.0.0`** — the default binds to localhost, which is the usual
+  reason a "remote" server cannot be reached.
+- **`-ml 1 -sow`** is the one that affects output quality. It makes every
+  returned segment a single word, so word timings are exact rather than
+  interpolated across a sentence, which is what decides how tightly a stutter
+  can be cut. The client asks for `max_len=1` per request as well, but not every
+  build honours per-request parameters — setting it on the server removes the
+  doubt. The run reports which it got; look for a line about interpolated
+  timings.
+- **`-fa`** (flash attention) on CUDA builds; `-t` matters mainly on CPU ones.
+- Uploads are **19.2 MB per request** at the default `WHISPER_CHUNK_SECONDS=600`
+  (16 kHz mono 16-bit). If your build rejects bodies that size, lower the
+  setting rather than raising a limit — `300` halves it. `0` sends a whole 2 h
+  track as one ~230 MB request, which is rarely a good idea.
+- No `-cv/--convert` needed: the audio is already 16 kHz mono WAV.
+- Requests are sent one at a time, since a single model instance serialises them
+  anyway. `WHISPER_JOBS` applies only to the local path.
+
+### llama-server
+
+```sh
+llama-server \
+    -m /srv/llm/models/qwen/Qwen3.6-35B-A3B.gguf \
+    --host 0.0.0.0 --port 8081 \
+    -c 8192 --parallel 1 \
+    -ngl 99 -fa \
+    --cache-type-k q8_0 --cache-type-v q8_0 \
+    --mlock
+```
+
+- **`-c 8192 --parallel 1`.** The trap here is that `-c` is the *total* context
+  divided among slots, so `-c 8192 --parallel 4` leaves 2048 per slot and
+  silently truncates the prompt. At the default `LLM_CHUNK_WORDS=350` a request
+  is ~3.3k prompt tokens plus 2048 reserved for the reply, so a slot needs
+  ~6k. Either keep `--parallel 1`, or multiply `-c` by the slot count.
+
+  | `LLM_CHUNK_WORDS` | prompt tokens | minimum context per slot |
+  | --- | --- | --- |
+  | 150 | ~1.8k | 4096 |
+  | 250 | ~2.5k | 5120 |
+  | 350 (default) | ~3.3k | 6144 |
+  | 500 | ~4.5k | 7168 |
+
+- **`LLAMA_CTX` in the config does nothing for a remote server** — it is only
+  passed to a server this script starts itself. The remote server's own `-c`
+  governs, and nothing checks that the two agree.
+- **`-fa` plus q8_0 KV cache** keeps VRAM down at no cost worth measuring here;
+  `--mlock` stops the model being swapped out between episodes.
+- Expect **~58 requests per participant** for a 2 h track at ~150 wpm, so the
+  model is loaded once and hit repeatedly. The client sends `cache_prompt: true`
+  and the ~570-token instruction prefix is identical every time, so prompt
+  caching earns its keep — another reason to prefer one slot over several.
+- Sampling is fixed per request (`temperature: 0`, `top_k: 1`) and the JSON
+  schema travels with each call, so server-side sampling defaults and
+  `--grammar-file` are irrelevant.
+- Raise `--timeout` if your build defaults below the client's
+  `LLAMA_REQUEST_TIMEOUT` (600 s).
+- For a MoE model on limited VRAM, newer builds have `--n-cpu-moe` to keep
+  experts on the CPU while the dense layers stay on the GPU.
+
+### Two limitations of the client
+
+- **No authentication.** Neither client sends a header, so `--api-key` on
+  llama-server will make every request fail with 401. Keep both servers on a
+  trusted network or a VPN interface rather than exposing them.
+- **The LLM is called through `/completion` with a raw prompt**, so the model's
+  chat template is never applied. Grammar constraints mean valid JSON comes back
+  regardless, but an instruct model may judge disfluencies better with its
+  template. Worth comparing against the audit log on your first real episode.
+
 ## Setup
 
 ```sh
