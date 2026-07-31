@@ -301,29 +301,176 @@ are marked.
 9. **Failure is recoverable**: the work directory plus `--from` reproduces the
    rest of the run.
 
-## 10. Testing
+## 10. Testing strategy
 
-`python3 tests/test_pipeline.py` — 85 unit tests, stdlib only. Interval algebra,
-transcript parsing (including the fallback for builds with dead token timings),
-LLM response validation, remote-ASR parsing and chunking, the cut/mute decision,
-and the generated ffmpeg expressions. Those last are checked by **evaluating them
-with a miniature interpreter of the grammar we emit** — a wrong expression would
-mangle audio without failing anything else. The llama client is exercised against
-a stub HTTP server: schema payload, retries, malformed responses, dedupe.
+```sh
+python3 tests/test_pipeline.py    # 88 tests, 13 classes, ~14 s, stdlib only
+./tests/selftest.sh               # 64 checks, 10 cases, ~17 s, ffmpeg only
+```
 
-`./tests/selftest.sh` — 63 end-to-end checks needing only ffmpeg. Synthetic
-episodes with silences in known places, run through the real pipeline in a
-sandbox, with the *rendered audio* inspected. Cases: sub-threshold gaps left
-alone; a long gap shortened to its residual; the safety limit refusing and
-`--force` overriding; a dry run touching nothing; mixed sample rates rejected; a
-stutter over crosstalk muted with the other speaker measurably intact; the full
-eight stages against stub whisper and llama servers; a mixed-format episode
-(WAV + AAC in, FLAC out) staying length-identical and matching its prediction;
-the same participant in two formats refused; and mixed rates working under
-`RESAMPLE_TO=auto`.
+### What makes this awkward to test
 
-Neither suite runs a real model. **Run one real episode with `--keep-work` after
-changing anything in `transcribe` or `detect`.**
+The characteristic failure here is not a crash. It is **a valid output file, of
+plausible length, containing wrong audio.** A cut expression with a mistake in it
+still produces a well-formed FLAC that ffmpeg is perfectly happy with; a mute
+applied to the wrong track still yields two files of identical length. Nothing
+raises, nothing exits non-zero, and the damage is only apparent on listening —
+by which point the inputs have been deleted.
+
+Everything below follows from that. The strategy is not "cover the code"; it is
+**make wrongness observable**, and prefer a measurement over an assertion about
+what a tool probably does.
+
+A secondary constraint shapes it too: development happens on a machine with
+neither model installed. Both suites therefore run with no configuration, no
+models, and nothing on the network.
+
+### Three layers
+
+| Layer | Runs | Needs | Catches | Cannot catch |
+| --- | --- | --- | --- | --- |
+| Unit — `tests/test_pipeline.py` | pure decision code | python3 | wrong intervals, bad validation, malformed expressions | anything about what ffmpeg or a model actually does |
+| Stubbed integration — same file + `tests/stub_servers.py` | real HTTP clients against fake servers | python3 | wrong request payloads, bad response handling, retry behaviour | whether a real server would answer that way |
+| End to end — `tests/selftest.sh` | the real pipeline over synthetic audio | ffmpeg | wrong rendered audio, wrong stage wiring, wrong file layout | model quality, real-world audio, long-file behaviour |
+
+The unit layer is where a bug should be reproduced if it possibly can be: it is
+fast, needs no audio, and a failure points at one function. The end-to-end layer
+exists for the claims that only ffmpeg can settle.
+
+### The four techniques doing the real work
+
+**1. The generated ffmpeg expressions are evaluated, not eyeballed.**
+`eval_expr` in the test file is a ~15-line interpreter of exactly the grammar
+`render.py` emits — `if`, `lt`, `between`, `clip`, arithmetic. Each generated
+expression is then compared against an independent Python statement of the
+intent, across thousands of sample points:
+
+```python
+for step in range(0, 6000):
+    t = step / 100.0
+    expected = any(s <= t <= e for s, e in
+                   ((c["start"], c["end"]) for c in cuts))
+    self.assertEqual(bool(eval_expr(expression, t)), expected)
+```
+
+The interpreter also **rejects any symbol it does not know**. If the generator
+starts emitting a new function, the test fails rather than quietly evaluating
+something it has never checked. This is the single most valuable test in the
+suite, because it covers the component whose failure is least visible.
+
+**2. The rendered audio is measured, not just its metadata.**
+`peak_db` reads `volumedetect` over a named window of an output file. The
+crosstalk case does not merely assert two equal durations — it asserts that
+across the muted span the affected track reads −91 dB *and the other speaker
+reads −8 dB at that same instant*. A test comparing only durations would pass
+with entirely wrong audio, which is precisely the failure mode that matters.
+
+**3. Both models have stubs, so all eight stages can run.**
+`tests/stub_servers.py` impersonates `whisper-server` and `llama-server`: canned
+replies handed out in order, and a request log the test asserts against. That
+gives coverage of the whole pipeline including `transcribe` and `detect`, and
+lets the assertions reach the *payload* — that the multipart body really carries
+the audio, that `json_schema` is present, that the transcript reached the prompt
+— rather than only checking that nothing blew up.
+
+**4. Predict, then verify — no tolerances where an exact answer exists.**
+`expected_output_samples` replicates ffmpeg's per-frame decision, and the
+self-test compares the real rendered file against that prediction rather than
+against a rule of thumb. The prediction itself is cross-checked in the unit
+suite by brute-force simulation through `eval_expr`, so the two implementations
+have to agree. In practice it lands within a millisecond.
+
+### Measure, don't assume
+
+Where behaviour of an external tool matters, it gets measured and the number
+recorded, rather than asserted from memory. Two cases in this codebase:
+
+- Mixed-format sync was going to carry a warning. A click at exactly 5.000 s
+  round-tripped through five codecs came back at the identical sample every
+  time, so the warning was dropped. An assumption would have produced a caveat
+  that was simply false. That measurement is now a self-test check in case 8,
+  since a regression in it would appear as silent misalignment rather than as an
+  error.
+- Container durations were assumed accurate. Measurement found AAC decoding
+  +5.33 ms and Opus −6.5 ms against their headers, which is what prompted
+  `meta-refresh`.
+
+When adding a claim about ffmpeg, whisper.cpp or llama.cpp, measure it first and
+put the figure in the test or its comment. When the design *depends* on the
+claim, make the measurement a check — the assumption is then load-bearing, and
+load-bearing assumptions deserve a guard.
+
+### Keeping the arithmetic hand-checkable
+
+The synthetic episodes use deliberately round numbers, so every expected value
+can be derived on paper and the test asserts a figure rather than whatever the
+code happened to produce. Case 2, for instance: a 10 s gap with
+`SILENCE_KEEP=0.4` must yield a 9.6 s cut, and 30 s minus that cut minus a
+3.75 s tail must leave 16.65 s. Both are checked as numbers.
+
+This matters because a test that asserts the current output is not a test — it is
+a change detector. When one of these fails, the arithmetic in the comment says
+which of the two is wrong.
+
+### What is deliberately not covered
+
+- **Real Whisper and real llama.cpp.** Their output is neither cheap nor
+  deterministic, and what needs testing is our handling of it, not their quality.
+  The consequence: the flags passed to `whisper-cli`, and llama-server's launch
+  arguments, are exercised by nothing. Those are the lines to re-read by hand.
+- **Silero VAD** — torch is absent from the test environment. The ffmpeg backend
+  is covered; the Silero path is not.
+- **Whether the edit sounds good.** Not a testable property. That is what the
+  edit report and a listen are for.
+- **Long-file behaviour.** Synthetic episodes are 10–30 s. Nothing here would
+  catch a filter graph that is correct but unusably slow across two hours, or a
+  memory problem that only appears at scale.
+- **Concurrency.** `FFMPEG_JOBS > 1` and `WHISPER_JOBS > 1` paths are not
+  exercised; the suites run serially.
+
+### Invariants and where they are guarded
+
+Cross-reference for [§9](#9-invariants):
+
+| Invariant | Guarded by |
+| --- | --- |
+| 1. identical output lengths | selftest cases 1, 6, 7, 8, 10; unit test on filter ordering |
+| 2. mutes never change the timeline | selftest cases 6, 7 (durations plus measured audio) |
+| 3. no cut overlaps speech | selftest case 1, checked against the VAD output |
+| 4. `keep` complements `cuts` | `TestPlanBuilder.test_keep_and_cuts_are_complementary` |
+| 5. no unvalidated LLM number reaches audio | `TestLlmValidation`, `TestAgainstStubServer` |
+| 6. local models never overlap | **nothing** — structural only, read the two stages |
+| 7. inputs deleted only after verification | selftest cases 1 (deleted), 3 (preserved on failure) |
+| 8. transcript matches the rendered audio | `TestFinalTranscript`, selftest case 6 |
+| 9. failure is recoverable | selftest case 3 (work dir kept), 6 and 7 (resume via `--from`) |
+
+Invariant 6 is the gap worth remembering. It cannot be observed without loading
+two real models, so it is held structurally instead: `stage_transcribe` waits for
+every process to exit, and `llama_start`/`llama_stop` both live inside
+`stage_detect`. **Anyone touching either stage has to verify it by reading.**
+
+### Adding a test
+
+- A wrong editing decision → `tests/test_pipeline.py`, reproduced as an interval
+  or word-list fixture. No audio required, and the failure localises.
+- A wrong thing done *to the audio* → `tests/selftest.sh`, with the output
+  inspected via `peak_db` or `duration_of`, not merely asserted to exist.
+- A new external-tool assumption → measure it, then encode the figure.
+- Keep expected values derived, not observed.
+
+The self-test sandboxes itself under `mktemp -d` and cleans up; run with
+`KEEP_SANDBOX=1` to keep the work directories, rendered files and stub request
+logs for inspection.
+
+### Before trusting a change
+
+1. Both suites pass.
+2. If `transcribe` or `detect` was touched: **one real episode with
+   `--keep-work`.** Nothing automated covers the real models.
+3. Read `<episode>_edit-report.txt` — cut counts and removed fraction are the
+   cheapest signal that a threshold has drifted.
+4. If the change was anywhere near rendering, sample the audio, and check the
+   invariants table above for what is guarding you.
 
 ## 11. Known limitations
 

@@ -725,6 +725,61 @@ print("codecs:", codecs)
 ' "$WORK8/meta.json"
 fi
 
+# The assumption that makes mixed-format episodes safe at all, and the reason
+# this pipeline carries no warning about them: every decoder accounts for its
+# codec's encoder delay, so identical audio in different formats decodes to the
+# same sample offset. Guarded here because a regression would show up as silent
+# misalignment between tracks rather than as any kind of error.
+check "codecs agree on where a sample sits" python3 -c '
+import subprocess, sys, struct, shutil
+
+SPECS = [("flac", "flac", []), ("mp3", "libmp3lame", ["-b:a", "192k"]),
+         ("m4a", "aac", ["-b:a", "192k"]), ("opus", "libopus", ["-b:a", "128k"]),
+         ("ogg", "libvorbis", ["-q:a", "6"])]
+work = sys.argv[1]
+
+def has(codec):
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-h", f"encoder={codec}"],
+                         capture_output=True, text=True).stdout
+    return f"Encoder {codec}" in out
+
+def onset(path):
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "s16le",
+                          "-ac", "1", "-ar", "48000", "-"],
+                         capture_output=True).stdout
+    for index in range(0, len(raw) - 1, 2):
+        if abs(struct.unpack_from("<h", raw, index)[0]) > 2000:
+            return index // 2
+    return None
+
+source = f"{work}/click.wav"
+subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                "aevalsrc=exprs=0.8*sin(2*PI*1000*t)*between(t\\,5\\,5.01)"
+                ":s=48000:d=10", "-c:a", "pcm_s16le", source], check=True)
+
+reference = onset(source)
+if reference is None:
+    print("the reference click was not found at all")
+    sys.exit(1)
+
+results = {"source": reference}
+for ext, codec, extra in SPECS:
+    if not has(codec):
+        continue
+    encoded = f"{work}/click.{ext}"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", source, "-c:a", codec]
+                   + extra + [encoded], check=True)
+    results[ext] = onset(encoded)
+
+if len(results) < 3:
+    print("too few encoders available to prove anything:", results)
+    sys.exit(1)
+if len(set(results.values())) != 1:
+    print("codecs disagree on the click position:", results)
+    sys.exit(1)
+print("all agree at sample", reference, "-", ", ".join(sorted(results)))
+' "$SANDBOX"
+
 if [[ -s "$OUT8/alice.flac" && -s "$OUT8/bob.flac" ]]; then
     D8A=$(duration_of "$OUT8/alice.flac")
     D8B=$(duration_of "$OUT8/bob.flac")

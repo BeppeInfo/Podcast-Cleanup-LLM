@@ -218,7 +218,7 @@ word, so padding cannot eat into real speech.
 
 ```sh
 python3 tests/test_pipeline.py    # 88 unit tests, no external tools needed
-./tests/selftest.sh               # 63 end-to-end checks, needs only ffmpeg
+./tests/selftest.sh               # 64 end-to-end checks, needs only ffmpeg
 ```
 
 The unit tests cover the interval algebra, transcript parsing, LLM response
