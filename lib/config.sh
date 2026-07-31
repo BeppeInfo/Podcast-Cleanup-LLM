@@ -10,10 +10,20 @@
 
 config_defaults() {
     # Filesystem layout ------------------------------------------------------
-    : "${INPUT_DIR:=/srv/media/podcast/incoming}"
-    : "${OUTPUT_DIR:=/srv/media/podcast/output}"
-    : "${WORK_ROOT:=/srv/media/podcast/work}"
-    : "${FAILED_DIR:=/srv/media/podcast/failed}"
+    # Everything the run reads and writes lives under one root, which defaults
+    # to the directory holding clean-podcast.sh: a checkout run in place is
+    # self-contained, which is what a workstation wants. A server install points
+    # PODCAST_ROOT at its media volume, or sets the four directories below
+    # individually when they live on different ones.
+    #
+    # These are deliberately left empty here and filled in by
+    # config_resolve_paths, which runs after the command line has been applied —
+    # otherwise --root could not affect a directory that had already defaulted.
+    : "${PODCAST_ROOT:=}"
+    : "${INPUT_DIR:=}"
+    : "${OUTPUT_DIR:=}"
+    : "${WORK_ROOT:=}"
+    : "${FAILED_DIR:=}"
 
     # Track naming: <episode><SEP><participant>.<ext>
     : "${TRACK_SEPARATOR:=_}"
@@ -179,6 +189,55 @@ config_load() {
     done
 
     config_defaults
+}
+
+# --- filesystem layout -------------------------------------------------------
+#
+# One root with four subdirectories under it. Each of the four can still be
+# pointed somewhere else on its own — a server with output on a different volume
+# keeps working — but the ordinary case is one --root and nothing more.
+
+# Absolute form of a path, whether or not it exists yet: the log and every error
+# message should name a directory the reader can act on, and "output" alone is
+# not one once the run has been started from somewhere else.
+_abs_path() {
+    local path="$1"
+    if [[ -d "$path" ]]; then
+        (cd -- "$path" && pwd)
+    else
+        [[ "$path" == /* ]] || path="$PWD/${path#./}"
+        printf '%s\n' "$path"
+    fi
+}
+
+# Called after the config file and the command line have both had their say, so
+# that an explicit setting always wins and only what is left derives from the
+# root.
+config_resolve_paths() {
+    [[ -n "$PODCAST_ROOT" ]] || PODCAST_ROOT="$LIB_ROOT"
+    PODCAST_ROOT=$(_abs_path "$PODCAST_ROOT")
+
+    : "${INPUT_DIR:=$PODCAST_ROOT/incoming}"
+    : "${OUTPUT_DIR:=$PODCAST_ROOT/output}"
+    : "${WORK_ROOT:=$PODCAST_ROOT/work}"
+    : "${FAILED_DIR:=$PODCAST_ROOT/failed}"
+
+    local v
+    for v in INPUT_DIR OUTPUT_DIR WORK_ROOT FAILED_DIR; do
+        printf -v "$v" '%s' "$(_abs_path "${!v}")"
+    done
+}
+
+# config_make_tree — create the layout up front, so a fresh install is one run
+# away from being usable and there is an obvious place to drop tracks. It also
+# makes a missing input directory mean "empty" rather than "misconfigured".
+config_make_tree() {
+    [[ "$DRY_RUN" == 1 ]] && return 0
+    local dir
+    for dir in "$INPUT_DIR" "$OUTPUT_DIR" "$WORK_ROOT" "$FAILED_DIR"; do
+        mkdir -p -- "$dir" || die "cannot create directory: $dir"
+    done
+    return 0
 }
 
 # --- api keys ----------------------------------------------------------------
@@ -382,7 +441,8 @@ config_dump() {
             log_raw "  config $v=<unset>"
         fi
     done
-    for v in INPUT_DIR OUTPUT_DIR WORK_ROOT FAILED_DIR INPUT_EXTS TRACK_SEPARATOR \
+    for v in PODCAST_ROOT INPUT_DIR OUTPUT_DIR WORK_ROOT FAILED_DIR \
+             INPUT_EXTS TRACK_SEPARATOR \
              OUTPUT_CODEC OUTPUT_EXT OUTPUT_EXTRA_ARGS RESAMPLE_TO \
              WHISPER_ENDPOINT WHISPER_ENDPOINT_PATH WHISPER_CHUNK_SECONDS \
              WHISPER_REQUEST_TIMEOUT \

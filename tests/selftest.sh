@@ -122,7 +122,10 @@ run_pipeline() {
     local incoming="$1" output="$2" work="$3"; shift 3
     # Whisper and llama.cpp are out of scope here, so their stages are left out
     # of the list entirely rather than stubbed.
-    "$ROOT/clean-podcast.sh" \
+    # --root keeps everything this run might write inside the sandbox, including
+    # the directories the three explicit options do not name — FAILED_DIR, which
+    # the cases that fail on purpose write their logs to.
+    "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
         --input "$incoming" --output "$output" --work "$work" \
         --stages discover,prepare,vad,plan,render,finalize \
         --no-llm --quiet "$@"
@@ -394,7 +397,8 @@ json.dump(
 INJECT
 
 # Deliberately without --no-llm: the injected edits must be picked up.
-if "$ROOT/clean-podcast.sh" --input "$CASE6/incoming" --output "$CASE6/output" \
+if "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
+    --input "$CASE6/incoming" --output "$CASE6/output" \
     --work "$CASE6/work" --config "$CONF" --episode ep006 --keep-work --quiet \
     --stages plan,render,finalize >"$SANDBOX/case6b.stdout" 2>&1
 then
@@ -534,7 +538,7 @@ fi
 WHISPER_URL="http://127.0.0.1:$(cat "$W_PORT_FILE")"
 LLAMA_URL="http://127.0.0.1:$(cat "$L_PORT_FILE")"
 
-if "$ROOT/clean-podcast.sh" \
+if "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
     --input "$CASE7/incoming" --output "$CASE7/output" --work "$CASE7/work" \
     --config "$CONF" --keep-work --quiet \
     --whisper-endpoint "$WHISPER_URL" --llama-endpoint "$LLAMA_URL" \

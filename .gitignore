@@ -3,3 +3,10 @@ __pycache__/
 
 # A local config is machine-specific; the example is the tracked one.
 podcast-cleanup.conf
+
+# The layout the run creates. The root defaults to the directory holding
+# clean-podcast.sh, so a checkout that is used in place grows these.
+/incoming/
+/output/
+/work/
+/failed/

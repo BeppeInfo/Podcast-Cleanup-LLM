@@ -109,8 +109,15 @@ stage_discover() {
     stage_begin discover "locating the episode and its tracks"
     config_need_ffmpeg
 
+    if (( ${#INPUT_FILES[@]} == 0 )) && [[ ! -d "$INPUT_DIR" ]]; then
+        # Only reachable on a dry run, which creates nothing: every other run
+        # has had config_make_tree build the layout by now. An absent input
+        # directory is the same situation as an empty one.
+        log_warn "input directory does not exist yet: $INPUT_DIR"
+        return 2
+    fi
+
     if (( ${#INPUT_FILES[@]} == 0 )); then
-        [[ -d "$INPUT_DIR" ]] || die "input directory does not exist: $INPUT_DIR"
         # Any of the configured extensions, matched case-insensitively — some
         # recorders write .WAV, and ffmpeg does not care either way.
         local -a name_test=()

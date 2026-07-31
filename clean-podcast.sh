@@ -42,11 +42,18 @@ With no TRACK arguments the input directory is scanned for one episode's worth
 of tracks, named <episode><separator><participant>.<ext> — for example
 ep042_leonardo.flac.
 
+Everything lives under one root, which defaults to the directory holding this
+script, so a fresh checkout is usable as-is: run it once and drop tracks into
+the incoming/ directory it creates.
+
 Options:
   -c, --config FILE     configuration file (default: search the usual places)
-  -i, --input DIR       directory to scan for input tracks
-  -o, --output DIR      where finished tracks are published
-      --work DIR        root of the per-episode work directory
+  -r, --root DIR        root of the working layout; incoming/, output/, work/
+                        and failed/ are created under it as needed
+                        (default: the directory holding this script)
+  -i, --input DIR       directory to scan for input tracks   (default: ROOT/incoming)
+  -o, --output DIR      where finished tracks are published  (default: ROOT/output)
+      --work DIR        root of the per-episode work directory (default: ROOT/work)
   -e, --episode ID      override the episode id derived from filenames
 
       --from STAGE      start at STAGE, reusing what an earlier run produced
@@ -92,6 +99,7 @@ parse_args() {
     while (( $# )); do
         case "$1" in
             -c|--config)   CONFIG_FILE="${2:?--config needs a file}"; shift 2 ;;
+            -r|--root)     ARG_PODCAST_ROOT="${2:?--root needs a directory}"; shift 2 ;;
             -i|--input)    ARG_INPUT_DIR="${2:?--input needs a directory}"; shift 2 ;;
             -o|--output)   ARG_OUTPUT_DIR="${2:?--output needs a directory}"; shift 2 ;;
             --work)        ARG_WORK_ROOT="${2:?--work needs a directory}"; shift 2 ;;
@@ -128,6 +136,14 @@ parse_args() {
 
 # Command-line values are applied after the config file, so they win.
 apply_overrides() {
+    # An explicit --root re-derives the whole layout: a config file's INPUT_DIR
+    # is a weaker statement than the root asked for on the command line. The
+    # per-directory options just below still win over it, being equally explicit
+    # and more specific.
+    if [[ -n "${ARG_PODCAST_ROOT:-}" ]]; then
+        PODCAST_ROOT="$ARG_PODCAST_ROOT"
+        INPUT_DIR="" OUTPUT_DIR="" WORK_ROOT="" FAILED_DIR=""
+    fi
     [[ -n "${ARG_INPUT_DIR:-}" ]]       && INPUT_DIR="$ARG_INPUT_DIR"
     [[ -n "${ARG_OUTPUT_DIR:-}" ]]      && OUTPUT_DIR="$ARG_OUTPUT_DIR"
     [[ -n "${ARG_WORK_ROOT:-}" ]]       && WORK_ROOT="$ARG_WORK_ROOT"
@@ -241,9 +257,11 @@ main() {
 
     config_load "$CONFIG_FILE"
     apply_overrides
+    config_resolve_paths
     config_validate
     config_resolve_api_keys
     config_dump
+    config_make_tree
 
     local -a stages=()
     mapfile -t stages < <(selected_stages)

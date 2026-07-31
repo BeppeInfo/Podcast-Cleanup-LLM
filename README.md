@@ -8,7 +8,8 @@ stretches are dead air and which are speech disfluencies, and renders the tracks
 back out — still separate, still in sync, ready for mixing.
 
 ```sh
-clean-podcast.sh --input /srv/media/podcast/incoming
+clean-podcast.sh                      # uses ./incoming, creating it if need be
+clean-podcast.sh --root /srv/media/podcast
 ```
 
 ## What it does to the audio
@@ -207,10 +208,33 @@ documented inline in the example, and command-line options override it.
 
 ## Input and output
 
+Everything lives under one **root**, which defaults to the directory holding
+`clean-podcast.sh`. The four subdirectories are created on first use, so a fresh
+checkout is usable straight away — run it once, then drop tracks into the
+`incoming/` it made:
+
+```
+<root>/
+    incoming/      tracks waiting to be processed
+    output/        finished episodes, one directory each
+    work/          per-episode intermediates
+    failed/        logs, and inputs if FAILED_ACTION="move"
+```
+
+Point the whole layout somewhere else with `--root DIR` or `PODCAST_ROOT`. Any
+one of the four can still be set on its own (`--input`, `--output`, `--work`, or
+`INPUT_DIR` and friends) for the case where they genuinely belong apart — scratch
+space on a different volume from the finished audio, say. A `--root` on the
+command line re-derives the ones you have not named explicitly.
+
+The default suits a workstation, where the models are usually remote anyway; a
+server install sets `PODCAST_ROOT` to its media volume in the config file and
+never thinks about it again.
+
 Input tracks are named `<episode><separator><participant>.<ext>`:
 
 ```
-/srv/media/podcast/incoming/
+<root>/incoming/
     ep042_leonardo.flac
     ep042_marta.flac
     ep042_guest.flac
@@ -243,7 +267,7 @@ input format was.
 After a successful run:
 
 ```
-/srv/media/podcast/output/ep042/
+<root>/output/ep042/
     leonardo.flac                 cleaned tracks, all exactly the same length
     marta.flac
     guest.flac

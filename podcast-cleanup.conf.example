@@ -13,10 +13,27 @@
 
 # ---------------------------------------------------------------- filesystem --
 
-INPUT_DIR="/srv/media/podcast/incoming"
-OUTPUT_DIR="/srv/media/podcast/output"
-WORK_ROOT="/srv/media/podcast/work"
-FAILED_DIR="/srv/media/podcast/failed"
+# Everything the run reads and writes lives under one root, created on first use.
+# The default is the directory holding clean-podcast.sh, which makes a checkout
+# self-contained — good for a workstation, where the models are usually remote
+# anyway. --root overrides it for a single run.
+#PODCAST_ROOT="/srv/media/podcast"
+
+# Derived from the root unless set here:
+#
+#   INPUT_DIR    $PODCAST_ROOT/incoming    tracks waiting to be processed
+#   OUTPUT_DIR   $PODCAST_ROOT/output      finished episodes, one directory each
+#   WORK_ROOT    $PODCAST_ROOT/work        per-episode intermediates
+#   FAILED_DIR   $PODCAST_ROOT/failed      logs (and inputs, see FAILED_ACTION)
+#
+# Set them individually only when they genuinely belong apart — output on a
+# different volume from the scratch space, say. A setting here beats the root;
+# a --root on the command line beats a setting here, since the whole point of
+# asking for a root is to move the layout.
+#INPUT_DIR="/srv/media/podcast/incoming"
+#OUTPUT_DIR="/srv/media/podcast/output"
+#WORK_ROOT="/var/tmp/podcast-work"
+#FAILED_DIR="/srv/media/podcast/failed"
 
 # Input tracks are named <episode><SEP><participant>.<ext>, e.g.
 # "ep042_leonardo.flac" -> episode "ep042", participant "leonardo".
