@@ -166,18 +166,47 @@ class AuthRejected(Exception):
     """The server refused our credentials. Retrying cannot help."""
 
 
+class SchemaIgnored(Exception):
+    """The server answered but did not honour the JSON schema.
+
+    Worth its own type because the consequence is silent: unconstrained prose
+    fails to parse, every chunk is dropped, and the episode finishes reporting
+    no edits — which looks exactly like clean speech.
+    """
+
+
 class LlamaClient:
+    """Client for a llama.cpp server, whichever model it happens to be serving.
+
+    Requests go to /v1/chat/completions by default, so the server applies the
+    chat template of the model it has loaded. That is the whole reason to prefer
+    it: /completion takes a raw prompt and applies no template, so every model
+    sees an instruction formatted for none of them, and how well it copes is a
+    property of the model rather than of this code. Routing through the chat
+    endpoint is what lets the model be swapped or upgraded without touching
+    anything here.
+
+    api="completion" keeps the old raw-prompt path for a server that lacks the
+    chat endpoint, or to compare the two against the same episode.
+    """
+
     def __init__(
         self,
         endpoint: str,
         timeout: float = 600.0,
         temperature: float = 0.0,
         api_key: str | None = None,
+        api: str = "chat",
+        max_reply_tokens: int = 2048,
     ):
+        if api not in ("chat", "completion"):
+            raise ValueError(f"api must be 'chat' or 'completion', got {api!r}")
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
         self.temperature = temperature
         self.api_key = api_key or None
+        self.api = api
+        self.max_reply_tokens = max_reply_tokens
 
     def _headers(self, **extra) -> dict:
         headers = dict(extra)
@@ -250,19 +279,99 @@ class LlamaClient:
         print(f"llama endpoint not ready: {last_error}")
         return False
 
-    def complete(self, prompt: str, schema: dict, n_predict: int = 2048) -> str:
+    def complete(self, prompt: str, schema: dict, max_tokens: int | None = None) -> str:
+        budget = max_tokens or self.max_reply_tokens
+        if self.api == "completion":
+            result = self._post(
+                "/completion",
+                {
+                    "prompt": prompt,
+                    "n_predict": budget,
+                    "temperature": self.temperature,
+                    "top_k": 1,
+                    "cache_prompt": True,
+                    "json_schema": schema,
+                },
+            )
+            return result.get("content", "")
+
         result = self._post(
-            "/completion",
-            {
-                "prompt": prompt,
-                "n_predict": n_predict,
-                "temperature": self.temperature,
-                "top_k": 1,
-                "cache_prompt": True,
-                "json_schema": schema,
-            },
+            "/v1/chat/completions", self._chat_payload(prompt, schema, budget)
         )
-        return result.get("content", "")
+        return _chat_content(result)
+
+    def _chat_payload(self, prompt: str, schema: dict, budget: int) -> dict:
+        return {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": budget,
+            "temperature": self.temperature,
+            "top_k": 1,
+            "cache_prompt": True,
+            # Two spellings of the same constraint. llama.cpp has documented
+            # both the nested OpenAI form and a flat "schema" shorthand, and
+            # which one a given build reads has moved around; sending both means
+            # a build that understands either is constrained, and neither form
+            # upsets a build that ignores it. check_schema_support() exists
+            # because a build that reads *neither* would otherwise fail silently.
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "edits", "schema": schema},
+                "schema": schema,
+            },
+        }
+
+    def check_schema_support(self) -> None:
+        """Confirm the server actually constrains output to the schema.
+
+        Sent once before an episode. If the schema is not applied the reply is
+        prose, every chunk of the real run fails to parse and is dropped, and
+        the episode reports no edits at all — indistinguishable from a clean
+        recording. Better to spend one tiny request finding out.
+        """
+        schema = response_schema(KINDS)
+        probe = (
+            "Reply with JSON only, matching the required schema: an object with "
+            'an "edits" key holding an empty array.'
+        )
+        try:
+            content = self.complete(probe, schema, max_tokens=128)
+        except AuthRejected:
+            raise
+        except Exception as exc:
+            raise SchemaIgnored(
+                f"could not reach the llama endpoint for a schema check: {exc}"
+            ) from exc
+
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise SchemaIgnored(
+                "the llama endpoint did not constrain its reply to the JSON "
+                f"schema (it answered {content[:120]!r}). Its build may not "
+                "support response_format; set LLM_API=completion to use the "
+                "raw /completion endpoint instead."
+            ) from exc
+        if not isinstance(parsed, dict) or "edits" not in parsed:
+            raise SchemaIgnored(
+                "the llama endpoint returned JSON that does not match the "
+                f"schema ({content[:120]!r}); set LLM_API=completion to use the "
+                "raw /completion endpoint instead."
+            )
+
+
+def _chat_content(result: dict) -> str:
+    """The assistant text of a chat completion, whatever the server wrapped it in."""
+    choices = result.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if content:
+        return content
+    # A reasoning model with reasoning_format=none puts everything in
+    # reasoning_content and leaves content empty. The schema still applies to
+    # what it generated, so it is worth reading rather than discarding.
+    return message.get("reasoning_content") or ""
 
 
 def _validate(raw_edits, words, first, last, limits, accepted):

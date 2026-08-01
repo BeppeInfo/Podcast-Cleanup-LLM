@@ -63,7 +63,7 @@ Options:
       --list-stages     show the stages and exit
 
       --vad BACKEND     ffmpeg (level based) or silero (speech based)
-      --no-llm          silence editing only; skip Qwen entirely
+      --no-llm          silence editing only; skip the LLM stage entirely
   -j, --jobs N          parallel ffmpeg jobs
       --force           proceed even when the plan trips a safety limit
 

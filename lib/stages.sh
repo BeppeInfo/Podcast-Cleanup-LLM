@@ -490,8 +490,14 @@ stage_transcribe_remote() {
 }
 
 # ============================================================================
-# detect — Qwen finds disfluencies; the server lives and dies inside this stage
+# detect — the LLM finds disfluencies; the server lives and dies in this stage
 # ============================================================================
+
+# Whether to spend one request confirming the server honours a JSON schema.
+llm_schema_check_flag() {
+    [[ "$LLM_CHECK_SCHEMA" == 1 ]] && printf '%s' "--check-schema"
+    return 0
+}
 
 llama_start() {
     config_need_python
@@ -502,8 +508,11 @@ llama_start() {
         LLAMA_URL="$LLAMA_ENDPOINT"
         log_info "using the llama server already at $LLAMA_URL"
         [[ "$DRY_RUN" == 1 ]] && return 0
+        # Unquoted on purpose: the helper yields one flag or no argument at all.
+        # shellcheck disable=SC2046
         PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
             py llm-wait --endpoint "$LLAMA_URL" --timeout 30 \
+            --api "$LLM_API" $(llm_schema_check_flag) \
             || die "the configured llama endpoint at $LLAMA_URL is not usable"
         log_ok "endpoint is responding"
         return 0
@@ -533,8 +542,10 @@ llama_start() {
     LLAMA_PID=$!
     log_debug "llama-server pid $LLAMA_PID, log $server_log"
 
+    # shellcheck disable=SC2046
     if ! PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
-        py llm-wait --endpoint "$LLAMA_URL" --timeout "$LLAMA_STARTUP_TIMEOUT"; then
+        py llm-wait --endpoint "$LLAMA_URL" --timeout "$LLAMA_STARTUP_TIMEOUT" \
+        --api "$LLM_API" $(llm_schema_check_flag); then
         log_error "llama-server never became ready; last lines of its log:"
         [[ -f "$server_log" ]] && log_line "$(tail -n 20 "$server_log")"
         llama_stop
@@ -598,7 +609,7 @@ stage_detect() {
             continue
         fi
 
-        log_info "qwen: $participant ($index/$total)"
+        log_info "llm: $participant ($index/$total)"
         local rc=0
         PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
             run_streaming parse_python_progress "$participant" \
@@ -609,6 +620,7 @@ stage_detect() {
             --max-words "$LLM_MAX_EDIT_WORDS" --max-seconds "$LLM_MAX_EDIT_SECONDS" \
             --min-confidence "$LLM_MIN_CONFIDENCE" --temperature "$LLM_TEMP" \
             --request-timeout "$LLAMA_REQUEST_TIMEOUT" --kinds "$LLM_ACCEPT_KINDS" \
+            --api "$LLM_API" --max-reply-tokens "$LLM_MAX_REPLY_TOKENS" \
             || rc=$?
 
         if (( rc == 0 )); then
@@ -619,6 +631,11 @@ stage_detect() {
             # found no edits at all — so this one stops the run.
             llama_stop
             die "the LLM endpoint refused our credentials. Fix the key, then resume with: $0 --episode $EPISODE_ID --from detect"
+        elif (( rc == 3 )); then
+            # Exit 3 is a server that will not constrain its output. Same
+            # reasoning: every track would fail identically and silently.
+            llama_stop
+            die "the LLM endpoint ignored the JSON schema. Try LLM_API=completion, then resume with: $0 --episode $EPISODE_ID --from detect"
         else
             failed=$(( failed + 1 ))
             log_warn "edit detection failed for $participant; that track keeps its disfluencies"

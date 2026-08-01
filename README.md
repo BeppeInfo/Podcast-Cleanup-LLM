@@ -1,7 +1,7 @@
 # Podcast-Cleanup-LLM
 
 Set of scripts for cleaning up a multi-track podcast recording using FFMPEG,
-Silero, Whisper and Qwen.
+Silero, Whisper and llama.cpp.
 
 Takes the synchronised per-participant tracks of one episode, works out which
 stretches are dead air and which are speech disfluencies, and renders the tracks
@@ -164,6 +164,9 @@ llama-server \
 - **`LLAMA_CTX` in the config does nothing for a remote server** — it is only
   passed to a server this script starts itself. The remote server's own `-c`
   governs, and nothing checks that the two agree.
+- **Any instruct model works**, not just the one in the example. Requests go to
+  `/v1/chat/completions`, so llama-server applies the chat template of whatever
+  model it has loaded — see "Choosing a model" below.
 - **`-fa` plus q8_0 KV cache** keeps VRAM down at no cost worth measuring here;
   `--mlock` stops the model being swapped out between episodes.
 - Expect **~58 requests per participant** for a 2 h track at ~150 wpm, so the
@@ -178,15 +181,38 @@ llama-server \
 - For a MoE model on limited VRAM, newer builds have `--n-cpu-moe` to keep
   experts on the CPU while the dense layers stay on the GPU.
 
-### Two limitations of the client
+### Choosing a model
 
-- **No authentication.** Neither client sends a header, so `--api-key` on
-  llama-server will make every request fail with 401. Keep both servers on a
-  trusted network or a VPN interface rather than exposing them.
-- **The LLM is called through `/completion` with a raw prompt**, so the model's
-  chat template is never applied. Grammar constraints mean valid JSON comes back
-  regardless, but an instruct model may judge disfluencies better with its
-  template. Worth comparing against the audit log on your first real episode.
+Nothing here is tied to the models in the examples. Both are named only by
+`WHISPER_MODEL` and `LLAMA_MODEL`, which are paths — swap either, or upgrade to a
+new version of the same one, and the pipeline does not need to know.
+
+**Whisper.** Any ggml model `whisper-cli` or `whisper-server` accepts. Bigger
+models transcribe better and are slower; what matters most downstream is word
+timing precision, which is why `-ml 1 -sow` is worth more than model size for
+this job. Remote responses are parsed tolerantly, so server versions that shape
+their JSON differently are handled.
+
+**The LLM.** Any instruct model llama-server can load. Requests go to
+`/v1/chat/completions`, so the server applies that model's own chat template —
+the prompt is plain instructions plus a JSON schema, with nothing model-specific
+in it. Two things worth knowing:
+
+- The schema is what guarantees parseable output, so a model that follows
+  instructions moderately well is enough; you do not need a large one. What a
+  bigger model buys is judgement about which repetitions are accidental, which
+  is exactly what the `confidence` field and `LLM_MIN_CONFIDENCE` exist to
+  filter.
+- `LLM_API="completion"` reverts to the old raw-prompt `/completion` path, for a
+  build without the chat endpoint or to compare the two on one episode. The
+  audit log (`*.audit.jsonl`, kept with the outputs) records every response, so
+  comparing two models — or two endpoints — on the same episode is just a diff.
+
+`LLM_CHECK_SCHEMA` sends one small request before the first track to confirm the
+server really constrains its output. It is on by default because the failure it
+catches is otherwise invisible: a server that ignores `response_format` returns
+prose, every chunk is dropped as unparseable, and the run finishes reporting no
+edits at all — which looks exactly like a clean recording.
 
 ## Setup
 
@@ -294,7 +320,7 @@ discover    find the episode's tracks, probe them, agree on an episode id
 prepare     decode each track to 16 kHz mono (what Whisper and Silero want)
 vad         per-track speech detection
 transcribe  Whisper per track, to completion, then every process exits
-detect      Qwen finds disfluencies; the server starts and stops inside here
+detect      the LLM finds disfluencies; the server starts and stops here
 plan        unify silence and edits into cuts and mutes
 render      one ffmpeg pass per track, into staging, then verified
 finalize    publish outputs, delete intermediates and inputs
@@ -307,7 +333,7 @@ completion, so a failed run can be resumed rather than restarted:
 clean-podcast.sh --episode ep042 --from plan      # redo the edit decisions
 clean-podcast.sh --episode ep042 --only render    # just re-render
 clean-podcast.sh --stages discover,prepare,vad    # silence analysis only
-clean-podcast.sh --no-llm                         # skip Qwen entirely
+clean-podcast.sh --no-llm                         # skip the LLM stage
 clean-podcast.sh --dry-run                        # show the commands, touch nothing
 clean-podcast.sh --list-stages
 ```

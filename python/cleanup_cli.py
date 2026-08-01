@@ -342,9 +342,16 @@ def cmd_whisper_wait(args):
 
 
 def cmd_llm_wait(args):
-    client = llm.LlamaClient(args.endpoint, api_key=_api_key(LLAMA_KEY_ENV))
+    client = llm.LlamaClient(
+        args.endpoint, api_key=_api_key(LLAMA_KEY_ENV), api=args.api
+    )
     if not client.wait_until_ready(args.timeout):
         raise SystemExit(1)
+    # One tiny constrained request before the episode starts. A server that
+    # answers /health but ignores the schema would otherwise be discovered only
+    # after every chunk of every track had been dropped for unparseable output.
+    if args.check_schema:
+        client.check_schema_support()
     print("llama endpoint ready")
 
 
@@ -358,6 +365,7 @@ def cmd_detect(args):
     client = llm.LlamaClient(
         args.endpoint, timeout=args.request_timeout, temperature=args.temperature,
         api_key=_api_key(LLAMA_KEY_ENV),
+        api=args.api, max_reply_tokens=args.max_reply_tokens,
     )
     result = llm.detect(
         client,
@@ -626,6 +634,11 @@ def build_parser():
     p = sub.add_parser("llm-wait", help="block until the llama endpoint is ready")
     p.add_argument("--endpoint", required=True)
     p.add_argument("--timeout", type=float, default=600.0)
+    p.add_argument("--api", choices=("chat", "completion"), default="chat")
+    p.add_argument(
+        "--check-schema", action="store_true",
+        help="also verify the server constrains replies to a JSON schema",
+    )
     p.set_defaults(func=cmd_llm_wait)
 
     p = sub.add_parser("detect", help="find disfluencies in one participant's words")
@@ -640,6 +653,8 @@ def build_parser():
     p.add_argument("--min-confidence", type=float, default=0.6)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--request-timeout", type=float, default=600.0)
+    p.add_argument("--api", choices=("chat", "completion"), default="chat")
+    p.add_argument("--max-reply-tokens", type=int, default=2048)
     p.add_argument("--kinds", default="stutter,repetition,false_start")
     p.set_defaults(func=cmd_detect)
 
@@ -688,6 +703,9 @@ def main(argv=None):
         # A clear sentence beats a traceback for something this mundane.
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except llm.SchemaIgnored as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
     except BrokenPipeError:
         return 1
     return 0

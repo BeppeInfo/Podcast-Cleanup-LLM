@@ -517,7 +517,11 @@ class _StubLlamaServer:
 
         self.replies = list(replies)
         self.requests = []
+        self.paths = []
         self.seen_auth = []
+        # Set to send a hand-built envelope instead of the usual wrapping, for
+        # the response shapes only some servers produce.
+        self.raw_reply = None
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -556,15 +560,26 @@ class _StubLlamaServer:
                     return
                 length = int(self.headers.get("Content-Length", 0))
                 outer.requests.append(json.loads(self.rfile.read(length)))
+                outer.paths.append(self.path)
+                if outer.raw_reply is not None:
+                    self._send(200, outer.raw_reply)
+                    return
                 reply = (
                     outer.replies.pop(0) if outer.replies else {"edits": []}
                 )
-                if isinstance(reply, str):
-                    self._send(200, {"content": reply})
-                elif reply is None:
+                if reply is None:
                     self._send(500, {"error": "boom"})
+                    return
+                text = reply if isinstance(reply, str) else json.dumps(reply)
+                # Reply in the envelope matching the endpoint that was called,
+                # so a client posting to the wrong one gets nothing usable.
+                if self.path.startswith("/v1/chat/completions"):
+                    self._send(200, {
+                        "choices": [{"message": {"role": "assistant",
+                                                 "content": text}}]
+                    })
                 else:
-                    self._send(200, {"content": json.dumps(reply)})
+                    self._send(200, {"content": text})
 
             def log_message(self, *args):
                 pass
@@ -636,14 +651,101 @@ class TestAgainstStubServer(unittest.TestCase):
         _, server = self._detect(parsed, [{"edits": []}])
         self.assertEqual(len(server.requests), 1)
         payload = server.requests[0]
-        self.assertIn("json_schema", payload)
         self.assertEqual(payload["temperature"], 0.0)
         self.assertTrue(payload["cache_prompt"])
-        schema = payload["json_schema"]
-        kinds = schema["properties"]["edits"]["items"]["properties"]["kind"]["enum"]
-        # Only the kinds we accept are offered to the model.
-        self.assertEqual(kinds, ["stutter", "repetition"])
-        self.assertIn("teste", payload["prompt"])
+
+        # Both spellings of the constraint are sent, since llama.cpp builds have
+        # read one or the other; each must carry the same schema.
+        response_format = payload["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        for schema in (response_format["json_schema"]["schema"],
+                       response_format["schema"]):
+            kinds = schema["properties"]["edits"]["items"]["properties"]["kind"]["enum"]
+            # Only the kinds we accept are offered to the model.
+            self.assertEqual(kinds, ["stutter", "repetition"])
+
+        # The transcript travels as a chat message, not a raw prompt: that is
+        # what lets the server apply the loaded model's own template.
+        self.assertNotIn("prompt", payload)
+        self.assertIn("teste", payload["messages"][0]["content"])
+        self.assertEqual(payload["messages"][0]["role"], "user")
+
+    def test_completion_escape_hatch_keeps_the_old_request_shape(self):
+        """LLM_API=completion must reach the raw endpoint, unchanged.
+
+        It exists for a build without the chat endpoint, so it has to keep
+        working exactly as it did rather than quietly becoming a chat call.
+        """
+        server = _StubLlamaServer([{"edits": []}])
+        self.addCleanup(server.close)
+        client = llm.LlamaClient(server.endpoint, timeout=10, api="completion")
+        client.complete("hi", llm.response_schema(["stutter"]))
+
+        payload = server.requests[0]
+        self.assertEqual(server.paths, ["/completion"])
+        self.assertIn("json_schema", payload)
+        self.assertIn("prompt", payload)
+        self.assertNotIn("messages", payload)
+        self.assertNotIn("response_format", payload)
+
+    def test_reply_token_ceiling_is_configurable(self):
+        server = _StubLlamaServer([{"edits": []}])
+        self.addCleanup(server.close)
+        client = llm.LlamaClient(server.endpoint, timeout=10, max_reply_tokens=64)
+        client.complete("hi", llm.response_schema(["stutter"]))
+        self.assertEqual(server.requests[0]["max_tokens"], 64)
+
+    def test_an_unknown_api_is_refused_at_construction(self):
+        with self.assertRaises(ValueError):
+            llm.LlamaClient("http://localhost:1", api="grpc")
+
+    def test_reasoning_content_is_read_when_content_is_empty(self):
+        """A reasoning model with reasoning_format=none leaves content empty.
+
+        The schema still constrained what it generated, so the JSON is in
+        reasoning_content and is worth reading rather than discarding.
+        """
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_reply = {
+            "choices": [{"message": {
+                "content": "",
+                "reasoning_content": '{"edits": []}',
+            }}]
+        }
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        content = client.complete("hi", llm.response_schema(["stutter"]))
+        self.assertEqual(json.loads(content), {"edits": []})
+
+    # --- the startup schema check --------------------------------------------
+
+    def test_schema_check_passes_against_a_constraining_server(self):
+        server = _StubLlamaServer([{"edits": []}])
+        self.addCleanup(server.close)
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        client.check_schema_support()          # must not raise
+        self.assertEqual(len(server.requests), 1)
+
+    def test_schema_check_catches_a_server_that_answers_prose(self):
+        """The failure this exists to prevent is a silent one.
+
+        A server that ignores response_format returns prose, every chunk fails
+        to parse and is dropped, and the episode reports no edits — which looks
+        exactly like clean speech.
+        """
+        server = _StubLlamaServer(["Certainly! Here are the edits you asked for."])
+        self.addCleanup(server.close)
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        with self.assertRaises(llm.SchemaIgnored) as caught:
+            client.check_schema_support()
+        self.assertIn("LLM_API=completion", str(caught.exception))
+
+    def test_schema_check_catches_valid_json_of_the_wrong_shape(self):
+        server = _StubLlamaServer([{"something_else": 1}])
+        self.addCleanup(server.close)
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        with self.assertRaises(llm.SchemaIgnored):
+            client.check_schema_support()
 
     def test_unparseable_response_is_survived(self):
         parsed = self._words(["um", "teste"])

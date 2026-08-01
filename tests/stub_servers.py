@@ -97,8 +97,18 @@ def build_handler(role, responses, request_log, api_key=None):
                         handle.write(json.dumps(record) + "\n")
 
             if role == "llama":
-                # llama-server returns the completion text in "content".
-                self._send_json(200, {"content": json.dumps(reply)})
+                # The two endpoints wrap the same text differently: /completion
+                # puts it in "content", /v1/chat/completions in the OpenAI
+                # choices/message envelope. Answer in the shape that was asked
+                # for, so a client sending to the wrong one is not quietly
+                # rewarded with a well-formed reply.
+                text = json.dumps(reply)
+                if self.path.startswith("/v1/chat/completions"):
+                    self._send_json(200, {
+                        "choices": [{"message": {"role": "assistant", "content": text}}]
+                    })
+                else:
+                    self._send_json(200, {"content": text})
             else:
                 self._send_json(200, reply)
 

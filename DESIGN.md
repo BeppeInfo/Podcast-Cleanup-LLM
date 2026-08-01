@@ -370,8 +370,11 @@ with entirely wrong audio, which is precisely the failure mode that matters.
 replies handed out in order, and a request log the test asserts against. That
 gives coverage of the whole pipeline including `transcribe` and `detect`, and
 lets the assertions reach the *payload* — that the multipart body really carries
-the audio, that `json_schema` is present, that the transcript reached the prompt
-— rather than only checking that nothing blew up.
+the audio, that the request went to the chat endpoint with the edit schema in
+`response_format`, that the transcript reached the message content — rather than
+only checking that nothing blew up. The stubs answer in the envelope matching
+the endpoint that was called, so a client posting to the wrong one is not
+rewarded with a well-formed reply.
 
 **4. Predict, then verify — no tolerances where an exact answer exists.**
 `expected_output_samples` replicates ffmpeg's per-frame decision, and the

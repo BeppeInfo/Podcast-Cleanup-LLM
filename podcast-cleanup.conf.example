@@ -147,6 +147,29 @@ LLAMA_EXTRA_ARGS=""
 LLAMA_STARTUP_TIMEOUT="600"
 LLAMA_REQUEST_TIMEOUT="600"
 
+# Which llama.cpp endpoint the detection stage uses.
+#
+#   chat        /v1/chat/completions. The server applies the chat template of
+#               whichever model it has loaded, so the model can be swapped or
+#               upgraded without anything here knowing which one it is. This is
+#               the reason to prefer it.
+#   completion  /completion. A raw prompt with no template applied — the way
+#               this used to work. Keep it for a build without the chat
+#               endpoint, or to compare the two on the same episode.
+LLM_API="chat"
+
+# Ceiling on a single reply. A 350-word chunk rarely yields more than a handful
+# of edits, so this is generous; raise it only if replies are being cut off
+# mid-JSON (the audit log shows the raw text of anything that failed to parse).
+LLM_MAX_REPLY_TOKENS="2048"
+
+# Before the first track, send one tiny request and check the reply really is
+# schema-constrained JSON. A server that answers /health but ignores
+# response_format would otherwise be discovered only after every chunk of every
+# track had been dropped as unparseable — an episode reporting no edits at all,
+# which is indistinguishable from clean speech. Costs one request.
+LLM_CHECK_SCHEMA="1"
+
 # ------------------------------------------------------- silence definition --
 
 # "ffmpeg"  — silencedetect, level based. No extra dependencies.

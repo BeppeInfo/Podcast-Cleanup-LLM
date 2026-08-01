@@ -79,6 +79,22 @@ config_defaults() {
     : "${LLAMA_STARTUP_TIMEOUT:=600}"     # seconds to wait for /health
     : "${LLAMA_REQUEST_TIMEOUT:=600}"     # seconds per completion request
 
+    # Which llama.cpp endpoint the detection stage talks to.
+    #   chat        /v1/chat/completions — the server applies the loaded model's
+    #               own chat template, so the model can be swapped or upgraded
+    #               without anything here knowing which one it is
+    #   completion  /completion — a raw prompt with no template applied, the way
+    #               this used to work. Kept for a build without the chat
+    #               endpoint, or to compare the two on the same episode.
+    : "${LLM_API:=chat}"
+    # Ceiling on one reply. A chunk of 350 words rarely yields more than a
+    # handful of edits, so this is generous; raise it only if replies are being
+    # truncated mid-JSON.
+    : "${LLM_MAX_REPLY_TOKENS:=2048}"
+    # Send one tiny schema-constrained request before the episode starts, to
+    # catch a server that answers /health but does not honour response_format.
+    : "${LLM_CHECK_SCHEMA:=1}"
+
     # Voice activity / silence ----------------------------------------------
     : "${VAD_BACKEND:=ffmpeg}"            # ffmpeg | silero
     : "${SILENCE_THRESHOLD:=-35dB}"       # ffmpeg backend only
@@ -319,6 +335,11 @@ config_validate() {
         *) die "FAILED_ACTION must be 'log' or 'move', got '$FAILED_ACTION'" ;;
     esac
 
+    case "$LLM_API" in
+        chat|completion) ;;
+        *) die "LLM_API must be 'chat' or 'completion', got '$LLM_API'" ;;
+    esac
+
     case "$RESAMPLE_TO" in
         ""|auto) ;;
         *[!0-9]*) die "RESAMPLE_TO must be empty, 'auto', or a sample rate, got '$RESAMPLE_TO'" ;;
@@ -448,7 +469,8 @@ config_dump() {
              WHISPER_REQUEST_TIMEOUT \
              WHISPER_BIN WHISPER_MODEL WHISPER_THREADS WHISPER_LANG WHISPER_JOBS \
              LLAMA_ENDPOINT LLAMA_SERVER_BIN LLAMA_MODEL LLAMA_HOST LLAMA_PORT \
-             LLAMA_CTX LLAMA_NGL VAD_BACKEND SILENCE_THRESHOLD SILERO_THRESHOLD \
+             LLAMA_CTX LLAMA_NGL LLM_API LLM_MAX_REPLY_TOKENS LLM_CHECK_SCHEMA \
+             VAD_BACKEND SILENCE_THRESHOLD SILERO_THRESHOLD \
              SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \
              MUTE_FADE LLM_ENABLE LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP \
              LLM_MAX_EDIT_WORDS LLM_MAX_EDIT_SECONDS LLM_MIN_CONFIDENCE \

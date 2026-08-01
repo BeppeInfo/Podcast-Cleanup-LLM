@@ -338,7 +338,7 @@ printf '\n%sCase 6: a stutter over crosstalk is muted, not cut%s\n' "$BOLD" "$RE
 # Bob is talking (4-6 s). Cutting there would take a bite out of Bob, so instead
 # Alice's track alone is silenced and the timeline is left exactly as it was.
 #
-# Whisper and Qwen are not available here, so their outputs are injected
+# Whisper and the LLM are not available here, so their outputs are injected
 # directly — the point under test is what the plan and the render do with them.
 
 CASE6="$SANDBOX/case6"
@@ -497,9 +497,12 @@ cat >"$SANDBOX/whisper-replies.json" <<'EOF'
 ]
 EOF
 
-# The model's replies, in the order the tracks are processed (alice, then bob).
+# The model's replies. The first is consumed by the startup schema check, which
+# sends one tiny constrained request before any track is analysed; the rest are
+# the tracks in processing order (alice, then bob).
 cat >"$SANDBOX/llama-replies.json" <<'EOF'
 [
+  {"edits": []},
   {"edits": [{"first": 1, "last": 2, "kind": "repetition", "confidence": 0.95}]},
   {"edits": []}
 ]
@@ -593,18 +596,33 @@ if spans != [(3.0, 3.2), (5.0, 5.25), (5.25, 5.5), (7.0, 7.5)]:
     sys.exit(1)
 ' "$WORK7/words/alice.words.json"
 
-check "the LLM was asked with a JSON schema" python3 -c '
+check "the LLM was asked through the chat endpoint, with a JSON schema" python3 -c '
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1])]
 if not rows:
     print("the llama endpoint was never called")
     sys.exit(1)
-payload = rows[0]["payload"]
-if "json_schema" not in payload:
-    print("no json_schema in the request:", sorted(payload))
+# The default LLM_API=chat must reach /v1/chat/completions, so the server
+# applies the loaded model chat template rather than seeing a raw prompt.
+paths = {row["path"] for row in rows}
+if paths != {"/v1/chat/completions"}:
+    print("unexpected endpoints used:", sorted(paths))
     sys.exit(1)
-if "eu" not in payload["prompt"]:
-    print("the transcript did not reach the prompt")
+# Row 0 is the startup schema check; the transcript goes in the ones after it.
+if len(rows) < 2:
+    print("expected a schema check plus per-track requests, got", len(rows))
+    sys.exit(1)
+payload = rows[1]["payload"]
+if "response_format" not in payload:
+    print("no response_format in the request:", sorted(payload))
+    sys.exit(1)
+schema = payload["response_format"].get("json_schema", {}).get("schema", {})
+if "edits" not in schema.get("properties", {}):
+    print("the edit schema did not survive into response_format:", payload["response_format"])
+    sys.exit(1)
+sent = json.dumps(payload.get("messages"))
+if "eu" not in sent:
+    print("the transcript did not reach the message content")
     sys.exit(1)
 ' "$SANDBOX/llama-requests.jsonl"
 
