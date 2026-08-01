@@ -74,7 +74,44 @@ level and is the better answer when levels vary.
 `right` across 9.94–11.34 s, a span whose peak is −50.4 dB — the noise floor.
 Word timings are not evidence that a word was spoken.
 
-Both findings are now caught. At the default threshold this clip warns:
+### The two backends, same audio, same servers
+
+Only `VAD_BACKEND` differs:
+
+| | `ffmpeg` (−35dB) | `silero` |
+| --- | --- | --- |
+| speech detected | 3.68 s in 7 spans | **5.50 s in 5 spans** |
+| removed | 52.3% | **27.6%** |
+| cuts | 4 (3 silence, 1 LLM) | 3 (2 silence, 1 LLM) |
+| words lost to silence | 4 — `know I don't right` | **1 — `right`** |
+
+```
+original   well you know I don't know you remember that there's a way there's a way to fix that right
+ffmpeg     well you know            you remember that there's a way            to fix that
+silero     well you know I don't know you remember that there's a way          to fix that
+```
+
+Silero produces the edit a person would: it hears the quiet `I don't know` that
+the level threshold missed, so the mid-clip silence cut disappears entirely. Both
+backends make the *same* LLM cut — 7.080–8.170, the repeated `there's a way` — so
+the detection stage is unaffected by the VAD choice, as it should be. Both renders
+matched their frame-exact prediction to 0.000 s.
+
+The one word silero still loses is `right`, and that is the correct answer:
+it is a Whisper hallucination over a −50.4 dB noise floor, so a speech-based VAD
+is right to call it silence. Which is the warning behaving as intended — under a
+good VAD it stops crying wolf about quiet speech and reports only the genuine
+anomaly.
+
+Silero needs `torch`, `torchaudio` and `silero-vad`, which the offline suites do
+not have; install them into a venv and point `PYTHON_BIN` at it rather than
+adding a hard dependency. On a CPU-only machine take torch and torchaudio from
+`--index-url https://download.pytorch.org/whl/cpu`, or `silero-vad` will pull a
+CUDA torchaudio that fails on `libcudart`.
+
+### Both findings are caught
+
+At the default threshold this clip warns:
 
 ```
 ! 4 transcribed word(s) on speaker fall inside cuts nothing asked for:
