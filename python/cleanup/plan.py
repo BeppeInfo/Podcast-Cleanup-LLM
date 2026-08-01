@@ -199,6 +199,21 @@ def build_plan(meta, speech, edits, words, params) -> dict:
     keep = iv.complement(cut_spans, 0.0, duration)
 
     lost_words = _words_lost_to_silence(participants, words, cut_spans, chosen_spans)
+    # Advice that names a setting the run is not using is worse than none, so it
+    # follows the backend that actually produced the speech map.
+    if params.get("vad_backend") == "silero":
+        remedy = (
+            "Silero already judges speech rather than level, so the likelier "
+            "cause is Whisper placing words over near-silence; lower "
+            "SILERO_THRESHOLD only if the audio really has speech there"
+        )
+    else:
+        remedy = (
+            "lower SILENCE_THRESHOLD if this is quiet speech, or "
+            "VAD_BACKEND=silero to judge speech over level. Whisper also "
+            "invents words over near-silence, so check the audio before "
+            "trusting either side"
+        )
     for participant, lost in sorted(lost_words.items()):
         sample = " ".join(w.get("text", "") for w in lost[:6])
         if len(lost) > 6:
@@ -206,10 +221,7 @@ def build_plan(meta, speech, edits, words, params) -> dict:
         warnings.append(
             f"{len(lost)} transcribed word(s) on {participant} fall inside cuts "
             f"nothing asked for: \"{sample.strip()}\". The VAD heard silence "
-            "where the transcript has words — lower SILENCE_THRESHOLD if this is "
-            "quiet speech, or VAD_BACKEND=silero to judge speech over level. "
-            "Whisper also invents words over near-silence, so check the audio "
-            "before trusting either side"
+            f"where the transcript has words — {remedy}"
         )
 
     # A muted stretch inside a cut is moot; trim mutes down to what survives,

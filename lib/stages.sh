@@ -93,6 +93,10 @@ write_params() {
     printf '  "cut_padding": %s,\n'          "$CUT_PADDING"          >>"$target"
     printf '  "min_cut": %s,\n'              "$MIN_CUT"              >>"$target"
     printf '  "mute_fade": %s,\n'            "$MUTE_FADE"            >>"$target"
+    # Not a number and not used in any calculation: the plan reports which
+    # backend produced the speech map, so its advice can name a setting that
+    # applies. Validated to ffmpeg|silero, so it needs no quoting care.
+    printf '  "vad_backend": "%s",\n'        "$VAD_BACKEND"          >>"$target"
     printf '  "max_cut_fraction": %s\n'      "$MAX_CUT_FRACTION"     >>"$target"
     printf '}\n' >>"$target"
 }

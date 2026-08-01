@@ -1058,6 +1058,17 @@ class TestVadTranscriptDisagreement(unittest.TestCase):
         self.assertIn("SILENCE_THRESHOLD", warning)
         self.assertIn("silero", warning)
 
+    def test_the_advice_follows_the_backend_in_use(self):
+        """Telling a silero run to switch to silero is worse than saying nothing."""
+        speech = {"a": [(0.0, 4.0), (14.0, 20.0)]}
+        words = {"a": self._words([("quiet", 8.0, 8.6)])}
+        params = dict(PARAMS, vad_backend="silero")
+        result = planner.build_plan(_meta(["a"], 20.0), speech, {}, words, params)
+        warning = next(w for w in result["warnings"] if "quiet" in w)
+        self.assertIn("SILERO_THRESHOLD", warning)
+        self.assertNotIn("VAD_BACKEND=silero", warning)
+        self.assertNotIn("SILENCE_THRESHOLD", warning)
+
     def test_words_an_edit_asked_to_remove_are_not_reported(self):
         """The LLM stage removes words on purpose; that is not a disagreement."""
         speech = {"a": [(0.0, 20.0)]}
