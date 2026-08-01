@@ -573,8 +573,10 @@ which of the two is wrong.
   first run against a real server remains the only evidence that the wire format
   is right, and the schema check is what makes that run fail loudly instead of
   silently.
-- **Silero VAD** — torch is absent from the test environment. The ffmpeg backend
-  is covered; the Silero path is not.
+- **Silero's judgement** — neither implementation's model is exercised, since
+  synthetic audio has nothing to judge. The segmentation *around* it is covered
+  (`speech_from_probabilities`), as is the wiring when `pysilero_vad` is
+  installed; what a real model makes of real speech is not.
 - **Real audio.** Synthetic tracks are sine bursts against digital silence, so
   every level is unambiguous and every word is invented. Neither the `detect`
   stage nor anything depending on real acoustics can be reached that way. A
@@ -680,8 +682,10 @@ logs for inspection.
 - One episode per run. Several in `INPUT_DIR` at once is an error, not a queue.
 - Mute rendering evaluates a per-frame expression over the whole track; with
   very many mutes on a long track it is the slowest part of a render.
-- Silero holds a torch model and so runs one track at a time regardless of
-  `FFMPEG_JOBS`.
+- Silero runs one track at a time regardless of `FFMPEG_JOBS`.
+- The two Silero implementations agree closely but not bit for bit, so a plan is
+  only exactly reproducible against the one that produced it. The VAD output
+  records which that was.
 - `filler` detection exists but is off by default.
 - Whisper removes some disfluencies during transcription, so `detect` can only
   work on what survives (§6). Its yield is lower than the raw speech would

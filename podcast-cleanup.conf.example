@@ -186,9 +186,23 @@ LLM_CHECK_SCHEMA="1"
 # ------------------------------------------------------- silence definition --
 
 # "ffmpeg"  — silencedetect, level based. No extra dependencies.
-# "silero"  — Silero VAD, speech based. Needs python torch + silero-vad, and is
-#             markedly better at not mistaking breathing or room tone for
-#             speech (or speech for silence).
+# "silero"  — Silero VAD, speech based, and markedly better at not mistaking
+#             breathing or room tone for speech (or speech for silence). Worth
+#             the dependency if levels vary across an episode.
+#
+# "silero" is satisfied by either of two packages, whichever is installed:
+#
+#   silero-vad     the reference implementation, and the one used when both are
+#                  present. Pulls in torch and torchaudio, about 970 MB.
+#   pysilero_vad   the same model as a 2 MB ggml build with no dependencies at
+#                  all, and roughly twice as fast. Worth preferring unless you
+#                  want the reference segmentation exactly; to use it while
+#                  silero-vad is also installed, point PYTHON_BIN at an
+#                  interpreter that only has pysilero_vad.
+#
+# They agree closely — on the test sample both find the same five speech spans
+# with every boundary inside one 32 ms chunk of the other — but not bit for bit,
+# so the VAD output records which one ran.
 VAD_BACKEND="ffmpeg"
 
 # Anything quieter than this counts as silence, for the ffmpeg backend.

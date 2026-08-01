@@ -115,11 +115,33 @@ is right to call it silence. Which is the warning behaving as intended — under
 good VAD it stops crying wolf about quiet speech and reports only the genuine
 anomaly.
 
-Silero needs `torch`, `torchaudio` and `silero-vad`, which the offline suites do
-not have; install them into a venv and point `PYTHON_BIN` at it rather than
-adding a hard dependency. On a CPU-only machine take torch and torchaudio from
-`--index-url https://download.pytorch.org/whl/cpu`, or `silero-vad` will pull a
-CUDA torchaudio that fails on `libcudart`.
+### The two Silero packages
+
+`VAD_BACKEND="silero"` is served by whichever package is installed —
+`silero-vad` preferred, `pysilero_vad` otherwise. A full run on this sample
+through each:
+
+| cut | `pysilero_vad` | `silero-vad` | delta |
+| --- | --- | --- | --- |
+| lead_in | 0.000–0.456 | 0.000–0.450 | 6 ms |
+| false_start | 7.080–8.170 | 7.080–8.170 | 0 ms |
+| lead_out | 9.784–11.331 | 9.750–11.331 | 34 ms |
+
+Same cuts for the same reasons, 27.3% removed against 27.6%, and the LLM edit
+identical to the millisecond. Every difference is inside one 32 ms chunk, which
+is `pysilero_vad`'s granularity — so this is quantisation, not disagreement.
+Both renders matched their frame-exact prediction.
+
+Not bit-identical, though, which is why `vad/<p>.json` records an
+`implementation` field: reproducing a plan exactly needs the package that made
+it.
+
+Installing either: `pysilero_vad` is 2 MB and pulls nothing. `silero-vad` wants
+`torch` and `torchaudio`, about 970 MB, and on a CPU-only machine both must come
+from `--index-url https://download.pytorch.org/whl/cpu` — otherwise `silero-vad`
+pulls a CUDA `torchaudio` that dies on `libcudart`. Neither is needed by the
+offline suites; put them in a venv and point `PYTHON_BIN` at it rather than
+making them hard dependencies.
 
 ### Both findings are caught
 

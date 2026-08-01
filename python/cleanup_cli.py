@@ -257,18 +257,25 @@ def cmd_vad_ffmpeg(args):
 
 
 def cmd_vad_silero(args):
-    speech = vad.silero_speech(args.wav, threshold=args.threshold)
+    speech, implementation = vad.silero_speech(args.wav, threshold=args.threshold)
     duration = args.duration or vad.wav_duration(args.wav)
     _write_json(
         args.out,
         {
             "participant": args.participant,
             "backend": "silero",
+            # Which package answered. The two agree to within one 32 ms chunk
+            # but are not bit-identical, so an edit that needs reproducing needs
+            # to know which one produced this map.
+            "implementation": implementation,
             "duration": round(duration, 3),
             "speech": [[round(s, 4), round(e, 4)] for s, e in speech],
         },
     )
-    print(f"{len(speech)} speech regions, {iv.total(speech):.1f}s of speech")
+    print(
+        f"{len(speech)} speech regions, {iv.total(speech):.1f}s of speech "
+        f"(via {implementation})"
+    )
 
 
 # --- transcript ---------------------------------------------------------------

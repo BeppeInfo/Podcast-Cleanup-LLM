@@ -11,12 +11,14 @@ it gets checked rather than eyeballed.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
 import sys
 import tempfile
 import unittest
+import wave
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
@@ -98,6 +100,158 @@ class TestIntervals(unittest.TestCase):
             value = timeline.map(step / 10.0)
             self.assertGreaterEqual(value + 1e-9, previous)
             previous = value
+
+
+class TestSileroSegmentation(unittest.TestCase):
+    """Probabilities to speech intervals.
+
+    `silero-vad` does this inside `get_speech_timestamps`; `pysilero_vad` only
+    returns a probability per 32 ms chunk and leaves it to us. Both must agree,
+    so this is where the rules live and where they are pinned. Pure arithmetic,
+    so it runs everywhere — the Silero path had no automated coverage at all
+    before this.
+    """
+
+    STEP = 0.032  # what pysilero gives at 16 kHz: 512 samples
+
+    def segment(self, probs, **kw):
+        options = {"threshold": 0.5, "min_silence_ms": 200, "min_speech_ms": 120}
+        options.update(kw)
+        return vad.speech_from_probabilities(probs, self.STEP, **options)
+
+    def test_a_run_above_the_threshold_becomes_one_span(self):
+        # 10 chunks ≈ 0.32s of speech, padded by 30ms either side.
+        spans = self.segment([0.0] * 5 + [0.9] * 10 + [0.0] * 10)
+        self.assertEqual(len(spans), 1)
+        start, end = spans[0]
+        self.assertAlmostEqual(start, 5 * self.STEP - 0.030, places=3)
+        self.assertAlmostEqual(end, 15 * self.STEP + 0.030, places=3)
+
+    def test_a_brief_dip_does_not_split_a_word(self):
+        """Hysteresis: speech ends below threshold-0.15, not below threshold."""
+        probs = [0.9] * 10 + [0.42] * 2 + [0.9] * 10   # 0.42 is under 0.5...
+        spans = self.segment(probs)
+        # ...but above the 0.35 release level, so this is still one span.
+        self.assertEqual(len(spans), 1)
+
+    def test_a_long_enough_gap_does_split(self):
+        # 10 chunks of silence is 320ms, well past min_silence_ms=200.
+        spans = self.segment([0.9] * 10 + [0.0] * 10 + [0.9] * 10)
+        self.assertEqual(len(spans), 2)
+
+    def test_a_gap_shorter_than_min_silence_does_not(self):
+        # 4 chunks is 128ms, under the 200ms required to end a span.
+        spans = self.segment([0.9] * 10 + [0.0] * 4 + [0.9] * 10)
+        self.assertEqual(len(spans), 1)
+
+    def test_a_blip_shorter_than_min_speech_is_dropped(self):
+        # 2 chunks is 64ms, under min_speech_ms=120.
+        self.assertEqual(self.segment([0.0] * 5 + [0.9] * 2 + [0.0] * 20), [])
+
+    def test_speech_running_to_the_end_is_closed_at_the_duration(self):
+        spans = self.segment([0.0] * 5 + [0.9] * 10, duration=1.0)
+        self.assertEqual(len(spans), 1)
+        self.assertLessEqual(spans[0][1], 1.0)
+
+    def test_padding_never_runs_past_the_track(self):
+        spans = self.segment([0.9] * 10, duration=0.32)
+        self.assertGreaterEqual(spans[0][0], 0.0)
+        self.assertLessEqual(spans[0][1], 0.32)
+
+    def test_silence_throughout_is_no_speech(self):
+        self.assertEqual(self.segment([0.01] * 50), [])
+
+
+class TestSileroImplementationChoice(unittest.TestCase):
+    """Which package answers, and what happens when none can.
+
+    Order matters and is a decision, not an accident: the reference
+    implementation wins when installed, because asking for Silero usually means
+    that one and its segmentation is upstream's rather than our port.
+    """
+
+    def test_the_reference_implementation_is_preferred(self):
+        self.assertEqual(
+            [name for name, _ in vad.SILERO_IMPLEMENTATIONS],
+            ["silero-vad", "pysilero_vad"],
+        )
+
+    def _with_implementations(self, entries):
+        original = vad.SILERO_IMPLEMENTATIONS
+        vad.SILERO_IMPLEMENTATIONS = tuple(entries)
+        self.addCleanup(setattr, vad, "SILERO_IMPLEMENTATIONS", original)
+
+    def test_an_absent_package_falls_through_to_the_next(self):
+        def missing(*args):
+            raise ImportError("no module named whatever")
+
+        self._with_implementations(
+            [("first", missing), ("second", lambda *a: [(0.0, 1.0)])]
+        )
+        speech, used = vad.silero_speech("ignored.wav")
+        self.assertEqual(used, "second")
+        self.assertEqual(speech, [(0.0, 1.0)])
+
+    def test_no_implementation_at_all_names_both_and_the_way_out(self):
+        def missing(*args):
+            raise ImportError("nope")
+
+        self._with_implementations([("first", missing), ("second", missing)])
+        with self.assertRaises(SystemExit) as caught:
+            vad.silero_speech("ignored.wav")
+        message = str(caught.exception)
+        self.assertIn("first", message)
+        self.assertIn("second", message)
+        self.assertIn("VAD_BACKEND=ffmpeg", message)
+
+    def test_a_real_error_is_not_mistaken_for_an_absent_package(self):
+        """Only ImportError means 'try the next one'."""
+        def broken(*args):
+            raise SystemExit("wrong sample rate")
+
+        self._with_implementations(
+            [("first", broken), ("second", lambda *a: [(0.0, 1.0)])]
+        )
+        with self.assertRaises(SystemExit):
+            vad.silero_speech("ignored.wav")
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("pysilero_vad"), "pysilero_vad is not installed"
+)
+class TestPysileroWiring(unittest.TestCase):
+    """That the preferred implementation is reachable and returns sane output.
+
+    Not a test of Silero's judgement — synthetic audio has nothing to judge.
+    It checks the plumbing: chunk sizing, windowed reads, and that intervals
+    come back inside the track.
+    """
+
+    def _wav(self, seconds=1.5, rate=16000):
+        import struct
+        path = os.path.join(tempfile.mkdtemp(), "probe.wav")
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(
+                b"".join(struct.pack("<h", 0) for _ in range(int(seconds * rate)))
+            )
+        return path
+
+    def test_silence_yields_no_speech_and_names_the_implementation(self):
+        speech, implementation = vad.silero_speech(self._wav())
+        self.assertEqual(implementation, "pysilero_vad")
+        self.assertEqual(speech, [])
+
+    def test_a_length_that_is_not_a_whole_number_of_chunks_is_accepted(self):
+        """512 samples is 32ms; 1.5s is not a multiple, so the tail is partial."""
+        speech, _ = vad.silero_speech(self._wav(seconds=1.517))
+        self.assertEqual(speech, [])
+
+    def test_the_wrong_sample_rate_is_refused_rather_than_guessed(self):
+        with self.assertRaises(SystemExit):
+            vad.silero_speech(self._wav(rate=44100))
 
 
 class TestSilenceDetectParsing(unittest.TestCase):

@@ -62,7 +62,11 @@ Options:
       --stages A,B,C    run exactly these stages, in this order
       --list-stages     show the stages and exit
 
-      --vad BACKEND     ffmpeg (level based) or silero (speech based)
+      --vad BACKEND     ffmpeg (level based) or silero (speech based, better
+                        where levels vary). silero uses the silero-vad package
+                        if installed, otherwise pysilero_vad — same model and
+                        results, but 2 MB and no torch rather than ~970 MB,
+                        and about twice as fast
       --no-llm          silence editing only; skip the LLM stage entirely
   -j, --jobs N          parallel ffmpeg jobs
       --force           proceed even when the plan trips a safety limit

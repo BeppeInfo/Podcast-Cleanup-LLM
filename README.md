@@ -41,7 +41,7 @@ entirely, so the edit keeps its breathing room instead of sounding gasped.
 | python3 | everything | standard library only |
 | whisper.cpp | the `transcribe` stage | `whisper-cli` locally, or a `whisper-server` endpoint |
 | llama.cpp | the `detect` stage | `llama-server` locally, or an endpoint |
-| torch + `silero-vad` | only for `VAD_BACKEND=silero` | optional |
+| `silero-vad` or `pysilero_vad` | only for `VAD_BACKEND=silero` | optional; the latter is 2 MB and needs no torch |
 
 ## Where the models run
 
