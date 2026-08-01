@@ -203,6 +203,13 @@ in it. Two things worth knowing:
   bigger model buys is judgement about which repetitions are accidental, which
   is exactly what the `confidence` field and `LLM_MIN_CONFIDENCE` exist to
   filter.
+- **A server in router mode needs `LLAMA_MODEL_NAME`.** A llama-server hosting a
+  single model ignores the `model` field, but one started without a model path
+  becomes a router for several and refuses any request that does not name one.
+  `curl -s <endpoint>/v1/models` lists the ids. Such a server also has to have
+  the model *loaded*: with `--no-models-autoload` it will not load on demand, and
+  answers "model is not loaded". Both failures are reported before the first
+  track, with the available ids listed.
 - `LLM_API="completion"` reverts to the old raw-prompt `/completion` path, for a
   build without the chat endpoint or to compare the two on one episode. The
   audit log (`*.audit.jsonl`, kept with the outputs) records every response, so

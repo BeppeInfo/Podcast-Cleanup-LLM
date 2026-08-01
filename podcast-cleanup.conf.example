@@ -158,6 +158,19 @@ LLAMA_REQUEST_TIMEOUT="600"
 #               endpoint, or to compare the two on the same episode.
 LLM_API="chat"
 
+# The model id to name in each request. A llama-server hosting one model ignores
+# it, so it can stay empty; one in *router mode* hosts several and refuses any
+# request that does not name one — "model name is missing from the request".
+# List what a server offers with:
+#
+#   curl -s http://your-server:8080/v1/models | python3 -m json.tool
+#
+# A router also has to have the model loaded. If it was started with
+# --no-models-autoload, naming an unloaded model gives "model is not loaded"
+# and it must be loaded before the run.
+LLAMA_MODEL_NAME=""
+#LLAMA_MODEL_NAME="Qwen3.6-35B-A3B-Q4_K_M"
+
 # Ceiling on a single reply. A 350-word chunk rarely yields more than a handful
 # of edits, so this is generous; raise it only if replies are being cut off
 # mid-JSON (the audit log shows the raw text of anything that failed to parse).

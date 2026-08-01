@@ -512,7 +512,7 @@ llama_start() {
         # shellcheck disable=SC2046
         PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
             py llm-wait --endpoint "$LLAMA_URL" --timeout 30 \
-            --api "$LLM_API" $(llm_schema_check_flag) \
+            --api "$LLM_API" --model-name "$LLAMA_MODEL_NAME" $(llm_schema_check_flag) \
             || die "the configured llama endpoint at $LLAMA_URL is not usable"
         log_ok "endpoint is responding"
         return 0
@@ -545,7 +545,7 @@ llama_start() {
     # shellcheck disable=SC2046
     if ! PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
         py llm-wait --endpoint "$LLAMA_URL" --timeout "$LLAMA_STARTUP_TIMEOUT" \
-        --api "$LLM_API" $(llm_schema_check_flag); then
+        --api "$LLM_API" --model-name "$LLAMA_MODEL_NAME" $(llm_schema_check_flag); then
         log_error "llama-server never became ready; last lines of its log:"
         [[ -f "$server_log" ]] && log_line "$(tail -n 20 "$server_log")"
         llama_stop
@@ -621,6 +621,7 @@ stage_detect() {
             --min-confidence "$LLM_MIN_CONFIDENCE" --temperature "$LLM_TEMP" \
             --request-timeout "$LLAMA_REQUEST_TIMEOUT" --kinds "$LLM_ACCEPT_KINDS" \
             --api "$LLM_API" --max-reply-tokens "$LLM_MAX_REPLY_TOKENS" \
+            --model-name "$LLAMA_MODEL_NAME" \
             || rc=$?
 
         if (( rc == 0 )); then

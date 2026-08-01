@@ -522,6 +522,9 @@ class _StubLlamaServer:
         # Set to send a hand-built envelope instead of the usual wrapping, for
         # the response shapes only some servers produce.
         self.raw_reply = None
+        self.raw_status = 200
+        # Model ids returned from /v1/models, for the router-mode error path.
+        self.models = []
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -552,6 +555,8 @@ class _StubLlamaServer:
                     return
                 if self.path == "/health":
                     self._send(health_status, {"status": "ok"})
+                elif self.path == "/v1/models":
+                    self._send(200, {"data": [{"id": m} for m in outer.models]})
                 else:
                     self._send(404, {})
 
@@ -562,7 +567,7 @@ class _StubLlamaServer:
                 outer.requests.append(json.loads(self.rfile.read(length)))
                 outer.paths.append(self.path)
                 if outer.raw_reply is not None:
-                    self._send(200, outer.raw_reply)
+                    self._send(outer.raw_status, outer.raw_reply)
                     return
                 reply = (
                     outer.replies.pop(0) if outer.replies else {"edits": []}
@@ -694,6 +699,47 @@ class TestAgainstStubServer(unittest.TestCase):
         client = llm.LlamaClient(server.endpoint, timeout=10, max_reply_tokens=64)
         client.complete("hi", llm.response_schema(["stutter"]))
         self.assertEqual(server.requests[0]["max_tokens"], 64)
+
+    def test_model_name_is_sent_when_configured(self):
+        """A server in router mode refuses a request that names no model."""
+        server = _StubLlamaServer([{"edits": []}])
+        self.addCleanup(server.close)
+        client = llm.LlamaClient(server.endpoint, timeout=10, model="qwen-x")
+        client.complete("hi", llm.response_schema(["stutter"]))
+        self.assertEqual(server.requests[0]["model"], "qwen-x")
+
+    def test_model_name_is_omitted_when_not_configured(self):
+        """A single-model server has nothing to route, so nothing is claimed."""
+        server = _StubLlamaServer([{"edits": []}])
+        self.addCleanup(server.close)
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        client.complete("hi", llm.response_schema(["stutter"]))
+        self.assertNotIn("model", server.requests[0])
+
+    def test_a_refusal_carries_the_servers_own_words(self):
+        """"HTTP Error 400: Bad Request" alone sends you reading code."""
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_status = 400
+        server.raw_reply = {"error": {"message": "model is not loaded"}}
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        with self.assertRaises(llm.EndpointError) as caught:
+            client.complete("hi", llm.response_schema(["stutter"]))
+        self.assertIn("model is not loaded", str(caught.exception))
+
+    def test_a_missing_model_name_is_explained_with_the_choices(self):
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_status = 400
+        server.raw_reply = {"error": {"message": "model name is missing"}}
+        server.models = ["qwen-a", "gemma-b"]
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        with self.assertRaises(llm.SchemaIgnored) as caught:
+            client.check_schema_support()
+        message = str(caught.exception)
+        self.assertIn("LLAMA_MODEL_NAME", message)
+        self.assertIn("qwen-a", message)
+        self.assertIn("gemma-b", message)
 
     def test_an_unknown_api_is_refused_at_construction(self):
         with self.assertRaises(ValueError):

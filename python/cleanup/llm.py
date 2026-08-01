@@ -166,6 +166,17 @@ class AuthRejected(Exception):
     """The server refused our credentials. Retrying cannot help."""
 
 
+class EndpointError(OSError):
+    """The server rejected the request and said why.
+
+    Subclasses OSError so the per-chunk handler in detect() still treats it as
+    a droppable failure — a chunk that overflows the context is a real per-item
+    error — while carrying the server's own words instead of a bare status code.
+    A misconfiguration that would reject *every* chunk is caught earlier, by
+    check_schema_support.
+    """
+
+
 class SchemaIgnored(Exception):
     """The server answered but did not honour the JSON schema.
 
@@ -198,6 +209,7 @@ class LlamaClient:
         api_key: str | None = None,
         api: str = "chat",
         max_reply_tokens: int = 2048,
+        model: str | None = None,
     ):
         if api not in ("chat", "completion"):
             raise ValueError(f"api must be 'chat' or 'completion', got {api!r}")
@@ -207,6 +219,10 @@ class LlamaClient:
         self.api_key = api_key or None
         self.api = api
         self.max_reply_tokens = max_reply_tokens
+        # Which model to ask for by name. A single-model llama-server ignores
+        # this; one in router mode serves several and refuses a request that
+        # does not name one, so it is not optional there.
+        self.model = model or None
 
     def _headers(self, **extra) -> dict:
         headers = dict(extra)
@@ -238,7 +254,27 @@ class LlamaClient:
                         "LLAMA_API_KEY_FILE."
                     )
                 ) from exc
-            raise
+            # Any other refusal: keep what the server actually said. "HTTP Error
+            # 400: Bad Request" alone sends you reading code instead of config.
+            detail = _error_detail(exc)
+            raise EndpointError(
+                f"the llama endpoint refused the request (HTTP {exc.code})"
+                + (f": {detail}" if detail else "")
+            ) from exc
+
+    def available_models(self) -> list[str]:
+        """Model ids the server admits to, for naming them in an error."""
+        try:
+            request = urllib.request.Request(
+                f"{self.endpoint}/v1/models", headers=self._headers()
+            )
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                listing = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return []
+        return [
+            entry["id"] for entry in listing.get("data", []) if entry.get("id")
+        ]
 
     def wait_until_ready(self, timeout: float, poll: float = 2.0) -> bool:
         """Block until the server reports it can serve, or the timeout expires.
@@ -301,7 +337,7 @@ class LlamaClient:
         return _chat_content(result)
 
     def _chat_payload(self, prompt: str, schema: dict, budget: int) -> dict:
-        return {
+        payload = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": budget,
             "temperature": self.temperature,
@@ -319,6 +355,9 @@ class LlamaClient:
                 "schema": schema,
             },
         }
+        if self.model:
+            payload["model"] = self.model
+        return payload
 
     def check_schema_support(self) -> None:
         """Confirm the server actually constrains output to the schema.
@@ -338,6 +377,19 @@ class LlamaClient:
         except AuthRejected:
             raise
         except Exception as exc:
+            # A server in router mode serves several models and refuses a
+            # request that does not name one — the commonest way this fails, and
+            # not obvious from the wording alone, so the setting and the actual
+            # choices are spelled out.
+            if "model" in str(exc).lower():
+                offered = self.available_models()
+                raise SchemaIgnored(
+                    f"{exc}. This server wants the model named in the request; "
+                    "set LLAMA_MODEL_NAME"
+                    + (f" to one of: {', '.join(offered)}" if offered else "")
+                    + ". A model listed but not loaded also has to be loaded "
+                    "first, unless the server was started with model autoload."
+                ) from exc
             raise SchemaIgnored(
                 f"could not reach the llama endpoint for a schema check: {exc}"
             ) from exc
@@ -357,6 +409,24 @@ class LlamaClient:
                 f"schema ({content[:120]!r}); set LLM_API=completion to use the "
                 "raw /completion endpoint instead."
             )
+
+
+def _error_detail(exc: urllib.error.HTTPError) -> str:
+    """The message out of an error body, in whichever shape it arrived."""
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    finally:
+        exc.close()  # or the buffered body leaks a ResourceWarning
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return body.strip()[:200]
+    error = parsed.get("error", parsed)
+    if isinstance(error, dict):
+        return str(error.get("message") or error)[:200]
+    return str(error)[:200]
 
 
 def _chat_content(result: dict) -> str:

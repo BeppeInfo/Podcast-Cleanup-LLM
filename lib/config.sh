@@ -87,6 +87,10 @@ config_defaults() {
     #               this used to work. Kept for a build without the chat
     #               endpoint, or to compare the two on the same episode.
     : "${LLM_API:=chat}"
+    # The model id to name in each request. A single-model llama-server ignores
+    # it; one in router mode serves several and refuses a request that does not
+    # name one, so it is required there. `curl <endpoint>/v1/models` lists them.
+    : "${LLAMA_MODEL_NAME:=}"
     # Ceiling on one reply. A chunk of 350 words rarely yields more than a
     # handful of edits, so this is generous; raise it only if replies are being
     # truncated mid-JSON.
@@ -469,7 +473,8 @@ config_dump() {
              WHISPER_REQUEST_TIMEOUT \
              WHISPER_BIN WHISPER_MODEL WHISPER_THREADS WHISPER_LANG WHISPER_JOBS \
              LLAMA_ENDPOINT LLAMA_SERVER_BIN LLAMA_MODEL LLAMA_HOST LLAMA_PORT \
-             LLAMA_CTX LLAMA_NGL LLM_API LLM_MAX_REPLY_TOKENS LLM_CHECK_SCHEMA \
+             LLAMA_CTX LLAMA_NGL LLAMA_MODEL_NAME LLM_API LLM_MAX_REPLY_TOKENS \
+             LLM_CHECK_SCHEMA \
              VAD_BACKEND SILENCE_THRESHOLD SILERO_THRESHOLD \
              SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \
              MUTE_FADE LLM_ENABLE LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP \

@@ -343,7 +343,8 @@ def cmd_whisper_wait(args):
 
 def cmd_llm_wait(args):
     client = llm.LlamaClient(
-        args.endpoint, api_key=_api_key(LLAMA_KEY_ENV), api=args.api
+        args.endpoint, api_key=_api_key(LLAMA_KEY_ENV), api=args.api,
+        model=args.model_name,
     )
     if not client.wait_until_ready(args.timeout):
         raise SystemExit(1)
@@ -366,6 +367,7 @@ def cmd_detect(args):
         args.endpoint, timeout=args.request_timeout, temperature=args.temperature,
         api_key=_api_key(LLAMA_KEY_ENV),
         api=args.api, max_reply_tokens=args.max_reply_tokens,
+        model=args.model_name,
     )
     result = llm.detect(
         client,
@@ -635,6 +637,7 @@ def build_parser():
     p.add_argument("--endpoint", required=True)
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--api", choices=("chat", "completion"), default="chat")
+    p.add_argument("--model-name", default="")
     p.add_argument(
         "--check-schema", action="store_true",
         help="also verify the server constrains replies to a JSON schema",
@@ -655,6 +658,7 @@ def build_parser():
     p.add_argument("--request-timeout", type=float, default=600.0)
     p.add_argument("--api", choices=("chat", "completion"), default="chat")
     p.add_argument("--max-reply-tokens", type=int, default=2048)
+    p.add_argument("--model-name", default="")
     p.add_argument("--kinds", default="stutter,repetition,false_start")
     p.set_defaults(func=cmd_detect)
 
