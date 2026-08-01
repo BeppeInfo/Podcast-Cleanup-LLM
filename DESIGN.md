@@ -248,6 +248,25 @@ into speech that should stay.
 `filler` ("um", "uh") is implemented but excluded from `LLM_ACCEPT_KINDS` by
 default; removing every one reads as over-editing.
 
+### The transcript has already removed some of them
+
+Whisper's decoder normalises. Speech synthesised as *"So I I I think … the the
+weather"* transcribed as *"So I think … the weather"* — every stutter gone before
+the LLM saw a word of it. `uh` survived; the repetitions did not.
+
+Two consequences, and the second is easy to miss:
+
+- **This stage cannot find what never reached it.** Its real yield is bounded by
+  what survives transcription, which is less than the raw speech contains. A
+  disappointing edit count is not necessarily the model being cautious.
+- **Synthetic audio cannot exercise it at all.** No matter how carefully the
+  disfluencies are planted, they are gone by the time the words arrive. That is
+  why a real recording is kept in `tests/samples/` — see §10.
+
+Nothing is done about the first. Reconstructing what Whisper discarded would mean
+distrusting the transcript the rest of the pipeline is built on, and the timings
+would be guesswork.
+
 ### Nothing here knows which model it is talking to
 
 Both models are named only by a path — `WHISPER_MODEL`, `LLAMA_MODEL` — and the
@@ -264,6 +283,13 @@ Two decisions keep it that way:
   the chat endpoint, or to compare the two on one episode.
 - **Whisper responses are parsed tolerantly** (see §7), which is the same
   argument applied to version drift rather than model choice.
+
+One thing the server may still need told: a llama-server started without a model
+path becomes a *router* for several, and refuses any request that does not name
+one. `LLAMA_MODEL_NAME` supplies it, empty for the single-model case that ignores
+it. That this was missing for so long is instructive — a single-model server
+ignores the field, so nothing local ever objected, and neither did stubs written
+against the same assumption.
 
 The schema constraint is sent under both the nested OpenAI spelling and the flat
 one, because llama.cpp builds have read one or the other. A build reading
@@ -316,6 +342,13 @@ Word timing quality differs: `max_len=1` is requested so each segment is one
 word and timings are exact, but a build that ignores it returns sentence
 segments whose word positions are interpolated. The run says which it got,
 because it decides how tightly a stutter can be cut.
+
+**A word with timings is not evidence a word was spoken.** On the sample
+recording Whisper returned a final `right` spanning 9.94–11.34 s, over audio
+whose peak is −50.4 dB — the noise floor. The transcript is a model's output, not
+a measurement, and it will place words over near-silence. Everything downstream
+treats it as one input among two: the VAD decides where speech is, the transcript
+decides what was said, and §8 covers what happens when they disagree.
 
 ### Authenticating to either endpoint
 
@@ -535,6 +568,11 @@ which of the two is wrong.
   silently.
 - **Silero VAD** — torch is absent from the test environment. The ffmpeg backend
   is covered; the Silero path is not.
+- **Real audio.** Synthetic tracks are sine bursts against digital silence, so
+  every level is unambiguous and every word is invented. Neither the `detect`
+  stage nor anything depending on real acoustics can be reached that way. A
+  recording is kept in `tests/samples/` for manual runs; nothing automated
+  consumes it, so the suites stay offline.
 - **Whether the edit sounds good.** Not a testable property. That is what the
   edit report and a listen are for.
 - **Long-file behaviour.** Synthetic episodes are 10–30 s. Nothing here would
@@ -542,6 +580,37 @@ which of the two is wrong.
   memory problem that only appears at scale.
 - **Concurrency.** `FFMPEG_JOBS > 1` and `WHISPER_JOBS > 1` paths are not
   exercised; the suites run serially.
+
+### What the first real run found
+
+The suites were green throughout. The first run against a real whisper-server and
+a real llama-server, on a real recording, found four things — worth listing
+because they share a shape:
+
+1. **The client never sent a `model` field.** A single-model server ignores it, so
+   the assumption held everywhere it was tested; a router-mode server refuses.
+2. **The VAD and the transcript disagreed**, and nothing compared them. Quiet
+   speech at −39.2 dB fell under the −35 dB threshold and was cut while Whisper
+   had transcribed it. Now warned about (§8).
+3. **The default `SILENCE_THRESHOLD` cut through the middle of the speech.** A
+   threshold belongs below the quietest speech and above the noise floor; this
+   recording put speech at −21 dB and −39 dB with a floor near −50 dB, and
+   `-35dB` fell *between the two kinds of speech*. Lowered to `-45dB`, which
+   lands in the intended band and errs toward leaving room tone rather than
+   cutting speech — those two mistakes do not cost the same.
+4. **The lost-word warning gave advice for the wrong backend**, telling a Silero
+   run to try Silero.
+
+Every one of them was invisible to the suites for the same reason: *both sides of
+each test were written here*. The stubs answer as the client expects, synthetic
+audio has no quiet speech, digital silence has no noise floor, and a fixture
+never runs with a configuration nobody thought to write down. Passing tests
+constrain the code to the author's model of the world, and these were all places
+where that model was wrong rather than where the code was.
+
+The response is not more stubs. It is the schema check, the lost-word warning,
+and a real recording to run by hand — each of which turns a silent wrong answer
+into a loud one at the point where reality first disagrees.
 
 ### Invariants and where they are guarded
 
@@ -601,6 +670,15 @@ logs for inspection.
 - Silero holds a torch model and so runs one track at a time regardless of
   `FFMPEG_JOBS`.
 - `filler` detection exists but is off by default.
+- Whisper removes some disfluencies during transcription, so `detect` can only
+  work on what survives (§6). Its yield is lower than the raw speech would
+  suggest, and nothing recovers the difference.
+- The VAD and the transcript can disagree about where speech is. The
+  disagreement is reported, never reconciled — neither side is reliable enough to
+  overrule the other (§8).
+- `SILENCE_THRESHOLD` is a single level for a whole episode. A recording whose
+  loudness varies across it has no single right answer; `VAD_BACKEND="silero"`
+  judges speech instead and is the better tool there.
 - Speaker attribution comes from track membership, not diarisation: bleed of one
   voice into another's mic is not separated, though the mute-over-crosstalk rule
   means it does no damage.
@@ -616,6 +694,8 @@ authority. The ones whose meaning is easy to get wrong:
 | `OUTPUT_CODEC`/`OUTPUT_EXT` | the output format, unrelated to what came in |
 | `RESAMPLE_TO` | empty means a rate mismatch is an error, not that nothing happens |
 | `VAD_MIN_SILENCE` | detection *granularity* of the speech map, not the editing threshold |
+| `SILENCE_THRESHOLD` | ffmpeg backend only; errs low because cutting quiet speech is damage while keeping room tone is only a looser edit |
+| `LLAMA_MODEL_NAME` | required by a router-mode server, ignored by a single-model one |
 | `SILENCE_MIN_DURATION` | how long a gap must be before it is worth shortening |
 | `SILENCE_KEEP` | quiet left behind in place of a shortened gap |
 | `CUT_PADDING` | speech margin kept either side of every cut |

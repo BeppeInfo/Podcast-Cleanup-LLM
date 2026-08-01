@@ -101,11 +101,14 @@ config_defaults() {
 
     # Voice activity / silence ----------------------------------------------
     : "${VAD_BACKEND:=ffmpeg}"            # ffmpeg | silero
-    # ffmpeg backend only. -45dB rather than -35dB because the cost of the two
-    # mistakes is not symmetric: too high a threshold cuts quiet speech, which
-    # is damage, while too low leaves a little room tone, which is only a less
-    # tight edit. Measured on a real recording, speech sat at -39dB while the
-    # noise floor was near -50dB, and -35dB fell between them.
+    # ffmpeg backend only. The threshold belongs below the quietest speech and
+    # above the noise floor. On a real recording here, speech ranged from -21dB
+    # down to -39dB with a floor near -50dB: -35dB sat *inside* that speech
+    # range and cut the quiet end of it, while -45dB clears it.
+    #
+    # It errs low on purpose, because the two mistakes do not cost the same.
+    # Too high cuts quiet speech, which is damage found only by listening; too
+    # low leaves some room tone, which is merely a less tight edit.
     : "${SILENCE_THRESHOLD:=-45dB}"
     # Detection granularity, not the editing threshold: the speech map is built
     # at this resolution and SILENCE_MIN_DURATION decides what to act on.

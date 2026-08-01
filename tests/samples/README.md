@@ -62,13 +62,23 @@ clip is what moved the default down to `-45dB`. Silence cuts only, `--no-llm`:
 | `-45dB` (current default) | 29.5% | 3 |
 | `-55dB` | 1.9% | 1 |
 
-At `-35dB` the span carrying `I don't know` (measured peak −39.2 dB) falls below
-the threshold and is cut as silence, while `well you` (−21.4 dB) and `there's a
-way` (−22.2 dB) are comfortably above it and survive. Nothing was broken — the
-VAD applied the threshold it was given — but that threshold sat between this
-recording's speech and its noise floor, which is the one place it must not be.
-`VAD_BACKEND="silero"` decides on speech rather than level and is the better
-answer when levels vary.
+The levels tell the whole story:
+
+| | measured peak |
+| --- | --- |
+| `well you`, `there's a way` | −21.4 dB, −22.2 dB |
+| `I don't know` | **−39.2 dB** |
+| the invented `right` | −50.4 dB (noise floor) |
+
+A threshold belongs below the quietest speech and above the noise floor. `-35dB`
+fell *between the two kinds of speech* — under the loud parts, over the quiet
+ones — so `I don't know` was cut while the rest survived. `-45dB` lands in the
+intended band. Nothing was broken; the VAD applied the threshold it was given,
+and the threshold was in the wrong place.
+
+That band only exists if the recording has one. `VAD_BACKEND="silero"` decides on
+speech rather than level and is the better answer when loudness varies across an
+episode.
 
 **Whisper places words where there is no audio.** It transcribes a final
 `right` across 9.94–11.34 s, a span whose peak is −50.4 dB — the noise floor.
