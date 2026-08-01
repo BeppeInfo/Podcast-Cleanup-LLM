@@ -78,6 +78,37 @@ left behind. Removing it entirely makes conversation sound gasped.
 
 ## 4. The data flow
 
+### Where it all lives
+
+One root, four directories under it, created on first use:
+
+```
+$PODCAST_ROOT/
+    incoming/    tracks waiting to be processed
+    output/      finished episodes, one directory each
+    work/        per-episode intermediates
+    failed/      logs, and inputs when FAILED_ACTION="move"
+```
+
+`PODCAST_ROOT` defaults to the directory holding `clean-podcast.sh`, so a
+checkout is self-contained and runs with no arguments and no config file. That
+default suits a workstation, which is now the expected case: with both models
+reachable over HTTP there is no reason for the pipeline itself to live on the
+server. A server install points the root at its media volume instead, or sets
+the four individually when they belong on different ones.
+
+Precedence is *specific beats general, command line beats config file*: a
+`INPUT_DIR` setting overrides the root, but `--root` on the command line
+overrides that `INPUT_DIR`, since relocating the whole layout is the reason to
+pass it. `--input`/`--output`/`--work` alongside `--root` still win, being
+equally explicit and more specific.
+
+Creating the tree up front is what lets a missing input directory mean *empty*
+rather than *misconfigured* — the run reports nothing to do and exits 0, leaving
+an obvious place to put files.
+
+### Per-episode state
+
 Everything lives in `$WORK_ROOT/<episode>/` and is JSON, so any stage can be
 re-run by hand.
 
@@ -203,7 +234,8 @@ number becomes a cut in the wrong place. So it is never given or asked for one.
   unaccepted kind, or below `LLM_MIN_CONFIDENCE`. Each rejection is recorded with
   its reason in the audit log.
 - Responses are constrained by a JSON schema server-side, so nothing is scraped
-  out of prose.
+  out of prose. Because that constraint is load-bearing, its absence is checked
+  for rather than assumed — see below.
 - Long transcripts go in overlapping windows; findings reported twice are fused
   by index range, keeping the more confident label.
 - A window whose response cannot be used is **dropped with a warning, not
@@ -215,6 +247,34 @@ into speech that should stay.
 
 `filler` ("um", "uh") is implemented but excluded from `LLM_ACCEPT_KINDS` by
 default; removing every one reads as over-editing.
+
+### Nothing here knows which model it is talking to
+
+Both models are named only by a path — `WHISPER_MODEL`, `LLAMA_MODEL` — and the
+prompt is plain instructions plus a schema, with no model-specific token or
+phrasing in it. Swapping either, or upgrading a version, needs no code change.
+Two decisions keep it that way:
+
+- **The LLM is called through `/v1/chat/completions`, not `/completion`.** The
+  raw-prompt endpoint applies no chat template, so every model would see an
+  instruction formatted for none of them, and how well it coped would be a
+  property of the model rather than of this code. Going through the chat
+  endpoint hands that job to the server, which knows the template of whatever it
+  has loaded. `LLM_API="completion"` reverts to the raw path for a build without
+  the chat endpoint, or to compare the two on one episode.
+- **Whisper responses are parsed tolerantly** (see §7), which is the same
+  argument applied to version drift rather than model choice.
+
+The schema constraint is sent under both the nested OpenAI spelling and the flat
+one, because llama.cpp builds have read one or the other. A build reading
+*neither* is the dangerous case: unconstrained prose fails to parse, every chunk
+is dropped by the rule above, and the run finishes reporting no edits at all —
+which is exactly what a clean recording also looks like. `LLM_CHECK_SCHEMA`
+therefore spends one small request before the first track confirming the reply
+really is constrained, and the stage aborts if not. It is the same reasoning as
+the per-chunk tolerance, inverted: dropping a window is survivable precisely
+because it is rare, so a fault that would drop *every* window must not be
+allowed to look like the survivable case.
 
 ## 7. Model placement and memory
 
@@ -257,6 +317,33 @@ word and timings are exact, but a build that ignores it returns sentence
 segments whose word positions are interpolated. The run says which it got,
 because it decides how tightly a stutter can be cut.
 
+### Authenticating to either endpoint
+
+Both clients send `Authorization: Bearer <key>` when a key is configured, inline
+(`WHISPER_API_KEY`, `LLAMA_API_KEY`) or from a file (the `_FILE` variants, which
+are preferred and warn when readable beyond their owner). whisper.cpp has no
+auth of its own, so its key is for whatever fronts it; llama.cpp's matches
+`--api-key`.
+
+Where the key must *not* end up drove the design. It reaches Python through the
+environment, never argv, because a command line is readable by any process on
+the machine; and `config_dump` records only whether one was set, because the run
+log is copied into the output directory and outlives the episode.
+
+A refusal is treated as fatal rather than transient, which is the opposite of
+how this code treats most errors:
+
+- the readiness probes report a 401 immediately instead of polling out their
+  timeout, since no amount of waiting fixes a wrong key;
+- `detect` propagates `AuthRejected` rather than swallowing it per chunk.
+
+The reasoning is the one in §6: a per-chunk drop is survivable because it is
+rare, so anything that would fail *every* chunk identically has to stop the run
+instead of quietly producing an episode with no edits. The schema check exists
+for the same reason and aborts the same way — exit 2 for a refused key, exit 3
+for an ignored schema, each naming the setting to change and the `--from detect`
+command to resume with.
+
 ## 8. Safety and failure
 
 - A plan removing more than `MAX_CUT_FRACTION` of the episode is refused;
@@ -264,7 +351,8 @@ because it decides how tightly a stutter can be cut.
 - Rendered durations are checked against the frame-exact prediction. A mismatch
   fails the run.
 - Rejected up front: mismatched sample rates, tracks from two episodes,
-  duplicate participants, unparseable filenames, a missing input directory.
+  duplicate participants, unparseable filenames. A missing input directory is
+  *not* an error — it is created, and an empty one simply means nothing to do.
 - Outputs are rendered into `output/<episode>/.staging/` and moved into place
   only once all are verified — a rename within one filesystem, so it is atomic
   and not a second copy of a gigabyte.
@@ -300,6 +388,12 @@ are marked.
    timeline.
 9. **Failure is recoverable**: the work directory plus `--from` reproduces the
    rest of the run.
+10. **A fault that would affect every chunk identically stops the run.** Per-item
+    tolerance — dropping a window whose response cannot be used — is only safe
+    because it is rare. A refused key or an unhonoured schema would drop all of
+    them and finish reporting no edits, which is indistinguishable from clean
+    speech, so both abort instead. Any new whole-run failure mode belongs here
+    rather than in the per-chunk `except`.
 
 ## 10. Testing strategy
 
@@ -421,6 +515,14 @@ which of the two is wrong.
   deterministic, and what needs testing is our handling of it, not their quality.
   The consequence: the flags passed to `whisper-cli`, and llama-server's launch
   arguments, are exercised by nothing. Those are the lines to re-read by hand.
+
+  The sharper consequence is that **the stubs accept whatever the client sends**,
+  because both sides were written here. A green suite proves the request has the
+  shape we intended, never that a real server agrees — which is exactly why the
+  `response_format` spelling is sent twice and why `LLM_CHECK_SCHEMA` exists. A
+  first run against a real server remains the only evidence that the wire format
+  is right, and the schema check is what makes that run fail loudly instead of
+  silently.
 - **Silero VAD** — torch is absent from the test environment. The ffmpeg backend
   is covered; the Silero path is not.
 - **Whether the edit sounds good.** Not a testable property. That is what the
@@ -510,3 +612,7 @@ authority. The ones whose meaning is easy to get wrong:
 | `RENDER_FRAME_SAMPLES` | timing granularity of the whole edit; must be uniform across an episode |
 | `MAX_CUT_FRACTION` | refusal threshold, not a target |
 | `WHISPER_CHUNK_SECONDS` | upload chunk size for remote transcription; 0 sends the lot |
+| `PODCAST_ROOT` | the whole layout; the four directory settings override it individually |
+| `LLM_API` | `chat` lets the server apply the model's template; `completion` is the raw-prompt fallback |
+| `LLM_CHECK_SCHEMA` | one request that turns a silent whole-run failure into an immediate one |
+| `*_API_KEY_FILE` | preferred over the inline form; the key never reaches argv or the log |
