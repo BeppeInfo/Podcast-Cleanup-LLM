@@ -72,12 +72,20 @@ level and is the better answer when levels vary.
 
 **Whisper places words where there is no audio.** It transcribes a final
 `right` across 9.94–11.34 s, a span whose peak is −50.4 dB — the noise floor.
-Word timings are not evidence that a word was spoken, which matters because the
-transcript and the VAD are two independent notions of "speech" and nothing
-currently checks that they agree. A silence cut can therefore remove a word the
-transcript claims exists. The output stays self-consistent — the published
-transcript is rebuilt from the rendered timeline, so it simply lacks that word —
-but the disagreement is invisible.
+Word timings are not evidence that a word was spoken.
+
+Both findings are now caught. At the default threshold this clip warns:
+
+```
+! 4 transcribed word(s) on speaker fall inside cuts nothing asked for:
+  "know I don't right". The VAD heard silence where the transcript has words …
+```
+
+which is the quiet phrase plus the invented `right`, while the repetition the
+LLM removed on purpose is correctly left out of the count. This sample is the
+regression test for that warning in its real form — the unit tests cover the
+logic, but only real audio produces speech at −39 dB and a hallucination at
+−50 dB.
 
 Add `--force` to run the default threshold to completion: with one speech edit
 on top of the silence cuts it reaches 52.3%, above `MAX_CUT_FRACTION`, and the

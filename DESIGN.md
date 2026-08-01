@@ -350,6 +350,16 @@ command to resume with.
   `--force` overrides. That almost always means a wrong detection threshold.
 - Rendered durations are checked against the frame-exact prediction. A mismatch
   fails the run.
+- A cut that swallows transcribed words no edit asked for is warned about, and
+  the words are listed in `plan.json` under `words_lost_to_silence`. The VAD and
+  the transcript are two independent opinions about where speech is, and nothing
+  else compares them — the published transcript is rebuilt from the rendered
+  timeline, so a word cut away disappears from it and the output stays
+  self-consistent. That self-consistency is exactly what hides the
+  disagreement. Either side can be wrong (a level-based VAD misses quiet speech;
+  Whisper places words over near-silence), so this reports and does not correct.
+  A word must be more than half swallowed to count: cut padding grazing its
+  neighbour is normal.
 - Rejected up front: mismatched sample rates, tracks from two episodes,
   duplicate participants, unparseable filenames. A missing input directory is
   *not* an error — it is created, and an empty one simply means nothing to do.

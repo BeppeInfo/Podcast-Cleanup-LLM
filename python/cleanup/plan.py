@@ -75,6 +75,51 @@ def _pad_edit(words, edit, duration, cut_padding) -> tuple[float, float]:
     return start, end
 
 
+# A word has to be more than half swallowed to count as removed. Cuts are padded
+# by CUT_PADDING and land on frame boundaries, so clipping the very edge of a
+# neighbouring word is normal and not worth reporting.
+LOST_WORD_FRACTION = 0.5
+
+
+def _words_lost_to_silence(participants, words, cut_spans, chosen_spans) -> dict:
+    """Words a cut removes that no edit asked to remove.
+
+    The VAD's "speech" and the transcript's "words" are two independent
+    opinions, and nothing else compares them: the published transcript is
+    rebuilt from the rendered timeline, so a word cut away simply disappears
+    from it and the result stays self-consistent. That is what makes the
+    disagreement worth reporting — it cannot be seen in the output.
+
+    Either side may be the wrong one. A level-based VAD misses quiet speech;
+    Whisper places words over near-silence. So this reports rather than
+    corrects.
+    """
+    if not cut_spans:
+        return {}
+    lost: dict[str, list[dict]] = {}
+    for participant in participants:
+        casualties = []
+        for word in words.get(participant) or []:
+            try:
+                start = float(word["start"])
+                end = float(word["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            span = end - start
+            if span <= iv.EPS:
+                continue
+            if iv.overlap_amount((start, end), cut_spans) < LOST_WORD_FRACTION * span:
+                continue
+            # An edit asking for this word is the system working, not a
+            # disagreement — the LLM stage removes words on purpose.
+            if iv.overlap_amount((start, end), chosen_spans.get(participant, [])) > iv.EPS:
+                continue
+            casualties.append(word)
+        if casualties:
+            lost[participant] = casualties
+    return lost
+
+
 def build_plan(meta, speech, edits, words, params) -> dict:
     """Assemble the plan. `speech`/`edits`/`words` are keyed by participant."""
     duration = float(meta["duration"])
@@ -92,6 +137,11 @@ def build_plan(meta, speech, edits, words, params) -> dict:
             "no speech detected on any track — check the VAD threshold before trusting this plan"
         )
 
+    # Spans some edit deliberately asked to remove, per participant. Used below
+    # to tell a word that was chosen for removal from one that merely fell
+    # inside a silence cut.
+    chosen_spans: dict[str, list[tuple[float, float]]] = {p: [] for p in participants}
+
     # Classify every LLM finding as a global cut or a single-track mute.
     for participant in participants:
         found = edits.get(participant) or []
@@ -106,6 +156,7 @@ def build_plan(meta, speech, edits, words, params) -> dict:
             start, end = _pad_edit(track_words, edit, duration, params["cut_padding"])
             if end - start < iv.EPS:
                 continue
+            chosen_spans[participant].append((start, end))
             crosstalk = iv.overlap_amount((start, end), others)
             common = {
                 "start": round(start, 4),
@@ -146,6 +197,20 @@ def build_plan(meta, speech, edits, words, params) -> dict:
 
     cut_spans = [(c["start"], c["end"]) for c in cuts]
     keep = iv.complement(cut_spans, 0.0, duration)
+
+    lost_words = _words_lost_to_silence(participants, words, cut_spans, chosen_spans)
+    for participant, lost in sorted(lost_words.items()):
+        sample = " ".join(w.get("text", "") for w in lost[:6])
+        if len(lost) > 6:
+            sample += " …"
+        warnings.append(
+            f"{len(lost)} transcribed word(s) on {participant} fall inside cuts "
+            f"nothing asked for: \"{sample.strip()}\". The VAD heard silence "
+            "where the transcript has words — lower SILENCE_THRESHOLD if this is "
+            "quiet speech, or VAD_BACKEND=silero to judge speech over level. "
+            "Whisper also invents words over near-silence, so check the audio "
+            "before trusting either side"
+        )
 
     # A muted stretch inside a cut is moot; trim mutes down to what survives,
     # and fuse those close enough that their fades would otherwise collide.
@@ -210,6 +275,7 @@ def build_plan(meta, speech, edits, words, params) -> dict:
                 "speech": round(iv.total(speech.get(p, [])), 3),
                 "edits_found": len(edits.get(p) or []),
                 "mutes": len(resolved_mutes.get(p, [])),
+                "words_lost_to_silence": len(lost_words.get(p, [])),
             }
             for p in participants
         },
@@ -223,6 +289,15 @@ def build_plan(meta, speech, edits, words, params) -> dict:
         "cuts": cuts,
         "mutes": resolved_mutes,
         "keep": [[round(s, 4), round(e, 4)] for s, e in keep],
+        # Kept in full so the disagreement can be inspected word by word
+        # rather than only counted in the report.
+        "words_lost_to_silence": {
+            participant: [
+                {"text": w.get("text", ""), "start": w.get("start"), "end": w.get("end")}
+                for w in lost
+            ]
+            for participant, lost in sorted(lost_words.items())
+        },
         "stats": stats,
         "warnings": warnings,
     }

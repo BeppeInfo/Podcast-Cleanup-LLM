@@ -1027,6 +1027,62 @@ def _meta(participants, duration):
     }
 
 
+class TestVadTranscriptDisagreement(unittest.TestCase):
+    """Words the VAD calls silence but the transcript calls speech.
+
+    Found on a real recording: at the default -35dB threshold a quiet phrase
+    measured -39.2dB, so the VAD cut it as silence while Whisper had transcribed
+    it. Nothing noticed, because the published transcript is rebuilt from the
+    rendered timeline — the word simply vanishes from both and the output stays
+    self-consistent. Synthetic audio cannot reach this: its silence is digital.
+    """
+
+    def _words(self, spec):
+        return [
+            {"i": i, "text": t, "start": s, "end": e, "segment": 0}
+            for i, (t, s, e) in enumerate(spec)
+        ]
+
+    def test_a_word_inside_a_silence_cut_is_reported(self):
+        # Speech either side of a long gap; a word sits in the middle of the gap
+        # because the VAD never heard it.
+        speech = {"a": [(0.0, 4.0), (14.0, 20.0)]}
+        words = {"a": self._words([("hello", 1.0, 2.0), ("quiet", 8.0, 8.6),
+                                   ("goodbye", 15.0, 16.0)])}
+        result = planner.build_plan(_meta(["a"], 20.0), speech, {}, words, PARAMS)
+
+        lost = result["words_lost_to_silence"]["a"]
+        self.assertEqual([w["text"] for w in lost], ["quiet"])
+        self.assertEqual(result["stats"]["per_participant"]["a"]["words_lost_to_silence"], 1)
+        warning = next(w for w in result["warnings"] if "quiet" in w)
+        self.assertIn("SILENCE_THRESHOLD", warning)
+        self.assertIn("silero", warning)
+
+    def test_words_an_edit_asked_to_remove_are_not_reported(self):
+        """The LLM stage removes words on purpose; that is not a disagreement."""
+        speech = {"a": [(0.0, 20.0)]}
+        words = {"a": self._words([("I", 10.0, 10.3), ("I", 10.35, 10.7),
+                                   ("think", 11.0, 11.5)])}
+        edits = {"a": [{"first": 0, "last": 1, "kind": "stutter", "confidence": 0.9,
+                        "start": 10.0, "end": 10.7, "text": "I I"}]}
+        result = planner.build_plan(_meta(["a"], 20.0), speech, edits, words, PARAMS)
+        self.assertEqual(result["words_lost_to_silence"], {})
+        self.assertFalse([w for w in result["warnings"] if "fall inside cuts" in w])
+
+    def test_a_word_clipped_at_the_edge_of_a_cut_is_not_reported(self):
+        """Cut padding routinely grazes the neighbouring word; that is normal."""
+        speech = {"a": [(0.0, 4.0), (14.0, 20.0)]}
+        # Ends 0.05s inside the gap, so only a sliver is taken.
+        words = {"a": self._words([("trailing", 3.5, 4.05)])}
+        result = planner.build_plan(_meta(["a"], 20.0), speech, {}, words, PARAMS)
+        self.assertEqual(result["words_lost_to_silence"], {})
+
+    def test_no_transcript_means_nothing_to_compare(self):
+        speech = {"a": [(0.0, 4.0), (14.0, 20.0)]}
+        result = planner.build_plan(_meta(["a"], 20.0), speech, {}, {}, PARAMS)
+        self.assertEqual(result["words_lost_to_silence"], {})
+
+
 class TestPlanBuilder(unittest.TestCase):
     def test_silence_is_shortened_not_removed(self):
         # One 5s gap between two bursts of speech.

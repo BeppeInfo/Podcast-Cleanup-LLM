@@ -377,6 +377,16 @@ word, so padding cannot eat into real speech.
 - Rendered durations are checked against a **frame-exact prediction** of what the
   filter graph will emit, not a rule of thumb. A mismatch fails the run and
   preserves the inputs.
+- **A silence cut swallowing transcribed words is reported.** The VAD's idea of
+  speech and the transcript's are independent, and when they disagree the output
+  hides it: the published transcript is rebuilt from the rendered timeline, so a
+  word cut away vanishes from both and the result still looks consistent. The
+  plan lists the words and the report warns. Either side can be the wrong one —
+  a level-based VAD misses quiet speech, and Whisper places words over
+  near-silence — so it warns rather than deciding, and `plan.json` keeps the
+  full list under `words_lost_to_silence` for a listen. Usually it means
+  `SILENCE_THRESHOLD` is too high for the recording, or that
+  `VAD_BACKEND="silero"` would suit it better.
 - Mismatched sample rates, tracks from two different episodes, duplicate
   participants and unparseable filenames are all rejected up front.
 - On failure the work directory is kept, a `FAILED` marker is written, and the run
