@@ -462,17 +462,24 @@ A secondary constraint shapes it too: development happens on a machine with
 neither model installed. Both suites therefore run with no configuration, no
 models, and nothing on the network.
 
-### Three layers
+### Four layers
 
 | Layer | Runs | Needs | Catches | Cannot catch |
 | --- | --- | --- | --- | --- |
 | Unit — `tests/test_pipeline.py` | pure decision code | python3 | wrong intervals, bad validation, malformed expressions | anything about what ffmpeg or a model actually does |
 | Stubbed integration — same file + `tests/stub_servers.py` | real HTTP clients against fake servers | python3 | wrong request payloads, bad response handling, retry behaviour | whether a real server would answer that way |
 | End to end — `tests/selftest.sh` | the real pipeline over synthetic audio | ffmpeg | wrong rendered audio, wrong stage wiring, wrong file layout | model quality, real-world audio, long-file behaviour |
+| Manual — `tests/samples/` against real servers | the whole pipeline over a real recording | ffmpeg, a whisper-server, a llama-server | wire formats a stub would have accepted, quiet speech, invented words, a threshold in the wrong place | anything absent from one 11-second clip |
 
 The unit layer is where a bug should be reproduced if it possibly can be: it is
 fast, needs no audio, and a failure points at one function. The end-to-end layer
 exists for the claims that only ffmpeg can settle.
+
+The fourth layer is deliberately **not** automated. It needs two servers, a
+model, and a judgement about how the result sounds, none of which belong in a
+suite that must stay runnable offline. It earns its place anyway: the first time
+it ran it found four things the other three had been green through, and "What the
+first real run found" below is about why that is not a coincidence.
 
 ### The four techniques doing the real work
 
@@ -649,12 +656,18 @@ logs for inspection.
 ### Before trusting a change
 
 1. Both suites pass.
-2. If `transcribe` or `detect` was touched: **one real episode with
-   `--keep-work`.** Nothing automated covers the real models.
+2. If `transcribe` or `detect` was touched: **run `tests/samples/` against real
+   servers.** Nothing automated covers the real models, and the request shapes
+   this code sends have been wrong in ways every stub accepted. The fixture's
+   README has the commands and the numbers a correct run produces.
 3. Read `<episode>_edit-report.txt` — cut counts and removed fraction are the
-   cheapest signal that a threshold has drifted.
+   cheapest signal that a threshold has drifted, and the warnings block is where
+   a VAD/transcript disagreement shows up.
 4. If the change was anywhere near rendering, sample the audio, and check the
    invariants table above for what is guarding you.
+5. If a request payload changed, check that `LLM_CHECK_SCHEMA` still passes
+   against a real server. It is the only thing standing between a wrong wire
+   format and an episode that silently finds no edits.
 
 ## 11. Known limitations
 
