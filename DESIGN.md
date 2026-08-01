@@ -248,6 +248,50 @@ into speech that should stay.
 `filler` ("um", "uh") is implemented but excluded from `LLM_ACCEPT_KINDS` by
 default; removing every one reads as over-editing.
 
+### Word-like crutches are a different problem, and are not covered
+
+`filler` means the non-lexical sounds only — the guidance the model receives is
+*"a hesitation sound carrying no meaning"*. Crutches built from real words —
+*"well…"*, *"you know"*, *"like"*, *"I mean"*, pt-BR *"tipo"*, *"sabe"*, *"né"* —
+are **not** detected, and switching `filler` on does not start detecting them.
+
+Considered and deferred, not overlooked. The model would likely be good at it.
+Unlike the four mechanical kinds, this is a semantic judgement, which is what a
+language model is actually for: every candidate word has a load-bearing sense —
+*"the well ran dry"*, *"you know what I mean?"*, the quotative *"he was like,
+'no way'"* whose removal collapses the sentence — and no word list resolves
+that. Being real words, they also survive transcription, so the yield ceiling
+described below does not apply: there is more to find here than there is for
+stutters, not less.
+
+Three things stand in the way, and none of them is the code. Adding a kind is
+`KINDS` plus a `KIND_GUIDANCE` entry — the schema enum, the prompt and the
+validator all derive from that list, and `LLM_ACCEPT_KINDS` already supplies the
+switch.
+
+- **The confidence question would be the wrong question.** The prompt asks how
+  sure the model is that a span was *accidental*. A crutch is not accidental —
+  *"you know"* is deliberately uttered as a hedge — so the honest answer is low,
+  and `LLM_MIN_CONFIDENCE` would filter away precisely the correct findings. The
+  question has to become whether removal leaves the meaning intact, and that is
+  a change to the shared prompt, so it lands on the four existing kinds too.
+- **`CUT_PADDING` assumes a gap that is not there.** Padding claims at most half
+  the real distance to the neighbouring word (above), which works because a
+  stutter or a false start sits in a natural break. These do not: *"it was
+  y'know weird"* is one coarticulated breath group with no gap to claim, so
+  padding computes to nearly nothing and the cut lands mid-consonant. *"Well,"*
+  opening a clause carries a pitch reset as well, and taking it makes what
+  follows start abruptly. Cheap in code, expensive in audio — this is the real
+  obstacle.
+- **Density defeats the safety net.** *"You know"* can recur every few seconds.
+  `MAX_CUT_FRACTION` would not notice, because the seconds stay small; what
+  accumulates is the count of splices, not the total removed.
+
+If it is ever taken up, `detect` is a standalone subcommand and `--audit` records
+the raw reply per chunk, so a new kind can be run against a transcript that
+already exists and read as text — no re-transcription, no render, and no audio
+touched until the model has shown it is any good at this on real material.
+
 ### The transcript has already removed some of them
 
 Whisper's decoder normalises. Speech synthesised as *"So I I I think … the the
@@ -686,7 +730,9 @@ logs for inspection.
 - The two Silero implementations agree closely but not bit for bit, so a plan is
   only exactly reproducible against the one that produced it. The VAD output
   records which that was.
-- `filler` detection exists but is off by default.
+- `filler` detection exists but is off by default, and covers only the
+  non-lexical sounds. Crutches made of real words — *"well…"*, *"you know"*,
+  *"né"* — are detected by no kind at all (§6).
 - Whisper removes some disfluencies during transcription, so `detect` can only
   work on what survives (§6). Its yield is lower than the raw speech would
   suggest, and nothing recovers the difference.

@@ -137,8 +137,10 @@ config_defaults() {
     : "${LLM_MAX_EDIT_SECONDS:=4.0}"
     : "${LLM_MIN_CONFIDENCE:=0.6}"
     : "${LLM_TEMP:=0}"
-    # Accepted edit kinds. "filler" (um/uh/like) is available but off by
-    # default: removing every filler tends to over-edit natural speech.
+    # Accepted edit kinds. "filler" (um/uh/er — the non-lexical sounds, and
+    # nothing else) is available but off by default: removing every filler tends
+    # to over-edit natural speech. Crutches made of real words ("well", "you
+    # know", "né") are detected by no kind; DESIGN.md §6 says why not.
     : "${LLM_ACCEPT_KINDS:=stutter,repetition,false_start}"
 
     # Safety ----------------------------------------------------------------

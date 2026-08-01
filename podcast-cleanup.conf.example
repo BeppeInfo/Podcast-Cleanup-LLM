@@ -260,8 +260,11 @@ LLM_MIN_CONFIDENCE="0.6"
 LLM_TEMP="0"
 
 # Available kinds: stutter, repetition, false_start, filler.
-# "filler" (um, uh, like, né) is off by default — removing every one of them
-# reads as over-editing.
+# "filler" is off by default — removing every one reads as over-editing. It
+# covers the non-lexical hesitation sounds ("um", "uh", "er") and nothing else:
+# crutches built from real words ("well…", "you know", "tipo", "né") are
+# detected by no kind here. DESIGN.md §6 explains what taking them on would
+# cost.
 LLM_ACCEPT_KINDS="stutter,repetition,false_start"
 
 # --------------------------------------------------------------- rendering ---
