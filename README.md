@@ -443,7 +443,11 @@ and writes JSON and never touches audio.
 ## Tuning notes
 
 - `SILENCE_THRESHOLD` is the first thing to adjust if too much or too little is
-  being cut. Read `ep042_edit-report.txt` before trusting a run.
+  being cut. The default `-45dB` errs on the safe side, since cutting quiet
+  speech is damage while leaving room tone is only a looser edit. Raise it
+  toward `-35dB` for a loud, close-mic'd recording. Read
+  `ep042_edit-report.txt` before trusting a run — and if it warns that a cut
+  swallowed transcribed words, this is the setting at fault.
 - `INPUT_EXTS` is worth narrowing to just your own format if the input directory
   holds anything else you would rather not sweep up. The same participant present
   in two formats is an error, not a preference.

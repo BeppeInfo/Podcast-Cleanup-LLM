@@ -1030,9 +1030,9 @@ def _meta(participants, duration):
 class TestVadTranscriptDisagreement(unittest.TestCase):
     """Words the VAD calls silence but the transcript calls speech.
 
-    Found on a real recording: at the default -35dB threshold a quiet phrase
-    measured -39.2dB, so the VAD cut it as silence while Whisper had transcribed
-    it. Nothing noticed, because the published transcript is rebuilt from the
+    Found on a real recording: at the -35dB threshold that used to be the
+    default, a quiet phrase measured -39.2dB, so the VAD cut it as silence while
+    Whisper had transcribed it. Nothing noticed, because the published transcript is rebuilt from the
     rendered timeline — the word simply vanishes from both and the output stays
     self-consistent. Synthetic audio cannot reach this: its silence is digital.
     """

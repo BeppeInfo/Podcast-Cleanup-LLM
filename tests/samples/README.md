@@ -53,22 +53,22 @@ matched the frame-exact prediction to 0.000 s.
 
 Two things this recording exposes that synthetic audio cannot:
 
-**The default `SILENCE_THRESHOLD="-35dB"` is too aggressive for a quiet
-recording.** This clip is quiet, and the level-based VAD cuts speech at that
-setting:
+**`SILENCE_THRESHOLD="-35dB"` is too aggressive for a quiet recording** — this
+clip is what moved the default down to `-45dB`. Silence cuts only, `--no-llm`:
 
 | `SILENCE_THRESHOLD` | removed | cuts |
 | --- | --- | --- |
-| `-35dB` (default) | 42.7% | 3 |
-| `-45dB` | 29.5% | 3 |
+| `-35dB` (the old default) | 42.7% | 3 |
+| `-45dB` (current default) | 29.5% | 3 |
 | `-55dB` | 1.9% | 1 |
 
-At the default, the span carrying `I don't know` (measured peak −39.2 dB) falls
-below the threshold and is cut as silence, while `well you` (−21.4 dB) and
-`there's a way` (−22.2 dB) are comfortably above it and survive. Nothing is
-broken — the VAD is applying the threshold it was given — but the threshold is
-wrong for this material. `VAD_BACKEND="silero"` decides on speech rather than
-level and is the better answer when levels vary.
+At `-35dB` the span carrying `I don't know` (measured peak −39.2 dB) falls below
+the threshold and is cut as silence, while `well you` (−21.4 dB) and `there's a
+way` (−22.2 dB) are comfortably above it and survive. Nothing was broken — the
+VAD applied the threshold it was given — but that threshold sat between this
+recording's speech and its noise floor, which is the one place it must not be.
+`VAD_BACKEND="silero"` decides on speech rather than level and is the better
+answer when levels vary.
 
 **Whisper places words where there is no audio.** It transcribes a final
 `right` across 9.94–11.34 s, a span whose peak is −50.4 dB — the noise floor.
@@ -76,7 +76,9 @@ Word timings are not evidence that a word was spoken.
 
 ### The two backends, same audio, same servers
 
-Only `VAD_BACKEND` differs:
+Only `VAD_BACKEND` differs. Measured when `-35dB` was still the default, so the
+`ffmpeg` column is the old behaviour — it is what the change to `-45dB` was
+reacting to:
 
 | | `ffmpeg` (−35dB) | `silero` |
 | --- | --- | --- |
@@ -111,19 +113,23 @@ CUDA torchaudio that fails on `libcudart`.
 
 ### Both findings are caught
 
-At the default threshold this clip warns:
+A full run at the current `-45dB` default removes 39.1%, finishes without
+`--force`, and warns:
 
 ```
-! 4 transcribed word(s) on speaker fall inside cuts nothing asked for:
-  "know I don't right". The VAD heard silence where the transcript has words …
+! 2 transcribed word(s) on speaker fall inside cuts nothing asked for:
+  "know right". The VAD heard silence where the transcript has words …
 ```
 
-which is the quiet phrase plus the invented `right`, while the repetition the
-LLM removed on purpose is correctly left out of the count. This sample is the
-regression test for that warning in its real form — the unit tests cover the
-logic, but only real audio produces speech at −39 dB and a hallucination at
-−50 dB.
+At the old `-35dB` the same warning named four words, `know I don't right`, and
+the run reached 52.3% — over `MAX_CUT_FRACTION`, so it refused without `--force`.
+Both are the rails working: the refusal was reporting a misconfiguration, not
+being fussy, and lowering the threshold removed the cause rather than the symptom.
 
-Add `--force` to run the default threshold to completion: with one speech edit
-on top of the silence cuts it reaches 52.3%, above `MAX_CUT_FRACTION`, and the
-safety refusal correctly stops it.
+Either way the repetition the LLM removed on purpose is correctly left out of the
+count. The residual `right` is the Whisper hallucination and is expected to stay
+until something reconciles the two notions of speech.
+
+This sample is the regression test for that warning in its real form. The unit
+tests cover the logic; only real audio produces speech at −39 dB and a
+hallucination at −50 dB.

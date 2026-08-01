@@ -101,7 +101,12 @@ config_defaults() {
 
     # Voice activity / silence ----------------------------------------------
     : "${VAD_BACKEND:=ffmpeg}"            # ffmpeg | silero
-    : "${SILENCE_THRESHOLD:=-35dB}"       # ffmpeg backend only
+    # ffmpeg backend only. -45dB rather than -35dB because the cost of the two
+    # mistakes is not symmetric: too high a threshold cuts quiet speech, which
+    # is damage, while too low leaves a little room tone, which is only a less
+    # tight edit. Measured on a real recording, speech sat at -39dB while the
+    # noise floor was near -50dB, and -35dB fell between them.
+    : "${SILENCE_THRESHOLD:=-45dB}"
     # Detection granularity, not the editing threshold: the speech map is built
     # at this resolution and SILENCE_MIN_DURATION decides what to act on.
     : "${VAD_MIN_SILENCE:=0.30}"

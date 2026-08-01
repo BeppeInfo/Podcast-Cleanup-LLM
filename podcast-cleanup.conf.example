@@ -191,7 +191,19 @@ LLM_CHECK_SCHEMA="1"
 #             speech (or speech for silence).
 VAD_BACKEND="ffmpeg"
 
-SILENCE_THRESHOLD="-35dB"
+# Anything quieter than this counts as silence, for the ffmpeg backend.
+#
+# The two mistakes do not cost the same. Too high and quiet speech is cut, which
+# is damage you only find by listening; too low and some room tone survives,
+# which is merely a less tight edit. So this errs low. On a real recording here,
+# speech measured -39dB and the noise floor about -50dB — -35dB fell between
+# them and removed words.
+#
+# Raise it toward -35dB for a loud, close-mic'd recording where more silence
+# should go; drop it toward -55dB for a quiet one. The run now warns when a
+# silence cut swallows words the transcript has, which is the signal that this
+# is set too high.
+SILENCE_THRESHOLD="-45dB"
 SILERO_THRESHOLD="0.5"
 
 # A stretch of time counts as silence only when *no* track has speech in it.
