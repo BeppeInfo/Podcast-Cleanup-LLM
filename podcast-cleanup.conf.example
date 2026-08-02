@@ -90,7 +90,21 @@ WHISPER_API_KEY=""
 # one request. Boundaries are nudged onto the middle of a quiet spot ffmpeg
 # found, so a chunk edge does not land inside a word. Chunking also means
 # progress is reported as the run goes rather than only at the end.
-WHISPER_CHUNK_SECONDS="600"
+#
+# It is not only an upload-size knob, and it is not a fix for what it mitigates.
+# Whisper decodes in 30-second windows, and a window whose decode ends on a lone
+# timestamp token is discarded whole — "single timestamp ending - skip entire
+# chunk" in whisper.cpp. On a real 600s track that cost 33 seconds of clear
+# speech with nothing in the response to say so, and since the speech map is
+# derived from the transcript, that audio then read as silence and was cut.
+#
+# Which window a passage lands in depends on how much speech precedes it, so
+# request length shuffles the alignment rather than curing anything: the same
+# passage survived a 100s request and vanished from a 300s and a 600s one. 120
+# keeps any single loss small; the check that actually catches it is the audio
+# cross-check in the plan stage, which refuses to cut audio no transcript
+# accounts for.
+WHISPER_CHUNK_SECONDS="120"
 WHISPER_REQUEST_TIMEOUT="1800"
 
 # Used only when WHISPER_ENDPOINT is empty.

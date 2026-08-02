@@ -122,8 +122,9 @@ inputs/<episode>_<participant>.<ext>       any format ffmpeg can decode
    │
    ├─ transcribe → words/<p>.words.json   words with timings, and segments
    │                                      (local whisper-cli, or a server)
-   │               asr/<p>.silence.log    only for a track long enough to split
-   │                                      into several requests
+   │               asr/<p>.loud.json      the level scan: chunk boundaries, and
+   │                                      the only opinion here that is not
+   │                                      Whisper's (§8)
    │
    ├─ detect ────→ llm/<p>.edits.json     validated findings, word-index based
    │               llm/<p>.audit.jsonl    every response, accepted or not
@@ -417,8 +418,8 @@ first and transcribe only what it calls speech, which is the whole reason this
 pipeline no longer detects speech itself — see below. **Chunking**: a 2 h track is
 ~230 MB and one request means no progress for as long as it takes, so it is split,
 with boundaries nudged onto a quiet spot ffmpeg found so a split does not land
-mid-word. That scan is the only surviving use of level-based silence detection,
-and it runs only for a track long enough to need splitting. **Tolerant parsing**: whisper-server's response shape varies by
+mid-word. `WHISPER_CHUNK_SECONDS` is also the blast radius of a skipped decode
+window, which is a separate matter covered below. **Tolerant parsing**: whisper-server's response shape varies by
 version and `response_format`, so several are accepted (`segments` with float
 seconds, with clock strings, or whisper-cli's `transcription` with `offsets`;
 token lists are used when they carry timings and ignored when they are bare ids).
@@ -429,6 +430,13 @@ Word timing quality differs: `max_len=1` is requested so each segment is one
 word and timings are exact, but a build that ignores it returns sentence
 segments whose word positions are interpolated. The run says which it got,
 because it decides how tightly a stutter can be cut.
+
+**An empty answer is an answer.** A chunk holding no speech comes back as `200`
+with an empty segment list, and that is the truth about that chunk. Treating it as
+a failure cost a whole track the first time chunking met a silent stretch — on a
+two-mic recording each participant is silent for minutes while the other talks, so
+those stretches are the norm rather than the exception. What still raises is a
+response that had something to say and nowhere to put it: text without timings.
 
 **A word with timings is not evidence a word was spoken.** On the sample
 recording Whisper returned a final `right` spanning 9.94–11.34 s, over audio
@@ -488,6 +496,38 @@ And where a segment arrives without usable token timings,
 `_segment_words_by_proportion` spreads its words evenly across its whole span, so
 that segment tiles continuously and silence inside it is invisible — which loses a
 cut rather than inventing one, and is the direction to err in.
+
+### Whisper throws away decode windows, and that is why the level scan survived
+
+The first real episode run under this design lost 33 seconds of clear speech from
+one track, and every part of the pipeline agreed that stretch was silent.
+
+Whisper decodes in 30-second windows (`WHISPER_CHUNK_SIZE`), and a window whose
+decode ends on a lone timestamp token is discarded whole — `"single timestamp
+ending - skip entire chunk"`, `src/whisper.cpp`. With VAD the windows are cut from
+*filtered* audio, so one skipped 30s window spanned 33s of original time once the
+silence inside it is counted back. The response says nothing about it. The
+transcript that came back was internally consistent, so the speech map derived
+from it was consistent too, and a silence cut removed the audio.
+
+Request length does not fix this. Which window a passage lands in depends on how
+much speech precedes it, so length only reshuffles the alignment: the same passage
+survived a 100s request and vanished from a 300s and a 600s one. `120` is chosen
+to keep any single loss small, not because it is safe.
+
+What catches it is the level scan, which is why that scan now runs for every track
+rather than only the ones long enough to split. It is the only input in the whole
+pipeline that Whisper had no hand in. It cannot tell speech from a cough — that is
+precisely why it is not the speech map — but it can tell loud from silent, and
+`plan.untranscribed_audio` compares each transcript against its own track's loud
+stretches. Over 3s is reported; once cuts remove more than 5s of it the run
+refuses.
+
+That restores, on a different footing, the independence the removed
+`_words_without_speech` check had. It does not need Silero, or any model: ffmpeg
+was already a hard dependency. The lesson worth keeping is narrower than "keep the
+old check" — it is that a transcript cannot be its own witness, and something in
+the pipeline has to look at the audio directly.
 
 ### Authenticating to either endpoint
 

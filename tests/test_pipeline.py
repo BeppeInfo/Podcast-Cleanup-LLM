@@ -409,9 +409,33 @@ class TestRemoteAsrNormalization(unittest.TestCase):
         segments = asr.normalize_response(payload)
         self.assertEqual([s["text"] for s in segments], ["good"])
 
-    def test_empty_result_is_an_error_not_a_silent_pass(self):
-        with self.assertRaises(ValueError):
-            asr.normalize_response({"segments": []})
+    def test_a_silent_chunk_is_an_answer_not_an_error(self):
+        """The failure this replaces cost a whole track.
+
+        With the server running Silero first, a chunk holding no speech comes
+        back as 200 with an empty segment list, and that is the truth about that
+        chunk. On a two-mic recording one participant is silent for minutes at a
+        time, so treating it as a failure killed the track the moment chunking
+        met one of those stretches.
+        """
+        self.assertEqual(asr.normalize_response({"segments": []}), [])
+        self.assertEqual(asr.normalize_response({"transcription": []}), [])
+        self.assertEqual(
+            asr.normalize_response({"text": "", "segments": []}), []
+        )
+        # Silence sometimes arrives as an item with empty text rather than none.
+        self.assertEqual(
+            asr.normalize_response(
+                {"segments": [{"text": "", "start": 0.0, "end": 0.0}]}
+            ),
+            [],
+        )
+
+    def test_text_without_a_usable_timing_is_still_an_error(self):
+        """Words with nowhere to put them must not pass as silence."""
+        with self.assertRaises(ValueError) as caught:
+            asr.normalize_response({"segments": [{"text": "hello"}]})
+        self.assertIn("usable timing", str(caught.exception))
         with self.assertRaises(ValueError):
             asr.normalize_response({"nothing": True})
 
@@ -1518,6 +1542,7 @@ PARAMS = {
     "min_cut": 0.15,
     "mute_fade": 0.03,
     "max_cut_fraction": 0.5,
+    "speech_pad": 0.25,
 }
 
 
@@ -1704,6 +1729,80 @@ class TestLoopingTranscript(unittest.TestCase):
     def test_a_transcript_too_short_to_judge_is_left_alone(self):
         words = {"host": self._loop(2, 10.0), "guest": []}
         self.assertEqual(planner.looping_words(["host"], words), {})
+
+
+class TestUntranscribedAudio(unittest.TestCase):
+    """The check that would have caught the bug that prompted it.
+
+    A 600s request to whisper-server silently omitted 22 seconds of clear speech
+    that a 100s request transcribed fine. Nothing downstream could see it: the
+    speech map is derived from the transcript, so both agreed that audio was
+    empty, and a silence cut then removed it. A level scan is the only input
+    Whisper had no hand in, and this is what it is for.
+    """
+
+    def _words(self, spec):
+        return [
+            {"i": i, "text": t, "start": s, "end": e, "segment": 0}
+            for i, (t, s, e) in enumerate(spec)
+        ]
+
+    def _plan(self, words, loud, params=None):
+        speech = {
+            p: tr.speech_from_words(w, 60.0, pad=0.25) for p, w in words.items()
+        }
+        # These fixtures are mostly silence by construction, so the cut-fraction
+        # limit is lifted: the point is what the audio cross-check does, and a
+        # second blocking reason would only obscure it.
+        return planner.build_plan(
+            _meta(list(words), 60.0), speech, {}, words,
+            params or dict(PARAMS, max_cut_fraction=1.0), loud=loud,
+        )
+
+    def test_loud_audio_with_no_words_is_reported(self):
+        words = {"a": self._words([("hi", 2.0, 2.5), ("bye", 50.0, 50.5)])}
+        # The level scan heard speech from 30-45s; the transcript has none.
+        result = self._plan(words, {"a": [(2.0, 2.5), (30.0, 45.0), (50.0, 50.5)]})
+        warning = " ".join(result["warnings"])
+        self.assertIn("loud enough to be speech but produced no words", warning)
+        self.assertIn("a", result["untranscribed_audio"])
+        self.assertAlmostEqual(result["stats"]["untranscribed_seconds"], 15.0, places=1)
+
+    def test_a_cut_over_it_blocks_the_run(self):
+        """Reporting is not enough when the audio is already being removed."""
+        words = {"a": self._words([("hi", 2.0, 2.5), ("bye", 50.0, 50.5)])}
+        result = self._plan(words, {"a": [(2.0, 2.5), (30.0, 45.0), (50.0, 50.5)]})
+        self.assertTrue(result["blocking"], result["warnings"])
+        self.assertIn("no transcript accounts for", " ".join(result["blocking"]))
+        self.assertIn("WHISPER_CHUNK_SECONDS", " ".join(result["blocking"]))
+        self.assertGreater(result["stats"]["untranscribed_in_cuts"], 5.0)
+
+    def test_short_stretches_are_not_worth_a_warning(self):
+        """A cough or a breath the scan called loud must not cry wolf."""
+        words = {"a": self._words([("hi", 2.0, 2.5), ("bye", 50.0, 50.5)])}
+        result = self._plan(words, {"a": [(2.0, 2.5), (20.0, 21.0), (50.0, 50.5)]})
+        self.assertEqual(result["untranscribed_audio"], {})
+        self.assertEqual(result["blocking"], [])
+
+    def test_a_transcript_covering_its_audio_raises_nothing(self):
+        words = {"a": self._words([(f"w{i}", 2.0 + i, 2.5 + i) for i in range(40)])}
+        result = self._plan(words, {"a": [(2.0, 42.0)]})
+        self.assertEqual(result["untranscribed_audio"], {})
+        self.assertEqual(result["blocking"], [])
+
+    def test_without_a_level_scan_the_check_is_simply_absent(self):
+        """It must not invent a finding from a missing input."""
+        words = {"a": self._words([("hi", 2.0, 2.5), ("bye", 50.0, 50.5)])}
+        result = self._plan(words, {})
+        self.assertEqual(result["untranscribed_audio"], {})
+        self.assertEqual(result["blocking"], [])
+
+    def test_the_padding_is_honoured_so_edges_do_not_count(self):
+        """A word's span plus SPEECH_PAD covers the scan's slightly wider idea."""
+        words = {"a": self._words([("hi", 10.0, 12.0)])}
+        # The scan starts 0.2s earlier and ends 0.2s later than the word.
+        result = self._plan(words, {"a": [(9.8, 12.2)]})
+        self.assertEqual(result["untranscribed_audio"], {})
 
 
 class TestPlanBuilder(unittest.TestCase):

@@ -316,19 +316,33 @@ stage_prepare() {
     stage_end "${#PARTICIPANTS[@]} tracks decoded"
 }
 
-# Where a long track may be split, for the transcribe stage. Only the boundary
-# placement rides on this: whether a spot is quiet enough to split on is a much
-# smaller question than what counts as speech, which Whisper's own Silero pass
-# answers. Written per track and skipped entirely for a track short enough to go
-# in one request.
-write_silence_log() {
-    local participant="$1" wav="$2" target="$3"
+# One level scan per track, serving two purposes that are worth keeping distinct.
+#
+# It says where a long track may be split, which is a small question: is this
+# spot quiet enough that a boundary here will not cut a word in half.
+#
+# And it is the only opinion about the audio that does not come from Whisper. It
+# cannot tell speech from a cough — that is why it is not the speech map — but it
+# can tell loud from silent, and loud audio that produced no words at all is
+# something the plan stage should refuse to cut blindly. That check exists
+# because a 600s request silently dropped 22 seconds of clear speech, and nothing
+# downstream could see it: the transcript was internally consistent, so the map
+# derived from it was too.
+write_loud_spans() {
+    local participant="$1" wav="$2" log="$3" target="$4"
 
-    run_to_file "$target" \
+    if ! run_to_file "$log" \
         "$FFMPEG" -nostdin -v info -i "$wav" \
         -af "silencedetect=noise=${SPLIT_SILENCE_THRESHOLD}:d=${SPLIT_MIN_SILENCE}" \
-        -f null - \
-        || log_warn "could not scan $participant for quiet spots; chunk boundaries may land mid-word"
+        -f null -
+    then
+        log_warn "could not scan $participant for quiet spots: chunk boundaries may land mid-word, and nothing will cross-check its transcript against its audio"
+        return 1
+    fi
+
+    run py loud-spans --log "$log" --participant "$participant" \
+        --duration "${TRACK_DURATION[$participant]}" --out "$target" \
+        || { log_warn "could not parse the level scan for $participant"; return 1; }
 }
 
 # ============================================================================
@@ -361,6 +375,13 @@ stage_transcribe() {
         fi
         rm -f "$marker"
         [[ -s "$wav" || "$DRY_RUN" == 1 ]] || die "missing prepared track: $wav"
+
+        # Same cross-check as the remote path. whisper-cli reads the whole track
+        # in one go, so there are no boundaries to place here — this is purely so
+        # the plan stage has something to compare the transcript against.
+        [[ "$DRY_RUN" == 1 ]] || write_loud_spans "$participant" "$wav" \
+            "$WORK/asr/$participant.silence.log" "$WORK/asr/$participant.loud.json" \
+            || true
 
         local -a whisper_args=(
             -m "$WHISPER_MODEL" -f "$wav" -of "$prefix"
@@ -442,13 +463,14 @@ stage_transcribe_remote() {
 
         log_info "whisper (remote): $participant ($index/$total)"
 
-        # Only a track that will actually be split needs somewhere to split it.
-        local silence_log=""
-        if [[ "$WHISPER_CHUNK_SECONDS" != 0 && "$DRY_RUN" != 1 ]] \
-           && awk -v d="${TRACK_DURATION[$participant]:-0}" \
-                  -v c="$WHISPER_CHUNK_SECONDS" 'BEGIN{exit !(d > c)}'; then
-            silence_log="$WORK/asr/$participant.silence.log"
-            write_silence_log "$participant" "$wav" "$silence_log"
+        # Every track, not only the ones long enough to split: the plan stage
+        # needs this to cross-check each transcript against its own audio.
+        local loud_spans=""
+        if [[ "$DRY_RUN" != 1 ]]; then
+            loud_spans="$WORK/asr/$participant.loud.json"
+            write_loud_spans "$participant" "$wav" \
+                "$WORK/asr/$participant.silence.log" "$loud_spans" \
+                || loud_spans=""
         fi
 
         local -a args=(
@@ -460,7 +482,7 @@ stage_transcribe_remote() {
             --language "$WHISPER_LANG"
             --request-timeout "$WHISPER_REQUEST_TIMEOUT"
         )
-        [[ -n "$silence_log" ]] && args+=(--silence-log "$silence_log")
+        [[ -n "$loud_spans" ]] && args+=(--loud "$loud_spans")
         if [[ "$WHISPER_VAD" == 1 ]]; then
             args+=(
                 --vad-threshold "$WHISPER_VAD_THRESHOLD"
@@ -750,6 +772,7 @@ stage_plan() {
         --meta "$WORK/meta.json"
         --params "$WORK/params.json"
         --words-dir "$WORK/words"
+        --loud-dir "$WORK/asr"
         --out "$WORK/plan.json"
         --report "$WORK/edit-report.txt"
     )

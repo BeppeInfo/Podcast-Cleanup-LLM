@@ -157,9 +157,18 @@ def normalize_response(payload, offset: float = 0.0) -> list[dict]:
     """Convert a server response into whisper-cli-shaped segments.
 
     Returns segments with millisecond `offsets`, shifted by `offset` seconds so
-    a chunk's timings sit on the episode's timeline. Raises ValueError when the
-    response carries no usable timing at all, since silently inventing one would
-    put cuts in the wrong place.
+    a chunk's timings sit on the episode's timeline.
+
+    An empty segment list is a *valid* answer and comes back as `[]`. With the
+    server running Silero over the audio first, a chunk that holds no speech is
+    answered `{"text": "", "segments": []}` with a 200, and that is the truth
+    about that chunk. Treating it as a failure cost a whole track on the first
+    run where chunking met a genuinely silent stretch — every track here has
+    minutes of it, because one participant is silent while the other talks.
+
+    What still raises is a response that had something to say and no way to
+    place it: text without timings, or no recognisable structure at all. Guessing
+    a position would put cuts in the wrong place.
     """
     if isinstance(payload, str):
         payload = json.loads(payload)
@@ -179,12 +188,17 @@ def normalize_response(payload, offset: float = 0.0) -> list[dict]:
 
     shift_ms = int(round(offset * 1000))
     segments: list[dict] = []
+    # Items that said something, whether or not we could place them. Silence
+    # comes back either as no items at all or as items with empty text, and both
+    # are answers; an item with words and no timing is not.
+    with_text = 0
     for item in raw:
         if not isinstance(item, dict):
             continue
         text = (item.get("text") or "").strip()
         if not text:
             continue
+        with_text += 1
 
         offsets = item.get("offsets")
         if isinstance(offsets, dict) and "from" in offsets and "to" in offsets:
@@ -222,8 +236,10 @@ def normalize_response(payload, offset: float = 0.0) -> list[dict]:
             ]
         segments.append(segment)
 
-    if not segments:
-        raise ValueError("no segments with usable timings in the response")
+    if not segments and with_text:
+        raise ValueError(
+            f"{with_text} segment(s) carried text but none a usable timing"
+        )
     return segments
 
 
@@ -381,6 +397,7 @@ def transcribe(
         fields.update({key: str(value) for key, value in (vad_options or {}).items()})
 
     segments: list[dict] = []
+    silent_chunks = 0
     workdir = tempfile.mkdtemp(prefix="podcast-asr-")
     try:
         for index, (start, end) in enumerate(chunks):
@@ -396,7 +413,10 @@ def transcribe(
             for attempt in range(retries + 1):
                 try:
                     payload = client.transcribe_file(piece, fields)
-                    segments.extend(normalize_response(payload, offset=start))
+                    found = normalize_response(payload, offset=start)
+                    if not found:
+                        silent_chunks += 1
+                    segments.extend(found)
                     last_error = None
                     break
                 except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError) as exc:
@@ -426,4 +446,8 @@ def transcribe(
     # speech map from these words.
     parsed["audio_seconds"] = round(duration, 3)
     parsed["server_vad"] = bool(vad)
+    # Chunks the server found no speech in at all. Expected on a two-mic
+    # recording — one participant is silent for minutes while the other talks —
+    # but every chunk coming back empty is not silence, it is a misconfiguration.
+    parsed["chunks_without_speech"] = silent_chunks
     return parsed

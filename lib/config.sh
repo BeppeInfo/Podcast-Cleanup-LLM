@@ -53,7 +53,24 @@ config_defaults() {
     # Audio is uploaded in chunks of this many seconds (0 sends the whole
     # track). Boundaries are nudged onto a quiet spot ffmpeg found, so a split
     # does not land mid-word.
-    : "${WHISPER_CHUNK_SECONDS:=600}"
+    #
+    # This is not only an upload-size knob, but it is not a fix for the thing it
+    # mitigates either, so it is worth knowing what it does and does not buy.
+    #
+    # Whisper decodes in 30-second windows (WHISPER_CHUNK_SIZE in whisper.h), and
+    # a window whose decode ends on a lone timestamp token is discarded whole —
+    # "single timestamp ending - skip entire chunk" in whisper.cpp. On a real 600s
+    # track that cost 33 seconds of clear speech, silently: with VAD the windows
+    # are cut from *filtered* audio, so one skipped 30s window spanned 33s of the
+    # original once the silence inside it is counted back.
+    #
+    # Which window a passage lands in depends on how much speech precedes it, so
+    # request length shuffles the alignment rather than curing anything: the same
+    # passage survived a 100s request and vanished from a 300s and a 600s one.
+    # 120 is short enough to keep any single loss small and to give the audio
+    # cross-check in `plan` a useful signal. That check, not this number, is what
+    # actually stops the damage.
+    : "${WHISPER_CHUNK_SECONDS:=120}"
     : "${WHISPER_REQUEST_TIMEOUT:=1800}"
 
     : "${WHISPER_BIN:=/opt/whisper.cpp/bin/whisper-cli}"

@@ -241,6 +241,32 @@ def cmd_meta_shell(args):
         print(f"{key}=({pairs})")
 
 
+def cmd_loud_spans(args):
+    """Parse a silencedetect log into the stretches that are not silent.
+
+    Two consumers, and the distinction matters. The transcribe stage uses these
+    to place chunk boundaries in quiet places. The plan stage uses them as the one
+    opinion about the audio that Whisper had no hand in, to refuse a cut over loud
+    audio no transcript accounts for. Neither treats this as a speech map: a level
+    scan cannot tell a cough from a word.
+    """
+    with open(args.log, encoding="utf-8", errors="replace") as handle:
+        loud = silence.parse_silencedetect(handle.read(), args.duration)
+    _write_json(
+        args.out,
+        {
+            "participant": args.participant,
+            "duration": round(args.duration, 3),
+            "threshold": args.threshold or "",
+            "loud": [[round(s, 4), round(e, 4)] for s, e in loud],
+        },
+    )
+    print(
+        f"{len(loud)} non-silent stretches, {iv.total(loud):.1f}s of "
+        f"{args.duration:.1f}s above the threshold"
+    )
+
+
 # --- transcript ---------------------------------------------------------------
 
 
@@ -270,9 +296,8 @@ VAD_REQUEST_FIELDS = (
 
 def cmd_transcribe_remote(args):
     loud = None
-    if args.silence_log and os.path.isfile(args.silence_log):
-        with open(args.silence_log, encoding="utf-8", errors="replace") as handle:
-            loud = silence.parse_silencedetect(handle.read(), args.duration or 0.0)
+    if args.loud and os.path.isfile(args.loud):
+        loud = [tuple(span) for span in _read_json(args.loud)["loud"]]
 
     client = asr.WhisperClient(
         args.endpoint, timeout=args.request_timeout, path=args.path,
@@ -301,6 +326,19 @@ def cmd_transcribe_remote(args):
     print(
         f"{words} words in {segments} segments over {parsed['chunks']} chunk(s)"
     )
+    empty = parsed.get("chunks_without_speech") or 0
+    if empty:
+        # Normal on a two-mic recording; total silence is not.
+        detail = f"{empty}/{parsed['chunks']} chunk(s) held no speech at all"
+        if empty == parsed["chunks"]:
+            print(
+                f"WARN {detail}, so this track has no transcript. If it really was "
+                "talking, the server is dropping it — check that vad_* is honoured "
+                "and lower WHISPER_CHUNK_SECONDS",
+                flush=True,
+            )
+        else:
+            print(f"note: {detail}")
     if not args.vad:
         # Worth one line every run: with the server transcribing silence too,
         # anything it invents there becomes speech in the plan, because the plan
@@ -453,12 +491,24 @@ def cmd_plan(args):
         for p in participants
     }
 
+    # Absent when the level scan could not be run. The cross-check then cannot
+    # happen, which is worth saying rather than passing over in silence.
+    loud_files = _collect(args.loud_dir, ".loud.json") if args.loud_dir else {}
+    loud = {p: loud_files[p]["loud"] for p in participants if p in loud_files}
+    unscanned = [p for p in participants if p not in loud]
+    if unscanned:
+        print(
+            f"note: no level scan for {', '.join(unscanned)}, so nothing checks "
+            "their transcripts against their own audio"
+        )
+
     result = planner.build_plan(
         meta,
         speech,
         {p: edit_files[p]["edits"] for p in edit_files},
         words,
         params,
+        loud=loud,
     )
     _write_json(args.out, result)
     report = planner.format_report(result)
@@ -467,12 +517,11 @@ def cmd_plan(args):
             handle.write(report)
     print(report, end="")
 
-    if result["warnings"] and not args.force:
-        hard = [w for w in result["warnings"] if "safety limit" in w]
-        if hard:
-            raise SystemExit(
-                "refusing to continue: " + "; ".join(hard) + " (override with --force)"
-            )
+    hard = result.get("blocking") or []
+    if hard and not args.force:
+        raise SystemExit(
+            "refusing to continue: " + "; ".join(hard) + " (override with --force)"
+        )
 
 
 # --- filters ------------------------------------------------------------------
@@ -626,6 +675,16 @@ def build_parser():
     p.add_argument("--meta", required=True)
     p.set_defaults(func=cmd_meta_shell)
 
+    p = sub.add_parser(
+        "loud-spans", help="silencedetect log -> the stretches that are not silent"
+    )
+    p.add_argument("--log", required=True)
+    p.add_argument("--duration", type=float, required=True)
+    p.add_argument("--participant", required=True)
+    p.add_argument("--threshold", help="recorded for the audit; not used here")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_loud_spans)
+
     p = sub.add_parser("words", help="whisper json -> words + segments")
     p.add_argument("--whisper-json", required=True)
     p.add_argument("--participant", required=True)
@@ -640,8 +699,8 @@ def build_parser():
     p.add_argument("--endpoint", required=True)
     p.add_argument("--out", required=True)
     p.add_argument(
-        "--silence-log",
-        help="ffmpeg silencedetect log, used only to place chunk boundaries",
+        "--loud",
+        help="loud-spans output, used only to place chunk boundaries in quiet",
     )
     p.add_argument("--duration", type=float, default=0.0)
     p.add_argument("--chunk-seconds", type=float, default=600.0)
@@ -703,6 +762,10 @@ def build_parser():
     p.add_argument("--meta", required=True)
     p.add_argument("--params", required=True)
     p.add_argument("--words-dir", required=True)
+    p.add_argument(
+        "--loud-dir",
+        help="loud-spans output, to cross-check each transcript against its audio",
+    )
     p.add_argument("--edits-dir")
     p.add_argument("--out", required=True)
     p.add_argument("--report")

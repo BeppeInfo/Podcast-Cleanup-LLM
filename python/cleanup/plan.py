@@ -1,10 +1,14 @@
 """Unify the transcript's silence and the LLM's findings into one edit plan.
 
-Both inputs are now derived from the same transcript: silence is where Whisper
+Both inputs are derived from the same transcript: silence is where Whisper
 returned no words (`transcript.speech_from_words`), and edits are what the LLM
-found in those words. There is no second opinion about the audio to cross-check
-against — see `looping_words` for what is still checkable, and DESIGN.md for why
-that trade was taken.
+found in those words. DESIGN.md covers why that trade was taken.
+
+Two checks guard the obvious hazard in it. `looping_words` catches a transcript
+that repeats itself, which is how Whisper fails on material that is not speech.
+`untranscribed_audio` compares each transcript against a level scan of its own
+track — the only input here that Whisper had no hand in — and the plan refuses to
+proceed when a cut would remove loud audio that no transcript accounts for.
 
 Two kinds of operation come out of this, and the distinction is the heart of
 the pipeline:
@@ -95,6 +99,55 @@ LOOP_MIN_REPEATS = 5
 LOOP_WARN_FRACTION = 0.25
 
 
+# A stretch of loud audio with no words has to last this long to be worth
+# mentioning. Below it, ordinary things account for the difference: a cough, a
+# breath the level scan called loud, the tail of a word whose timing is short.
+UNTRANSCRIBED_MIN_SPAN = 3.0
+
+# And a cut has to remove this much of it, in total, before the plan refuses to
+# proceed. Set from the incident it exists for: a skipped decode window cost 33
+# seconds of clear speech, and a silence cut then removed 6 of them.
+UNTRANSCRIBED_BLOCK_SECONDS = 5.0
+
+
+def untranscribed_audio(participants, words, loud, duration, pad) -> dict:
+    """Loud audio a track's own transcript has no words for.
+
+    This is the one opinion about the audio that does not come from Whisper. The
+    level scan cannot tell speech from a cough, which is exactly why it is not
+    the speech map — but it can tell loud from silent, and a long stretch of loud
+    audio that produced no words at all is either something Whisper declined to
+    transcribe or something it never saw.
+
+    Both happen. Whisper's Silero pass drops non-speech on purpose, and that is
+    the trade this design accepted. But Whisper also discards whole decode
+    windows: it works in 30-second windows, and one whose decode ends on a lone
+    timestamp token is skipped entirely ("single timestamp ending - skip entire
+    chunk"). On the recording this was written for that cost 33 seconds of clear
+    speech, and nothing else could see it — the transcript was self-consistent,
+    and the speech map is derived from the transcript, so both agreed the audio
+    was empty.
+
+    Which window a passage falls in depends on how much speech precedes it, so no
+    setting prevents this; it can only be detected after the fact. That is why
+    this check blocks rather than warns when a cut is already removing the audio.
+    """
+    missing: dict[str, list[tuple[float, float]]] = {}
+    for participant in participants:
+        spans = loud.get(participant) or []
+        if not spans:
+            continue
+        covered = tr.speech_from_words(words.get(participant), duration, pad)
+        gaps = [
+            (start, end)
+            for start, end in iv.subtract(iv.normalize(spans), covered)
+            if end - start >= UNTRANSCRIBED_MIN_SPAN
+        ]
+        if gaps:
+            missing[participant] = gaps
+    return missing
+
+
 def looping_words(participants, words) -> dict:
     """Tracks whose transcript repeats one run of words far past plausibility.
 
@@ -141,13 +194,17 @@ def looping_words(participants, words) -> dict:
     return looping
 
 
-def build_plan(meta, speech, edits, words, params) -> dict:
-    """Assemble the plan. `speech`/`edits`/`words` are keyed by participant.
+def build_plan(meta, speech, edits, words, params, loud=None) -> dict:
+    """Assemble the plan. `speech`/`edits`/`words`/`loud` are keyed by participant.
 
     `speech` comes from `transcript.speech_from_words` — the padded union of the
     words Whisper returned, not a separate opinion about the audio. Silence is
     therefore "no words here", and the padding is what keeps a cut off the edge
     of a word whose timing is approximate.
+
+    `loud` is the level scan, and is the exception: the one input that does not
+    come from Whisper. It is not used to decide anything, only to refuse — see
+    `untranscribed_audio`.
     """
     duration = float(meta["duration"])
     participants = [track["participant"] for track in meta["tracks"]]
@@ -225,6 +282,35 @@ def build_plan(meta, speech, edits, words, params) -> dict:
     # the speech map is made of the transcript. What is still visible is Whisper
     # repeating itself, which is how it fails when it is given something that is
     # not speech.
+    # Loud audio nothing transcribed. Reported wherever it is, and refused when a
+    # cut actually removes it — that combination is the shape of the bug this
+    # exists for, and the only one worth stopping a run over.
+    blocking: list[str] = []
+    unheard = untranscribed_audio(
+        participants, words, loud or {}, duration, params["speech_pad"]
+    )
+    cut_unheard = 0.0
+    for participant, gaps in sorted(unheard.items()):
+        total = sum(end - start for start, end in gaps)
+        inside = iv.total(iv.intersect(gaps, cut_spans)) if cut_spans else 0.0
+        cut_unheard += inside
+        widest = max(gaps, key=lambda span: span[1] - span[0])
+        warnings.append(
+            f"{total:.0f}s of {participant}'s audio is loud enough to be speech "
+            f"but produced no words at all, in {len(gaps)} stretch(es), the "
+            f"longest {widest[1] - widest[0]:.0f}s at {widest[0]:.0f}s"
+            + (f" — {inside:.0f}s of it falls inside cuts" if inside > iv.EPS else "")
+        )
+    if cut_unheard >= UNTRANSCRIBED_BLOCK_SECONDS:
+        blocking.append(
+            f"cuts remove {cut_unheard:.0f}s of audio that is loud enough to be "
+            "speech and that no transcript accounts for. Either Whisper skipped a "
+            "decode window, which lowering WHISPER_CHUNK_SECONDS makes smaller but "
+            "cannot prevent, or it declined to transcribe non-speech, which "
+            "SPLIT_SILENCE_THRESHOLD can be raised to stop reporting. Listen to "
+            "the spans in plan.json before overriding"
+        )
+
     looping = looping_words(participants, words)
     for participant, detail in sorted(looping.items()):
         warnings.append(
@@ -273,10 +359,12 @@ def build_plan(meta, speech, edits, words, params) -> dict:
     removed = iv.total(cut_spans)
     fraction = removed / duration if duration > 0 else 0.0
     if fraction > params["max_cut_fraction"]:
-        warnings.append(
+        limit = (
             f"plan removes {fraction * 100:.1f}% of the episode, above the "
             f"{params['max_cut_fraction'] * 100:.0f}% safety limit"
         )
+        warnings.append(limit)
+        blocking.append(limit)
 
     stats = {
         "duration": round(duration, 3),
@@ -289,6 +377,10 @@ def build_plan(meta, speech, edits, words, params) -> dict:
         "cut_from_silence": sum(
             1 for c in cuts if any(s == "silence" for s in c["sources"])
         ),
+        "untranscribed_seconds": round(
+            sum(e - s for gaps in unheard.values() for s, e in gaps), 3
+        ),
+        "untranscribed_in_cuts": round(cut_unheard, 3),
         "cut_from_llm": sum(
             1 for c in cuts if any(s.startswith("llm:") for s in c["sources"])
         ),
@@ -318,8 +410,16 @@ def build_plan(meta, speech, edits, words, params) -> dict:
         "looping_transcripts": {
             participant: detail for participant, detail in sorted(looping.items())
         },
+        # Kept span by span so it can be listened to rather than only counted.
+        "untranscribed_audio": {
+            participant: [[round(s, 3), round(e, 3)] for s, e in gaps]
+            for participant, gaps in sorted(unheard.items())
+        },
         "stats": stats,
         "warnings": warnings,
+        # The subset of warnings that should stop a run. Kept separate so the
+        # decision lives here rather than in a caller matching on message text.
+        "blocking": blocking,
     }
 
 

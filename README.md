@@ -71,9 +71,23 @@ server returns. A build honouring `max_len=1` returns one word per segment and
 the timings are exact; one that ignores it returns sentence segments, and word
 positions inside them are interpolated, which makes stutter cuts less tight. The
 run warns when that happens. Local `whisper-cli` always gives per-token timings.
-Audio is uploaded in chunks (`WHISPER_CHUNK_SECONDS`, 0 for one request), with
-boundaries nudged onto a quiet spot ffmpeg found so no chunk edge lands inside a
-word.
+Audio is uploaded in chunks (`WHISPER_CHUNK_SECONDS`, default 120, 0 for one
+request), with boundaries nudged onto a quiet spot ffmpeg found so no chunk edge
+lands inside a word.
+
+**Whisper discards decode windows, and this is the one to know about.** It works
+in 30-second windows, and a window whose decode ends on a lone timestamp token is
+skipped whole — `"single timestamp ending - skip entire chunk"` in
+`src/whisper.cpp`. On a real 600s track that silently cost 33 seconds of clear
+speech: with VAD the windows are cut from *filtered* audio, so one skipped 30s
+window spanned 33s of the original once the silence inside it is counted back.
+Which window a passage lands in depends on how much speech precedes it, so
+request length shuffles the alignment rather than curing anything — the same
+passage survived a 100s request and vanished from a 300s and a 600s one. Nothing
+in the response reports it, and since the speech map is derived from the
+transcript, the loss reads as silence and gets cut. `WHISPER_CHUNK_SECONDS=120`
+keeps any single loss small; the audio cross-check below is what actually stops
+the damage.
 
 **And one that matters more.** The words that come back are also the speech map —
 silence is where the transcript has none — so the server must be running Silero
@@ -430,6 +444,15 @@ word, so padding cannot eat into real speech.
 - Rendered durations are checked against a **frame-exact prediction** of what the
   filter graph will emit, not a rule of thumb. A mismatch fails the run and
   preserves the inputs.
+- **A cut over audio nothing transcribed is refused.** One ffmpeg level scan per
+  track is the only input Whisper had no hand in. It cannot tell speech from a
+  cough — which is why it is not the speech map — but it can tell loud from
+  silent, and loud audio that produced no words at all is either something
+  Whisper declined to transcribe or a decode window it threw away. Stretches over
+  3s are reported and recorded in `plan.json` under `untranscribed_audio`; once
+  cuts remove more than 5s of it in total the run refuses, and `--force` is the
+  way past. This is the check that catches the 30-second-window loss described
+  above, and it is the reason the level scan now runs for every track.
 - **A looping transcript is reported.** Nothing compares the transcript against
   the audio any more — the speech map is derived from the transcript, so the two
   agree by construction. What is still visible is the shape of the failure:
@@ -480,7 +503,8 @@ lib/config.sh                 defaults, config loading, validation
 lib/stages.sh                 the seven stages, and the llama server lifecycle
 python/cleanup_cli.py         subcommands the shell calls
 python/cleanup/intervals.py   interval algebra and timeline remapping
-python/cleanup/silence.py     silencedetect parsing, for chunk boundaries only
+python/cleanup/silence.py     silencedetect parsing: chunk boundaries, and the
+                              only opinion about the audio that is not Whisper's
 python/cleanup/transcript.py  Whisper tokens to words, and the speech map
 python/cleanup/asr.py         remote whisper-server client and chunking
 python/cleanup/llm.py         chunking, prompting, response validation
@@ -504,6 +528,9 @@ and writes JSON and never touches audio.
 - `WHISPER_VAD_THRESHOLD` is the other end of the same question, and it acts
   earlier: it decides what Whisper transcribes at all, and therefore what exists
   to be protected. Lower it if quiet speech is going missing from the transcript.
+- `SPLIT_SILENCE_THRESHOLD` decides how much the audio cross-check complains
+  about. Raise it toward `-35dB` if it keeps reporting non-speech you are content
+  to lose; lower it to hear about more. It has no effect on what gets cut.
 - `INPUT_EXTS` is worth narrowing to just your own format if the input directory
   holds anything else you would rather not sweep up. The same participant present
   in two formats is an error, not a preference.

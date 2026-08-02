@@ -1135,6 +1135,77 @@ for PAD in 0 0.25; do
 done
 
 # ============================================================================
+printf '\n%sCase 12: a cut over audio nothing transcribed is refused%s\n' "$BOLD" "$RESET"
+# ============================================================================
+#
+# The regression this exists for. Whisper decodes in 30-second windows and
+# discards a whole window whose decode ends badly — "single timestamp ending -
+# skip entire chunk". On a real episode that silently cost 33 seconds of clear
+# speech, and because the speech map is derived from the transcript, the audio and
+# the map agreed it was empty and a silence cut removed it.
+#
+# Here alice's audio has a tone at 20-30s that her canned transcript omits, which
+# is what a skipped window looks like from the outside. The level scan is the only
+# input Whisper had no hand in, so it is the only thing that can notice.
+
+CASE12="$SANDBOX/case12"
+A12_AUDIO='0,10 20,30'      # what the microphone recorded
+A12_WORDS='0,10'            # what came back — the 20-30s window went missing
+B12_SPEECH='10,20'
+build_episode ep012 "$CASE12/incoming" \
+    "$(windows_expr "$A12_AUDIO")" "$(windows_expr "$B12_SPEECH")" 30
+whisper_responses "$SANDBOX/case12.words.json" \
+    "alice=$A12_WORDS" "bob=$B12_SPEECH"
+start_whisper_stub "$SANDBOX/case12.words.json"
+
+if run_pipeline "$CASE12/incoming" "$CASE12/output" "$CASE12/work" \
+    --config "$CONF" --keep-work >"$SANDBOX/case12.stdout" 2>&1
+then
+    check "a cut over untranscribed audio is refused" false
+    fail_note "the run should have refused but did not"
+else
+    check "a cut over untranscribed audio is refused" true
+fi
+check "the refusal says what it found" \
+    grep -qi "no transcript accounts for" "$SANDBOX/case12.stdout"
+check "the refusal names the setting that shrinks the loss" \
+    grep -q "WHISPER_CHUNK_SECONDS" "$SANDBOX/case12.stdout"
+
+PLAN12="$CASE12/work/ep012/plan.json"
+if [[ -f "$PLAN12" ]]; then
+    check "the missing span is recorded for listening" python3 -c '
+import json, sys
+plan = json.load(open(sys.argv[1]))
+spans = plan["untranscribed_audio"].get("alice") or []
+if not spans:
+    print("nothing recorded under untranscribed_audio:", plan["untranscribed_audio"])
+    sys.exit(1)
+start, end = spans[0]
+if not (19.0 <= start <= 21.0 and 29.0 <= end <= 30.01):
+    print(f"expected roughly 20-30s, got {start}-{end}")
+    sys.exit(1)
+print(f"recorded {start:.2f}-{end:.2f}s")
+' "$PLAN12"
+    check "it is counted in the stats" python3 -c '
+import json, sys
+stats = json.load(open(sys.argv[1]))["stats"]
+if stats["untranscribed_in_cuts"] < 5.0:
+    print("untranscribed_in_cuts too low to have blocked:", stats)
+    sys.exit(1)
+' "$PLAN12"
+fi
+
+# And --force is still the way through, since only a person can judge the audio.
+if run_pipeline "$CASE12/incoming" "$CASE12/output" "$CASE12/work" \
+    --config "$CONF" --keep-work --force >"$SANDBOX/case12-force.stdout" 2>&1
+then
+    check "--force overrides it" true
+else
+    check "--force overrides it" false
+    fail_note "$(tail -n 20 "$SANDBOX/case12-force.stdout")"
+fi
+
+# ============================================================================
 
 printf '\n'
 if (( FAILURES == 0 )); then
