@@ -8,12 +8,21 @@ Token timings are not always usable — depending on build and flags the offsets
 can arrive all-zero or non-monotonic. When that happens the segment's words are
 spread across its span in proportion to their length, which is coarse but never
 wrong enough to matter for a disfluency cut.
+
+This module also answers where a track has speech at all (`speech_from_words`).
+That used to be a separate stage running its own detector over the audio; it is
+here now because Whisper's own VAD pass decides what gets transcribed, so the
+words *are* the speech map. An interpolated segment tiles its whole span
+continuously, so silence inside it is invisible — which loses a cut rather than
+inventing one, and is the direction to err in.
 """
 
 from __future__ import annotations
 
 import json
 import re
+
+from . import intervals
 
 # whisper's non-textual tokens: [_BEG_], [_TT_120], [_SOT_], and friends.
 _SPECIAL = re.compile(r"^\[_.*_?\]$|^<\|.*\|>$")
@@ -159,6 +168,48 @@ def build_from_segments(raw_segments, participant: str, language: str = "") -> d
         "words": words,
         "approximated_segments": approximated,
     }
+
+
+# Every word's span is widened by this much before the union that makes the
+# speech map. Two things ride on it.
+#
+# Whisper's word timings are approximate — a boundary sits within a couple of
+# hundred milliseconds of the real one, and further than that where a segment's
+# token timings were unusable and `_segment_words_by_proportion` had to spread
+# words evenly across it. The padding is how much of that error a cut is not
+# allowed to eat.
+#
+# It also prices every cut. A gap between words has to exceed
+# SILENCE_MIN_DURATION plus twice this before it becomes one, so raising it
+# makes cuts rarer and more conservative and lowering it makes them tighter and
+# more numerous. That is the whole knob: there is no threshold to tune any more.
+SPEECH_PAD = 0.25
+
+
+def speech_from_words(words, duration: float, pad: float = SPEECH_PAD):
+    """Where this track has speech, according to its own transcript.
+
+    Whisper does its own Silero VAD pass and only transcribes what that pass
+    calls speech, so the words coming back already carry that judgement — which
+    is why nothing here runs a second detector over the audio.
+
+    The consequence worth stating plainly: this map cannot disagree with the
+    transcript, because it is made of it. Audible material Whisper wrote nothing
+    for — a laugh, a cough, a mumble, a filler it dropped — reads as silence
+    here and is eligible for a silence cut. That is a deliberate trade, and
+    `plan.looping_words` is what catches the failure it can no longer see.
+    """
+    spans: list[tuple[float, float]] = []
+    for word in words or []:
+        try:
+            start = float(word["start"])
+            end = float(word["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end < start:
+            continue
+        spans.append((max(0.0, start - pad), min(duration, end + pad)))
+    return intervals.normalize(spans)
 
 
 def word_span(words, first: int, last: int) -> tuple[float, float]:

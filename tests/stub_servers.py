@@ -11,6 +11,11 @@ shape, endpoint probing, and the stage wiring around them.
 `--responses` is a JSON array handed out one entry per POST, in order. Requests
 past the end of the list get the final entry again. Each request is appended to
 `--request-log` as one JSON line, so the test can assert on what was sent.
+
+For the whisper role it may instead be a JSON object keyed by uploaded filename
+("alice.wav"), which is what the end-to-end test wants: each track gets the
+transcript that matches its own audio, whatever order the stages ask in and
+however many times a resumed run asks again.
 """
 
 from __future__ import annotations
@@ -21,6 +26,28 @@ import json
 import os
 import sys
 import threading
+
+
+def _uploaded_filename(raw: bytes) -> str:
+    """The filename from the multipart file part, or "" if there is none."""
+    marker = b'name="file"; filename="'
+    at = raw.find(marker)
+    if at < 0:
+        return ""
+    rest = raw[at + len(marker):]
+    return rest[: rest.find(b'"')].decode("utf-8", errors="replace")
+
+
+def _field_values(raw: bytes) -> dict:
+    """The plain (non-file) form fields as {name: value}."""
+    values = {}
+    for part in raw.split(b"Content-Disposition: form-data; ")[1:]:
+        head, _, body = part.partition(b"\r\n\r\n")
+        if b"filename=" in head:
+            continue
+        name = head.split(b'name="', 1)[1].split(b'"', 1)[0].decode()
+        values[name] = body.split(b"\r\n--")[0].decode("utf-8", errors="replace")
+    return values
 
 
 def build_handler(role, responses, request_log, api_key=None):
@@ -69,10 +96,23 @@ def build_handler(role, responses, request_log, api_key=None):
                 return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
+            filename = _uploaded_filename(raw)
             with lock:
                 index = counter["n"]
                 counter["n"] += 1
-                reply = responses[min(index, len(responses) - 1)] if responses else {}
+                if isinstance(responses, dict):
+                    # Keyed by filename: a resumed or re-run stage must get the
+                    # same answer for the same track, not the next one in line.
+                    reply = responses.get(filename)
+                    if reply is None:
+                        self._send_json(
+                            404, {"error": f"no canned reply for '{filename}'"}
+                        )
+                        return
+                elif responses:
+                    reply = responses[min(index, len(responses) - 1)]
+                else:
+                    reply = {}
                 if request_log:
                     record = {
                         "index": index,
@@ -89,10 +129,15 @@ def build_handler(role, responses, request_log, api_key=None):
                         # Note the audio's size rather than its contents, and
                         # confirm the file part actually arrived.
                         record["has_file_part"] = b'name="file"' in raw
+                        record["filename"] = filename
                         record["fields"] = sorted(
                             part.split(b'name="', 1)[1].split(b'"', 1)[0].decode()
                             for part in raw.split(b"Content-Disposition: form-data; ")[1:]
                         )
+                        # Values of the non-file parts, so a test can assert that
+                        # e.g. vad=true really travelled rather than just that a
+                        # field by that name existed.
+                        record["values"] = _field_values(raw)
                     with open(request_log, "a", encoding="utf-8") as handle:
                         handle.write(json.dumps(record) + "\n")
 

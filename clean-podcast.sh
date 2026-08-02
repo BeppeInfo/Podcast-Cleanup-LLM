@@ -62,11 +62,10 @@ Options:
       --stages A,B,C    run exactly these stages, in this order
       --list-stages     show the stages and exit
 
-      --vad BACKEND     ffmpeg (level based) or silero (speech based, better
-                        where levels vary). silero uses the silero-vad package
-                        if installed, otherwise pysilero_vad — same model and
-                        results, but 2 MB and no torch rather than ~970 MB,
-                        and about twice as fast
+      --no-whisper-vad  do not have Whisper run Silero over the audio first.
+                        Silence then gets transcribed too, and since the speech
+                        map is derived from the transcript, anything invented
+                        there becomes speech in the plan
       --no-llm          silence editing only; skip the LLM stage entirely
   -j, --jobs N          parallel ffmpeg jobs
       --force           proceed even when the plan trips a safety limit
@@ -116,7 +115,7 @@ parse_args() {
                 printf 'Stages, in order:\n'
                 printf '  %s\n' "${ALL_STAGES[@]}"
                 exit 0 ;;
-            --vad)         ARG_VAD_BACKEND="${2:?--vad needs a backend}"; shift 2 ;;
+            --no-whisper-vad) ARG_WHISPER_VAD=0; shift ;;
             --no-llm)      ARG_LLM_ENABLE=0; shift ;;
             --whisper-endpoint) ARG_WHISPER_ENDPOINT="${2:?--whisper-endpoint needs a URL}"; shift 2 ;;
             --local-whisper)    ARG_LOCAL_WHISPER=1; shift ;;
@@ -151,7 +150,7 @@ apply_overrides() {
     [[ -n "${ARG_INPUT_DIR:-}" ]]       && INPUT_DIR="$ARG_INPUT_DIR"
     [[ -n "${ARG_OUTPUT_DIR:-}" ]]      && OUTPUT_DIR="$ARG_OUTPUT_DIR"
     [[ -n "${ARG_WORK_ROOT:-}" ]]       && WORK_ROOT="$ARG_WORK_ROOT"
-    [[ -n "${ARG_VAD_BACKEND:-}" ]]     && VAD_BACKEND="$ARG_VAD_BACKEND"
+    [[ -n "${ARG_WHISPER_VAD:-}" ]]     && WHISPER_VAD="$ARG_WHISPER_VAD"
     [[ -n "${ARG_LLM_ENABLE:-}" ]]      && LLM_ENABLE="$ARG_LLM_ENABLE"
     [[ -n "${ARG_WHISPER_ENDPOINT:-}" ]] && WHISPER_ENDPOINT="$ARG_WHISPER_ENDPOINT"
     [[ -n "${ARG_LLAMA_ENDPOINT:-}" ]]  && LLAMA_ENDPOINT="$ARG_LLAMA_ENDPOINT"

@@ -21,7 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cleanup import intervals as iv  # noqa: E402
-from cleanup import asr, llm, plan as planner, render, transcript as tr, vad  # noqa: E402
+from cleanup import asr, llm, plan as planner, render, silence, transcript as tr  # noqa: E402
 
 
 def _read_json(path):
@@ -190,7 +190,7 @@ def cmd_meta_refresh(args):
         prepared = os.path.join(args.prep_dir, f"{track['participant']}.wav")
         if not os.path.isfile(prepared):
             _fail(f"prepared track missing, cannot measure: {prepared}")
-        measured = round(vad.wav_duration(prepared), 4)
+        measured = round(silence.wav_duration(prepared), 4)
         before = track["duration"]
         track["duration"] = measured
         if abs(measured - before) > 0.002:
@@ -210,7 +210,7 @@ def cmd_meta_refresh(args):
         )
 
 
-# --- vad ----------------------------------------------------------------------
+# --- meta ----------------------------------------------------------------------
 
 
 def cmd_meta_shell(args):
@@ -241,43 +241,6 @@ def cmd_meta_shell(args):
         print(f"{key}=({pairs})")
 
 
-def cmd_vad_ffmpeg(args):
-    with open(args.log, encoding="utf-8", errors="replace") as handle:
-        speech = vad.parse_silencedetect(handle.read(), args.duration)
-    _write_json(
-        args.out,
-        {
-            "participant": args.participant,
-            "backend": "ffmpeg",
-            "duration": args.duration,
-            "speech": [[round(s, 4), round(e, 4)] for s, e in speech],
-        },
-    )
-    print(f"{len(speech)} speech regions, {iv.total(speech):.1f}s of speech")
-
-
-def cmd_vad_silero(args):
-    speech, implementation = vad.silero_speech(args.wav, threshold=args.threshold)
-    duration = args.duration or vad.wav_duration(args.wav)
-    _write_json(
-        args.out,
-        {
-            "participant": args.participant,
-            "backend": "silero",
-            # Which package answered. The two agree to within one 32 ms chunk
-            # but are not bit-identical, so an edit that needs reproducing needs
-            # to know which one produced this map.
-            "implementation": implementation,
-            "duration": round(duration, 3),
-            "speech": [[round(s, 4), round(e, 4)] for s, e in speech],
-        },
-    )
-    print(
-        f"{len(speech)} speech regions, {iv.total(speech):.1f}s of speech "
-        f"(via {implementation})"
-    )
-
-
 # --- transcript ---------------------------------------------------------------
 
 
@@ -296,25 +259,41 @@ def cmd_words(args):
 # --- detection ----------------------------------------------------------------
 
 
+VAD_REQUEST_FIELDS = (
+    ("vad_threshold", "vad_threshold"),
+    ("vad_min_speech_duration_ms", "vad_min_speech_ms"),
+    ("vad_min_silence_duration_ms", "vad_min_silence_ms"),
+    ("vad_speech_pad_ms", "vad_speech_pad_ms"),
+    ("vad_samples_overlap", "vad_samples_overlap"),
+)
+
+
 def cmd_transcribe_remote(args):
-    speech = None
-    if args.vad and os.path.isfile(args.vad):
-        speech = [tuple(span) for span in _read_json(args.vad)["speech"]]
+    loud = None
+    if args.silence_log and os.path.isfile(args.silence_log):
+        with open(args.silence_log, encoding="utf-8", errors="replace") as handle:
+            loud = silence.parse_silencedetect(handle.read(), args.duration or 0.0)
 
     client = asr.WhisperClient(
         args.endpoint, timeout=args.request_timeout, path=args.path,
         api_key=_api_key(WHISPER_KEY_ENV),
     )
+    options = {
+        field: getattr(args, attribute)
+        for field, attribute in VAD_REQUEST_FIELDS
+        if getattr(args, attribute) is not None
+    }
     parsed = asr.transcribe(
         client,
         args.wav,
         args.participant,
         language=args.language,
         chunk_seconds=args.chunk_seconds,
-        speech=speech,
+        loud=loud,
         temperature=args.temperature,
         on_progress=_progress,
-        skip_silence=args.skip_silence,
+        vad=args.vad,
+        vad_options=options,
     )
     _write_json(args.out, parsed)
 
@@ -322,21 +301,14 @@ def cmd_transcribe_remote(args):
     print(
         f"{words} words in {segments} segments over {parsed['chunks']} chunk(s)"
     )
-    skipped = parsed.get("skipped_seconds") or 0.0
-    if skipped > 0.5:
-        share = skipped / max(parsed.get("audio_seconds") or 1.0, 1e-6)
-        detail = (
-            f"{skipped:.0f}s of {parsed['audio_seconds']:.0f}s ({share * 100:.0f}%) "
-            "was not sent to Whisper: the VAD heard no speech there"
+    if not args.vad:
+        # Worth one line every run: with the server transcribing silence too,
+        # anything it invents there becomes speech in the plan, because the plan
+        # has nothing else to go on.
+        print(
+            "note: server-side VAD is off, so silence was transcribed as well; "
+            "hallucinated words there will read as speech downstream"
         )
-        # Skipping silence is the point, but skipping most of a track is also
-        # what a wrong VAD threshold looks like, and the words it drops leave no
-        # trace in the transcript to notice later.
-        if share > 0.5:
-            print(f"WARN {detail}. If that track really was talking, lower the "
-                  "VAD threshold or set WHISPER_SKIP_SILENCE=0", flush=True)
-        else:
-            print(f"note: {detail}")
     if parsed["approximated_segments"]:
         # Worth saying plainly: it decides how tightly a stutter can be cut.
         share = parsed["approximated_segments"] / max(segments, 1)
@@ -459,20 +431,33 @@ def _collect(directory, suffix):
 def cmd_plan(args):
     meta = _read_json(args.meta)
     params = _read_json(args.params)
-    speech_files = _collect(args.vad_dir, ".json")
     word_files = _collect(args.words_dir, ".words.json")
     edit_files = _collect(args.edits_dir, ".edits.json") if args.edits_dir else {}
 
     participants = [t["participant"] for t in meta["tracks"]]
-    missing = [p for p in participants if p not in speech_files]
+    # A missing transcript is fatal rather than "that track was silent". Silence
+    # is now the absence of words, so a track with no words at all would read as
+    # silent everywhere — and since cuts only happen where every track is silent,
+    # it would stop protecting its own audio from everyone else's cuts.
+    missing = [p for p in participants if p not in word_files]
     if missing:
-        _fail(f"no VAD result for: {', '.join(missing)}")
+        _fail(
+            f"no transcript for: {', '.join(missing)} — the speech map is derived "
+            "from the words, so a track without one cannot be planned"
+        )
+
+    words = {p: word_files[p]["words"] for p in participants}
+    durations = {t["participant"]: float(t["duration"]) for t in meta["tracks"]}
+    speech = {
+        p: tr.speech_from_words(words[p], durations[p], pad=params["speech_pad"])
+        for p in participants
+    }
 
     result = planner.build_plan(
         meta,
-        {p: speech_files[p]["speech"] for p in participants},
+        speech,
         {p: edit_files[p]["edits"] for p in edit_files},
-        {p: word_files[p]["words"] for p in word_files},
+        words,
         params,
     )
     _write_json(args.out, result)
@@ -641,21 +626,6 @@ def build_parser():
     p.add_argument("--meta", required=True)
     p.set_defaults(func=cmd_meta_shell)
 
-    p = sub.add_parser("vad-ffmpeg", help="parse a silencedetect log")
-    p.add_argument("--log", required=True)
-    p.add_argument("--duration", type=float, required=True)
-    p.add_argument("--participant", required=True)
-    p.add_argument("--out", required=True)
-    p.set_defaults(func=cmd_vad_ffmpeg)
-
-    p = sub.add_parser("vad-silero", help="run Silero VAD over a prepared track")
-    p.add_argument("--wav", required=True)
-    p.add_argument("--participant", required=True)
-    p.add_argument("--threshold", type=float, default=0.5)
-    p.add_argument("--duration", type=float, default=0.0)
-    p.add_argument("--out", required=True)
-    p.set_defaults(func=cmd_vad_silero)
-
     p = sub.add_parser("words", help="whisper json -> words + segments")
     p.add_argument("--whisper-json", required=True)
     p.add_argument("--participant", required=True)
@@ -669,12 +639,21 @@ def build_parser():
     p.add_argument("--participant", required=True)
     p.add_argument("--endpoint", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--vad", help="VAD result, used to place chunk boundaries in silence")
+    p.add_argument(
+        "--silence-log",
+        help="ffmpeg silencedetect log, used only to place chunk boundaries",
+    )
+    p.add_argument("--duration", type=float, default=0.0)
     p.add_argument("--chunk-seconds", type=float, default=600.0)
     p.add_argument(
-        "--no-skip-silence", dest="skip_silence", action="store_false",
-        help="send the whole track, including stretches the VAD calls silence",
+        "--no-vad", dest="vad", action="store_false",
+        help="do not ask the server to run Silero first; silence is transcribed too",
     )
+    p.add_argument("--vad-threshold", type=float)
+    p.add_argument("--vad-min-speech-ms", type=int)
+    p.add_argument("--vad-min-silence-ms", type=int)
+    p.add_argument("--vad-speech-pad-ms", type=int)
+    p.add_argument("--vad-samples-overlap", type=float)
     p.add_argument("--language", default="auto")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--request-timeout", type=float, default=1800.0)
@@ -723,7 +702,6 @@ def build_parser():
     p = sub.add_parser("plan", help="unify silence and edits into an edit plan")
     p.add_argument("--meta", required=True)
     p.add_argument("--params", required=True)
-    p.add_argument("--vad-dir", required=True)
     p.add_argument("--words-dir", required=True)
     p.add_argument("--edits-dir")
     p.add_argument("--out", required=True)

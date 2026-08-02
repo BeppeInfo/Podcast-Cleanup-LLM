@@ -117,13 +117,13 @@ inputs/<episode>_<participant>.<ext>       any format ffmpeg can decode
    │
    ├─ discover ──→ meta.json         participants, codecs, rates, durations
    │
-   ├─ prepare ───→ prep/<p>.wav      16 kHz mono, what Whisper and Silero want
+   ├─ prepare ───→ prep/<p>.wav      16 kHz mono, what Whisper wants
    │               meta.json         durations replaced with measured ones
-   │
-   ├─ vad ───────→ vad/<p>.json      {"speech": [[start, end], ...]}
    │
    ├─ transcribe → words/<p>.words.json   words with timings, and segments
    │                                      (local whisper-cli, or a server)
+   │               asr/<p>.silence.log    only for a track long enough to split
+   │                                      into several requests
    │
    ├─ detect ────→ llm/<p>.edits.json     validated findings, word-index based
    │               llm/<p>.audit.jsonl    every response, accepted or not
@@ -412,10 +412,13 @@ guarantee it cannot make.
 the reply into the same segment shape `whisper-cli` produces, so
 `transcript.build_from_segments` reassembles words from one code path either way.
 
-Two wrinkles. **Chunking**: a 2 h track is ~230 MB and one request means no
-progress for as long as it takes, so it is split — with boundaries nudged onto
-the middle of a silence the VAD stage already found, which is why `transcribe`
-runs after `vad`. **Tolerant parsing**: whisper-server's response shape varies by
+Three wrinkles. **Server-side VAD**: the request asks the server to run Silero
+first and transcribe only what it calls speech, which is the whole reason this
+pipeline no longer detects speech itself — see below. **Chunking**: a 2 h track is
+~230 MB and one request means no progress for as long as it takes, so it is split,
+with boundaries nudged onto a quiet spot ffmpeg found so a split does not land
+mid-word. That scan is the only surviving use of level-based silence detection,
+and it runs only for a track long enough to need splitting. **Tolerant parsing**: whisper-server's response shape varies by
 version and `response_format`, so several are accepted (`segments` with float
 seconds, with clock strings, or whisper-cli's `transcription` with `offsets`;
 token lists are used when they carry timings and ignored when they are bare ids).
@@ -430,9 +433,61 @@ because it decides how tightly a stutter can be cut.
 **A word with timings is not evidence a word was spoken.** On the sample
 recording Whisper returned a final `right` spanning 9.94–11.34 s, over audio
 whose peak is −50.4 dB — the noise floor. The transcript is a model's output, not
-a measurement, and it will place words over near-silence. Everything downstream
-treats it as one input among two: the VAD decides where speech is, the transcript
-decides what was said, and §8 covers what happens when they disagree.
+a measurement, and it will place words over near-silence.
+
+### The transcript is the speech map
+
+There used to be a `vad` stage: Silero (or ffmpeg's silencedetect) ran over each
+prepared track and produced a speech map, and the plan treated it as one input
+among two — the map decided where speech was, the transcript decided what was
+said, and a disagreement between them was reported.
+
+That stage is gone. whisper.cpp runs Silero itself, and once the server is
+transcribing speech only, the words coming back already carry that judgement:
+silence is where the transcript has no words, and `transcript.speech_from_words`
+is the padded union of the words. One Silero, in one place, and the Python side
+has no model dependency at all.
+
+**What that buys.** Whisper handed silence invents text, and a local detector
+existed largely to withhold silence from it — a job the model's own VAD does
+better, inside the model, without slicing WAVs and re-offsetting timings. The
+`plan_speech_chunks` layer that did it here, its padding and merge-gap constants,
+both VAD backends, the Silero packages, `VAD_BACKEND`, `SILERO_THRESHOLD` and the
+stage itself are all gone. What remains is one number, `SPEECH_PAD`.
+
+**What it costs, precisely.** The map is now a subset of what Silero passed, and
+the residue — audible material Whisper wrote nothing for — reads as silence and is
+eligible for a cut:
+
+- fillers Whisper drops, mumbles, a too-quiet phrase, crosstalk bleed;
+- laughter, a cough, a breath, a chair, an intro sting.
+
+Cuts are global, so a laugh in a mutual pause is the realistic loss. That was
+accepted deliberately: it is rare in the recordings this is for, and the answer to
+non-verbal material is a model that transcribes it as a tag, not a second
+detector here.
+
+**And two checks became tautologies, so they were deleted rather than kept as
+theatre.** `_words_without_speech` asked whether a track's audio supported its own
+transcript, and `_words_lost_to_silence` asked whether a cut removed words nothing
+asked for. Both compared the transcript against an independent opinion. With the
+map derived from the transcript, neither can ever fire: a word is always inside
+its own padded span, and a cut only happens where no padded span is. Keeping code
+that cannot fail would read as a safeguard that is not there.
+
+The first of those caught something real — 198 repetitions of one sentence over a
+muted mic — so its *purpose* is kept by `plan.looping_words`, which needs no
+second opinion. Whisper handed noise does not invent varied text; it repeats. A
+run of eight words recurring five times and accounting for a quarter of a track is
+warned about. That detects the failure by its shape rather than by comparison, and
+it works on a transcript alone.
+
+**The residual risks worth knowing.** A build too old to parse the `vad_*` form
+fields ignores them silently, so nothing here can confirm the pass actually ran.
+And where a segment arrives without usable token timings,
+`_segment_words_by_proportion` spreads its words evenly across its whole span, so
+that segment tiles continuously and silence inside it is invisible — which loses a
+cut rather than inventing one, and is the direction to err in.
 
 ### Authenticating to either endpoint
 
@@ -467,16 +522,14 @@ command to resume with.
   `--force` overrides. That almost always means a wrong detection threshold.
 - Rendered durations are checked against the frame-exact prediction. A mismatch
   fails the run.
-- A cut that swallows transcribed words no edit asked for is warned about, and
-  the words are listed in `plan.json` under `words_lost_to_silence`. The VAD and
-  the transcript are two independent opinions about where speech is, and nothing
-  else compares them — the published transcript is rebuilt from the rendered
-  timeline, so a word cut away disappears from it and the output stays
-  self-consistent. That self-consistency is exactly what hides the
-  disagreement. Either side can be wrong (a level-based VAD misses quiet speech;
-  Whisper places words over near-silence), so this reports and does not correct.
-  A word must be more than half swallowed to count: cut padding grazing its
-  neighbour is normal.
+- A transcript that repeats one run of words past plausibility is warned about
+  and recorded in `plan.json` under `looping_transcripts`. This is the one check
+  that survives deriving the speech map from the transcript, because it needs no
+  independent opinion about the audio — see §7. A missing transcript is a hard
+  failure rather than a silent track: silence is the absence of words, so a track
+  without any would read as silent everywhere, and since cuts happen only where
+  every track is silent, it would stop protecting its own audio from everyone
+  else's cuts.
 - Rejected up front: mismatched sample rates, tracks from two episodes,
   duplicate participants, unparseable filenames. A missing input directory is
   *not* an error — it is created, and an empty one simply means nothing to do.
@@ -671,10 +724,12 @@ which of the two is wrong.
   first run against a real server remains the only evidence that the wire format
   is right, and the schema check is what makes that run fail loudly instead of
   silently.
-- **Silero's judgement** — neither implementation's model is exercised, since
-  synthetic audio has nothing to judge. The segmentation *around* it is covered
-  (`speech_from_probabilities`), as is the wiring when `pysilero_vad` is
-  installed; what a real model makes of real speech is not.
+- **Silero's judgement** — it runs inside whisper.cpp now, so nothing here can
+  reach it and synthetic audio would have nothing for it to judge anyway. What is
+  covered is that the request asks for it and spells every field the way
+  whisper-server parses it (`TestServerSideVadRequest`, selftest case 1). Whether
+  the server on the other end honours those fields, or is old enough to drop them
+  without complaint, is not something this side can test — or detect at runtime.
 - **Real audio.** Synthetic tracks are sine bursts against digital silence, so
   every level is unambiguous and every word is invented. Neither the `detect`
   stage nor anything depending on real acoustics can be reached that way. A
@@ -698,15 +753,17 @@ because they share a shape:
    the assumption held everywhere it was tested; a router-mode server refuses.
 2. **The VAD and the transcript disagreed**, and nothing compared them. Quiet
    speech at −39.2 dB fell under the −35 dB threshold and was cut while Whisper
-   had transcribed it. Now warned about (§8).
+   had transcribed it.
 3. **The default `SILENCE_THRESHOLD` cut through the middle of the speech.** A
    threshold belongs below the quietest speech and above the noise floor; this
    recording put speech at −21 dB and −39 dB with a floor near −50 dB, and
-   `-35dB` fell *between the two kinds of speech*. Lowered to `-45dB`, which
-   lands in the intended band and errs toward leaving room tone rather than
-   cutting speech — those two mistakes do not cost the same.
+   `-35dB` fell *between the two kinds of speech*.
 4. **The lost-word warning gave advice for the wrong backend**, telling a Silero
    run to try Silero.
+
+Findings 2, 3 and 4 are all about a local speech detector that no longer exists;
+the level threshold they argued over now only picks chunk boundaries, where being
+wrong costs one word rather than an edit (§7).
 
 Every one of them was invisible to the suites for the same reason: *both sides of
 each test were written here*. The stubs answer as the client expects, synthetic
@@ -727,7 +784,7 @@ Cross-reference for [§9](#9-invariants):
 | --- | --- |
 | 1. identical output lengths | selftest cases 1, 6, 7, 8, 10; unit test on filter ordering |
 | 2. mutes never change the timeline | selftest cases 6, 7 (durations plus measured audio) |
-| 3. no cut overlaps speech | selftest case 1, checked against the VAD output |
+| 3. no cut overlaps speech | selftest case 1, checked against the transcribed words rather than the plan's own map |
 | 4. `keep` complements `cuts` | `TestPlanBuilder.test_keep_and_cuts_are_complementary` |
 | 5. no unvalidated LLM number reaches audio | `TestLlmValidation`, `TestAgainstStubServer` |
 | 6. local models never overlap | **nothing** — structural only, read the two stages |
@@ -764,7 +821,7 @@ logs for inspection.
    README has the commands and the numbers a correct run produces.
 3. Read `<episode>_edit-report.txt` — cut counts and removed fraction are the
    cheapest signal that a threshold has drifted, and the warnings block is where
-   a VAD/transcript disagreement shows up.
+   a looping transcript shows up.
 4. If the change was anywhere near rendering, sample the audio, and check the
    invariants table above for what is guarding you.
 5. If a request payload changed, check that `LLM_CHECK_SCHEMA` still passes
@@ -782,22 +839,23 @@ logs for inspection.
 - One episode per run. Several in `INPUT_DIR` at once is an error, not a queue.
 - Mute rendering evaluates a per-frame expression over the whole track; with
   very many mutes on a long track it is the slowest part of a render.
-- Silero runs one track at a time regardless of `FFMPEG_JOBS`.
-- The two Silero implementations agree closely but not bit for bit, so a plan is
-  only exactly reproducible against the one that produced it. The VAD output
-  records which that was.
 - `filler` detection exists but is off by default, and covers only the
   non-lexical sounds. Crutches made of real words — *"well…"*, *"you know"*,
   *"né"* — are detected by no kind at all (§6).
 - Whisper removes some disfluencies during transcription, so `detect` can only
   work on what survives (§6). Its yield is lower than the raw speech would
   suggest, and nothing recovers the difference.
-- The VAD and the transcript can disagree about where speech is. The
-  disagreement is reported, never reconciled — neither side is reliable enough to
-  overrule the other (§8).
-- `SILENCE_THRESHOLD` is a single level for a whole episode. A recording whose
-  loudness varies across it has no single right answer; `VAD_BACKEND="silero"`
-  judges speech instead and is the better tool there.
+- **Nothing checks the transcript against the audio**, because the speech map is
+  derived from the transcript (§7). Audible material Whisper wrote nothing for —
+  laughter, a cough, a dropped filler — reads as silence and can be cut. Only the
+  shape of a looping transcript is still detectable.
+- **A whisper build that ignores the `vad_*` request fields is undetectable from
+  here.** It answers normally and transcribes the silence too, and what it invents
+  there becomes speech in the plan. `whisper-server --help | grep -c vad` should
+  report 8.
+- `SPEECH_PAD` is a single margin for a whole episode, and it is doing two jobs at
+  once: absorbing Whisper's timing error and setting how long a gap must be to
+  count. A recording where those want different values has no right answer.
 - Speaker attribution comes from track membership, not diarisation: bleed of one
   voice into another's mic is not separated, though the mute-over-crosstalk rule
   means it does no damage.
@@ -812,8 +870,10 @@ authority. The ones whose meaning is easy to get wrong:
 | `INPUT_EXTS` | a discovery filter only; the format never reaches the editing logic |
 | `OUTPUT_CODEC`/`OUTPUT_EXT` | the output format, unrelated to what came in |
 | `RESAMPLE_TO` | empty means a rate mismatch is an error, not that nothing happens |
-| `VAD_MIN_SILENCE` | detection *granularity* of the speech map, not the editing threshold |
-| `SILENCE_THRESHOLD` | ffmpeg backend only; errs low because cutting quiet speech is damage while keeping room tone is only a looser edit |
+| `WHISPER_VAD` | the only speech detection there is; off means silence gets transcribed and whatever is invented there becomes speech in the plan |
+| `WHISPER_VAD_MODEL` | local `whisper-cli` runs only — a server takes its own `-vm` at launch, which no request can override |
+| `SPEECH_PAD` | how far each word is widened before the union that makes the speech map; a gap needs `SILENCE_MIN_DURATION` **plus twice this** to be silence |
+| `SPLIT_SILENCE_THRESHOLD` | picks chunk boundaries for a long upload, nothing else; being wrong costs one word, not an edit |
 | `LLAMA_MODEL_NAME` | required by a router-mode server, ignored by a single-model one |
 | `SILENCE_MIN_DURATION` | how long a gap must be before it is worth shortening |
 | `SILENCE_KEEP` | quiet left behind in place of a shortened gap |

@@ -1,7 +1,7 @@
 # Podcast-Cleanup-LLM
 
 Set of scripts for cleaning up a multi-track podcast recording using FFMPEG,
-Silero, Whisper and llama.cpp.
+Whisper and llama.cpp.
 
 Takes the synchronised per-participant tracks of one episode, works out which
 stretches are dead air and which are speech disfluencies, and renders the tracks
@@ -41,7 +41,7 @@ entirely, so the edit keeps its breathing room instead of sounding gasped.
 | python3 | everything | standard library only |
 | whisper.cpp | the `transcribe` stage | `whisper-cli` locally, or a `whisper-server` endpoint |
 | llama.cpp | the `detect` stage | `llama-server` locally, or an endpoint |
-| `silero-vad` or `pysilero_vad` | only for `VAD_BACKEND=silero` | optional; the latter is 2 MB and needs no torch |
+| a Silero VAD model | the `transcribe` stage | `ggml-silero-*.bin`, run by whisper.cpp itself — no Python package |
 
 ## Where the models run
 
@@ -72,8 +72,16 @@ the timings are exact; one that ignores it returns sentence segments, and word
 positions inside them are interpolated, which makes stutter cuts less tight. The
 run warns when that happens. Local `whisper-cli` always gives per-token timings.
 Audio is uploaded in chunks (`WHISPER_CHUNK_SECONDS`, 0 for one request), with
-boundaries nudged onto silence the VAD stage already found so no chunk edge lands
-inside a word.
+boundaries nudged onto a quiet spot ffmpeg found so no chunk edge lands inside a
+word.
+
+**And one that matters more.** The words that come back are also the speech map —
+silence is where the transcript has none — so the server must be running Silero
+over the audio first, or it will transcribe the silence too and whatever it
+invents there will read as speech. `WHISPER_VAD=1` asks for that per request;
+what the server needs at launch is `-vm` (see below). A build too old to parse
+the `vad_*` form fields ignores them silently, and nothing on this side can tell:
+check `whisper-server --help | grep -c vad` reports 8.
 
 ## Running the servers
 
@@ -113,6 +121,7 @@ deliver an episode that had quietly found no edits at all.
 whisper-server \
     -m /srv/llm/models/whisper/ggml-large-v3-turbo.bin \
     --host 0.0.0.0 --port 8080 \
+    -vm /srv/llm/models/whisper/ggml-silero-v6.2.0.bin \
     -t "$(nproc)" \
     -ml 1 -sow \
     -fa
@@ -120,6 +129,32 @@ whisper-server \
 
 - **`--host 0.0.0.0`** — the default binds to localhost, which is the usual
   reason a "remote" server cannot be reached.
+- **`-vm <silero model>`** is the one this pipeline cannot work properly without.
+  It points at the Silero VAD model so the server can transcribe speech only;
+  fetch one with whisper.cpp's `models/download-vad-model.sh silero-v6.2.0`.
+  Everything *else* about the VAD travels per request, so nothing here needs
+  `--vad` at launch and other clients of the same server are unaffected:
+
+  | request field | set from | default here | whisper.cpp default |
+  | --- | --- | --- | --- |
+  | `vad` | `WHISPER_VAD` | `true` | `false` |
+  | `vad_threshold` | `WHISPER_VAD_THRESHOLD` | `0.5` | `0.5` |
+  | `vad_min_speech_duration_ms` | `WHISPER_VAD_MIN_SPEECH_MS` | `250` | `250` |
+  | `vad_min_silence_duration_ms` | `WHISPER_VAD_MIN_SILENCE_MS` | `1000` | `100` |
+  | `vad_speech_pad_ms` | `WHISPER_VAD_SPEECH_PAD_MS` | `300` | `30` |
+  | `vad_samples_overlap` | `WHISPER_VAD_SAMPLES_OVERLAP` | `0.1` | `0.1` |
+
+  The two that differ from upstream do so for the same reason in opposite
+  directions. `min_silence` is raised because 100 ms ends a segment at every
+  breath, and each segment then reaches Whisper with less of the context it
+  punctuates from. `speech_pad` is raised because a word's opening consonant is
+  quieter than the vowel behind it, so segment edges are where Silero errs — and
+  a clipped edge is a word that never reaches the transcript at all.
+
+  A build too old to parse those fields ignores them without complaint, and the
+  symptom is a transcript with invented speech in it. `whisper-server --help |
+  grep -c vad` should report 8. For a local `whisper-cli` run the same values go
+  through `WHISPER_VAD_MODEL` and the `-vm/-vt/-vspd/-vsd/-vp/-vo` flags instead.
 - **`-ml 1 -sow`** is the one that affects output quality. It makes every
   returned segment a single word, so word timings are exact rather than
   interpolated across a sentence, which is what decides how tightly a stutter
@@ -343,9 +378,9 @@ failure leaves them untouched. `--keep-inputs` and `--keep-work` opt out.
 
 ```
 discover    find the episode's tracks, probe them, agree on an episode id
-prepare     decode each track to 16 kHz mono (what Whisper and Silero want)
-vad         per-track speech detection
+prepare     decode each track to 16 kHz mono (what Whisper wants)
 transcribe  Whisper per track, to completion, then every process exits
+            (its Silero pass is what decides where speech is at all)
 detect      the LLM finds disfluencies; the server starts and stops here
 plan        unify silence and edits into cuts and mutes
 render      one ffmpeg pass per track, into staging, then verified
@@ -358,8 +393,7 @@ completion, so a failed run can be resumed rather than restarted:
 ```sh
 clean-podcast.sh --episode ep042 --from plan      # redo the edit decisions
 clean-podcast.sh --episode ep042 --only render    # just re-render
-clean-podcast.sh --stages discover,prepare,vad    # silence analysis only
-clean-podcast.sh --no-llm                         # skip the LLM stage
+clean-podcast.sh --no-llm                         # silence editing only
 clean-podcast.sh --dry-run                        # show the commands, touch nothing
 clean-podcast.sh --list-stages
 ```
@@ -396,16 +430,16 @@ word, so padding cannot eat into real speech.
 - Rendered durations are checked against a **frame-exact prediction** of what the
   filter graph will emit, not a rule of thumb. A mismatch fails the run and
   preserves the inputs.
-- **A silence cut swallowing transcribed words is reported.** The VAD's idea of
-  speech and the transcript's are independent, and when they disagree the output
-  hides it: the published transcript is rebuilt from the rendered timeline, so a
-  word cut away vanishes from both and the result still looks consistent. The
-  plan lists the words and the report warns. Either side can be the wrong one —
-  a level-based VAD misses quiet speech, and Whisper places words over
-  near-silence — so it warns rather than deciding, and `plan.json` keeps the
-  full list under `words_lost_to_silence` for a listen. Usually it means
-  `SILENCE_THRESHOLD` is too high for the recording, or that
-  `VAD_BACKEND="silero"` would suit it better.
+- **A looping transcript is reported.** Nothing compares the transcript against
+  the audio any more — the speech map is derived from the transcript, so the two
+  agree by construction. What is still visible is the shape of the failure:
+  handed something that is not speech, Whisper repeats itself rather than
+  inventing varied text. On the recording that prompted this it produced one
+  sentence 198 times across 4.6 minutes, 73% of a track whose mic was muted. A
+  run of eight words recurring five or more times, and accounting for a quarter
+  of a track, is warned about and recorded in `plan.json` under
+  `looping_transcripts`. Treat that transcript, the speech map derived from it,
+  and every edit built on it as unreliable until the audio has been listened to.
 - Mismatched sample rates, tracks from two different episodes, duplicate
   participants and unparseable filenames are all rejected up front.
 - On failure the work directory is kept, a `FAILED` marker is written, and the run
@@ -443,11 +477,11 @@ one real episode with `--keep-work` the first time.
 clean-podcast.sh              CLI, config, stage sequencing, failure handling
 lib/log.sh                    logging, progress, command execution
 lib/config.sh                 defaults, config loading, validation
-lib/stages.sh                 the eight stages, and the llama server lifecycle
+lib/stages.sh                 the seven stages, and the llama server lifecycle
 python/cleanup_cli.py         subcommands the shell calls
 python/cleanup/intervals.py   interval algebra and timeline remapping
-python/cleanup/vad.py         silencedetect parsing and Silero
-python/cleanup/transcript.py  Whisper tokens to words
+python/cleanup/silence.py     silencedetect parsing, for chunk boundaries only
+python/cleanup/transcript.py  Whisper tokens to words, and the speech map
 python/cleanup/asr.py         remote whisper-server client and chunking
 python/cleanup/llm.py         chunking, prompting, response validation
 python/cleanup/plan.py        the cut-versus-mute decision
@@ -461,17 +495,18 @@ and writes JSON and never touches audio.
 
 ## Tuning notes
 
-- `SILENCE_THRESHOLD` is the first thing to adjust if too much or too little is
-  being cut. The default `-45dB` errs on the safe side, since cutting quiet
-  speech is damage while leaving room tone is only a looser edit. Raise it
-  toward `-35dB` for a loud, close-mic'd recording. Read
-  `ep042_edit-report.txt` before trusting a run — and if it warns that a cut
-  swallowed transcribed words, this is the setting at fault.
+- `SPEECH_PAD` is the first thing to adjust if too much or too little is being
+  cut, and it is the only threshold left on this side. Each word is widened by it
+  before the union that makes the speech map, so a gap must clear
+  `SILENCE_MIN_DURATION` plus twice it before anything is removed. Raise it for
+  rarer, safer cuts; lower it for tighter ones. Read `ep042_edit-report.txt`
+  before trusting a run.
+- `WHISPER_VAD_THRESHOLD` is the other end of the same question, and it acts
+  earlier: it decides what Whisper transcribes at all, and therefore what exists
+  to be protected. Lower it if quiet speech is going missing from the transcript.
 - `INPUT_EXTS` is worth narrowing to just your own format if the input directory
   holds anything else you would rather not sweep up. The same participant present
   in two formats is an error, not a preference.
-- `VAD_BACKEND="silero"` is markedly better at telling speech from breathing and
-  room tone, at the cost of a torch dependency.
 - `LLM_ACCEPT_KINDS` excludes `filler` by default; removing every "um" tends to
   read as over-editing. Add it if you want that.
 - `RENDER_FRAME_SAMPLES` is the timing granularity of the edit (512 samples is

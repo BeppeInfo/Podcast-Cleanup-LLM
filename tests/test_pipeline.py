@@ -11,7 +11,6 @@ it gets checked rather than eyeballed.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import re
@@ -24,7 +23,7 @@ import wave
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
 from cleanup import intervals as iv
-from cleanup import asr, llm, plan as planner, render, transcript as tr, vad
+from cleanup import asr, llm, plan as planner, render, silence, transcript as tr
 # The CLI itself, for the exit codes the shell branches on. Importing is safe:
 # it only runs main() under __main__.
 import cleanup_cli as cli
@@ -106,158 +105,6 @@ class TestIntervals(unittest.TestCase):
             previous = value
 
 
-class TestSileroSegmentation(unittest.TestCase):
-    """Probabilities to speech intervals.
-
-    `silero-vad` does this inside `get_speech_timestamps`; `pysilero_vad` only
-    returns a probability per 32 ms chunk and leaves it to us. Both must agree,
-    so this is where the rules live and where they are pinned. Pure arithmetic,
-    so it runs everywhere — the Silero path had no automated coverage at all
-    before this.
-    """
-
-    STEP = 0.032  # what pysilero gives at 16 kHz: 512 samples
-
-    def segment(self, probs, **kw):
-        options = {"threshold": 0.5, "min_silence_ms": 200, "min_speech_ms": 120}
-        options.update(kw)
-        return vad.speech_from_probabilities(probs, self.STEP, **options)
-
-    def test_a_run_above_the_threshold_becomes_one_span(self):
-        # 10 chunks ≈ 0.32s of speech, padded by 30ms either side.
-        spans = self.segment([0.0] * 5 + [0.9] * 10 + [0.0] * 10)
-        self.assertEqual(len(spans), 1)
-        start, end = spans[0]
-        self.assertAlmostEqual(start, 5 * self.STEP - 0.030, places=3)
-        self.assertAlmostEqual(end, 15 * self.STEP + 0.030, places=3)
-
-    def test_a_brief_dip_does_not_split_a_word(self):
-        """Hysteresis: speech ends below threshold-0.15, not below threshold."""
-        probs = [0.9] * 10 + [0.42] * 2 + [0.9] * 10   # 0.42 is under 0.5...
-        spans = self.segment(probs)
-        # ...but above the 0.35 release level, so this is still one span.
-        self.assertEqual(len(spans), 1)
-
-    def test_a_long_enough_gap_does_split(self):
-        # 10 chunks of silence is 320ms, well past min_silence_ms=200.
-        spans = self.segment([0.9] * 10 + [0.0] * 10 + [0.9] * 10)
-        self.assertEqual(len(spans), 2)
-
-    def test_a_gap_shorter_than_min_silence_does_not(self):
-        # 4 chunks is 128ms, under the 200ms required to end a span.
-        spans = self.segment([0.9] * 10 + [0.0] * 4 + [0.9] * 10)
-        self.assertEqual(len(spans), 1)
-
-    def test_a_blip_shorter_than_min_speech_is_dropped(self):
-        # 2 chunks is 64ms, under min_speech_ms=120.
-        self.assertEqual(self.segment([0.0] * 5 + [0.9] * 2 + [0.0] * 20), [])
-
-    def test_speech_running_to_the_end_is_closed_at_the_duration(self):
-        spans = self.segment([0.0] * 5 + [0.9] * 10, duration=1.0)
-        self.assertEqual(len(spans), 1)
-        self.assertLessEqual(spans[0][1], 1.0)
-
-    def test_padding_never_runs_past_the_track(self):
-        spans = self.segment([0.9] * 10, duration=0.32)
-        self.assertGreaterEqual(spans[0][0], 0.0)
-        self.assertLessEqual(spans[0][1], 0.32)
-
-    def test_silence_throughout_is_no_speech(self):
-        self.assertEqual(self.segment([0.01] * 50), [])
-
-
-class TestSileroImplementationChoice(unittest.TestCase):
-    """Which package answers, and what happens when none can.
-
-    Order matters and is a decision, not an accident: the reference
-    implementation wins when installed, because asking for Silero usually means
-    that one and its segmentation is upstream's rather than our port.
-    """
-
-    def test_the_reference_implementation_is_preferred(self):
-        self.assertEqual(
-            [name for name, _ in vad.SILERO_IMPLEMENTATIONS],
-            ["silero-vad", "pysilero_vad"],
-        )
-
-    def _with_implementations(self, entries):
-        original = vad.SILERO_IMPLEMENTATIONS
-        vad.SILERO_IMPLEMENTATIONS = tuple(entries)
-        self.addCleanup(setattr, vad, "SILERO_IMPLEMENTATIONS", original)
-
-    def test_an_absent_package_falls_through_to_the_next(self):
-        def missing(*args):
-            raise ImportError("no module named whatever")
-
-        self._with_implementations(
-            [("first", missing), ("second", lambda *a: [(0.0, 1.0)])]
-        )
-        speech, used = vad.silero_speech("ignored.wav")
-        self.assertEqual(used, "second")
-        self.assertEqual(speech, [(0.0, 1.0)])
-
-    def test_no_implementation_at_all_names_both_and_the_way_out(self):
-        def missing(*args):
-            raise ImportError("nope")
-
-        self._with_implementations([("first", missing), ("second", missing)])
-        with self.assertRaises(SystemExit) as caught:
-            vad.silero_speech("ignored.wav")
-        message = str(caught.exception)
-        self.assertIn("first", message)
-        self.assertIn("second", message)
-        self.assertIn("VAD_BACKEND=ffmpeg", message)
-
-    def test_a_real_error_is_not_mistaken_for_an_absent_package(self):
-        """Only ImportError means 'try the next one'."""
-        def broken(*args):
-            raise SystemExit("wrong sample rate")
-
-        self._with_implementations(
-            [("first", broken), ("second", lambda *a: [(0.0, 1.0)])]
-        )
-        with self.assertRaises(SystemExit):
-            vad.silero_speech("ignored.wav")
-
-
-@unittest.skipUnless(
-    importlib.util.find_spec("pysilero_vad"), "pysilero_vad is not installed"
-)
-class TestPysileroWiring(unittest.TestCase):
-    """That the preferred implementation is reachable and returns sane output.
-
-    Not a test of Silero's judgement — synthetic audio has nothing to judge.
-    It checks the plumbing: chunk sizing, windowed reads, and that intervals
-    come back inside the track.
-    """
-
-    def _wav(self, seconds=1.5, rate=16000):
-        import struct
-        path = os.path.join(tempfile.mkdtemp(), "probe.wav")
-        with wave.open(path, "wb") as handle:
-            handle.setnchannels(1)
-            handle.setsampwidth(2)
-            handle.setframerate(rate)
-            handle.writeframes(
-                b"".join(struct.pack("<h", 0) for _ in range(int(seconds * rate)))
-            )
-        return path
-
-    def test_silence_yields_no_speech_and_names_the_implementation(self):
-        speech, implementation = vad.silero_speech(self._wav())
-        self.assertEqual(implementation, "pysilero_vad")
-        self.assertEqual(speech, [])
-
-    def test_a_length_that_is_not_a_whole_number_of_chunks_is_accepted(self):
-        """512 samples is 32ms; 1.5s is not a multiple, so the tail is partial."""
-        speech, _ = vad.silero_speech(self._wav(seconds=1.517))
-        self.assertEqual(speech, [])
-
-    def test_the_wrong_sample_rate_is_refused_rather_than_guessed(self):
-        with self.assertRaises(SystemExit):
-            vad.silero_speech(self._wav(rate=44100))
-
-
 class TestSilenceDetectParsing(unittest.TestCase):
     def test_pairs_events_in_order(self):
         log = """
@@ -267,7 +114,7 @@ class TestSilenceDetectParsing(unittest.TestCase):
         [silencedetect @ 0x1] silence_end: 9.25 | silence_duration: 1.25
         """
         self.assertEqual(
-            vad.parse_silencedetect(log, 10.0),
+            silence.parse_silencedetect(log, 10.0),
             [(0.0, 1.5), (3.0, 8.0), (9.25, 10.0)],
         )
 
@@ -275,15 +122,15 @@ class TestSilenceDetectParsing(unittest.TestCase):
         """The draft's zip() approach mispaired everything after this case."""
         log = "silence_start: 2.0\nsilence_end: 4.0\nsilence_start: 9.0\n"
         self.assertEqual(
-            vad.parse_silencedetect(log, 10.0), [(0.0, 2.0), (4.0, 9.0)]
+            silence.parse_silencedetect(log, 10.0), [(0.0, 2.0), (4.0, 9.0)]
         )
 
     def test_leading_silence(self):
         log = "silence_start: 0\nsilence_end: 2.5\n"
-        self.assertEqual(vad.parse_silencedetect(log, 6.0), [(2.5, 6.0)])
+        self.assertEqual(silence.parse_silencedetect(log, 6.0), [(2.5, 6.0)])
 
     def test_no_silence_at_all(self):
-        self.assertEqual(vad.parse_silencedetect("", 5.0), [(0.0, 5.0)])
+        self.assertEqual(silence.parse_silencedetect("", 5.0), [(0.0, 5.0)])
 
 
 def _whisper_segment(text, start_ms, end_ms, tokens):
@@ -660,6 +507,80 @@ class TestWavSlicing(unittest.TestCase):
         asr.slice_wav(source, 0.5, 99.0, target)
         sliced, _ = asr.wav_info(target)
         self.assertAlmostEqual(sliced, 0.5, places=6)
+
+
+class TestServerSideVadRequest(unittest.TestCase):
+    """What the transcribe request actually asks the server to do.
+
+    Worth pinning precisely, because a build that does not parse these fields
+    ignores them silently — httplib drops what it does not recognise — and the
+    only symptom is a transcript with invented speech in it. Nothing here can
+    detect that, so the least this can do is guarantee the request is right.
+    """
+
+    class _Recorder:
+        def __init__(self):
+            self.sent = []
+
+        def transcribe_file(self, path, fields):
+            self.sent.append(dict(fields))
+            return {"transcription": [{
+                "text": "hello",
+                "offsets": {"from": 0, "to": 500},
+            }]}
+
+    def _wav(self, seconds=2.0):
+        import struct
+        import wave as wavemod
+
+        path = os.path.join(tempfile.mkdtemp(), "track.wav")
+        with wavemod.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16000)
+            handle.writeframes(struct.pack("<h", 0) * int(seconds * 16000))
+        return path
+
+    def _fields(self, **kwargs):
+        recorder = self._Recorder()
+        asr.transcribe(recorder, self._wav(), "a", **kwargs)
+        return recorder.sent[0]
+
+    def test_vad_is_requested_by_default(self):
+        self.assertEqual(self._fields()["vad"], "true")
+
+    def test_the_tuning_parameters_travel_with_the_request(self):
+        fields = self._fields(vad_options={
+            "vad_threshold": 0.5,
+            "vad_min_speech_duration_ms": 250,
+            "vad_min_silence_duration_ms": 1000,
+            "vad_speech_pad_ms": 300,
+            "vad_samples_overlap": 0.1,
+        })
+        # Names are whisper-server's, spelled its way; a typo is a silent no-op.
+        self.assertEqual(fields["vad_threshold"], "0.5")
+        self.assertEqual(fields["vad_min_speech_duration_ms"], "250")
+        self.assertEqual(fields["vad_min_silence_duration_ms"], "1000")
+        self.assertEqual(fields["vad_speech_pad_ms"], "300")
+        self.assertEqual(fields["vad_samples_overlap"], "0.1")
+
+    def test_no_vad_sends_no_vad_field_at_all(self):
+        """Rather than vad=false, which an old build would also ignore."""
+        fields = self._fields(vad=False, vad_options={"vad_threshold": 0.5})
+        self.assertNotIn("vad", fields)
+        self.assertNotIn("vad_threshold", fields)
+
+    def test_word_timings_are_still_asked_for(self):
+        fields = self._fields()
+        self.assertEqual(fields["max_len"], "1")
+        self.assertEqual(fields["split_on_word"], "true")
+        self.assertEqual(fields["response_format"], "verbose_json")
+
+    def test_the_result_records_whether_vad_ran(self):
+        recorder = self._Recorder()
+        parsed = asr.transcribe(recorder, self._wav(), "a", vad=True)
+        self.assertTrue(parsed["server_vad"])
+        self.assertEqual(parsed["audio_seconds"], 2.0)
 
 
 class _StubLlamaServer:
@@ -1617,14 +1538,14 @@ def _meta(participants, duration):
     }
 
 
-class TestVadTranscriptDisagreement(unittest.TestCase):
-    """Words the VAD calls silence but the transcript calls speech.
+class TestSpeechFromWords(unittest.TestCase):
+    """The speech map, derived from the transcript rather than from the audio.
 
-    Found on a real recording: at the -35dB threshold that used to be the
-    default, a quiet phrase measured -39.2dB, so the VAD cut it as silence while
-    Whisper had transcribed it. Nothing noticed, because the published transcript is rebuilt from the
-    rendered timeline — the word simply vanishes from both and the output stays
-    self-consistent. Synthetic audio cannot reach this: its silence is digital.
+    Whisper runs Silero itself and only transcribes what it calls speech, so the
+    words that come back carry that judgement and nothing here looks at the audio
+    a second time. What this pins down is the padding, which is the only knob
+    left: it decides how much of Whisper's timing error a cut may eat, and how
+    long a gap has to be before it counts as silence at all.
     """
 
     def _words(self, spec):
@@ -1633,131 +1554,66 @@ class TestVadTranscriptDisagreement(unittest.TestCase):
             for i, (t, s, e) in enumerate(spec)
         ]
 
-    def test_a_word_inside_a_silence_cut_is_reported(self):
-        # Speech either side of a long gap; a word sits in the middle of the gap
-        # because the VAD never heard it.
-        speech = {"a": [(0.0, 4.0), (14.0, 20.0)]}
-        words = {"a": self._words([("hello", 1.0, 2.0), ("quiet", 8.0, 8.6),
-                                   ("goodbye", 15.0, 16.0)])}
-        result = planner.build_plan(_meta(["a"], 20.0), speech, {}, words, PARAMS)
+    def test_each_word_becomes_a_padded_span(self):
+        speech = tr.speech_from_words(
+            self._words([("hello", 5.0, 5.5)]), 20.0, pad=0.25
+        )
+        self.assertEqual(speech, [(4.75, 5.75)])
 
-        lost = result["words_lost_to_silence"]["a"]
-        self.assertEqual([w["text"] for w in lost], ["quiet"])
-        self.assertEqual(result["stats"]["per_participant"]["a"]["words_lost_to_silence"], 1)
-        warning = next(w for w in result["warnings"] if "quiet" in w)
-        self.assertIn("SILENCE_THRESHOLD", warning)
-        self.assertIn("silero", warning)
-
-    def test_the_advice_follows_the_backend_in_use(self):
-        """Telling a silero run to switch to silero is worse than saying nothing."""
-        speech = {"a": [(0.0, 4.0), (14.0, 20.0)]}
-        words = {"a": self._words([("quiet", 8.0, 8.6)])}
-        params = dict(PARAMS, vad_backend="silero")
-        result = planner.build_plan(_meta(["a"], 20.0), speech, {}, words, params)
-        warning = next(w for w in result["warnings"] if "quiet" in w)
-        self.assertIn("SILERO_THRESHOLD", warning)
-        self.assertNotIn("VAD_BACKEND=silero", warning)
-        self.assertNotIn("SILENCE_THRESHOLD", warning)
-
-    def test_words_an_edit_asked_to_remove_are_not_reported(self):
-        """The LLM stage removes words on purpose; that is not a disagreement."""
-        speech = {"a": [(0.0, 20.0)]}
-        words = {"a": self._words([("I", 10.0, 10.3), ("I", 10.35, 10.7),
-                                   ("think", 11.0, 11.5)])}
-        edits = {"a": [{"first": 0, "last": 1, "kind": "stutter", "confidence": 0.9,
-                        "start": 10.0, "end": 10.7, "text": "I I"}]}
-        result = planner.build_plan(_meta(["a"], 20.0), speech, edits, words, PARAMS)
-        self.assertEqual(result["words_lost_to_silence"], {})
-        self.assertFalse([w for w in result["warnings"] if "fall inside cuts" in w])
-
-    def test_a_word_clipped_at_the_edge_of_a_cut_is_not_reported(self):
-        """Cut padding routinely grazes the neighbouring word; that is normal."""
-        speech = {"a": [(0.0, 4.0), (14.0, 20.0)]}
-        # Ends 0.05s inside the gap, so only a sliver is taken.
-        words = {"a": self._words([("trailing", 3.5, 4.05)])}
-        result = planner.build_plan(_meta(["a"], 20.0), speech, {}, words, PARAMS)
-        self.assertEqual(result["words_lost_to_silence"], {})
-
-    def test_no_transcript_means_nothing_to_compare(self):
-        speech = {"a": [(0.0, 4.0), (14.0, 20.0)]}
-        result = planner.build_plan(_meta(["a"], 20.0), speech, {}, {}, PARAMS)
-        self.assertEqual(result["words_lost_to_silence"], {})
-
-
-class TestSpeechOnlyChunking(unittest.TestCase):
-    """Silence is withheld from Whisper, because it invents text over it.
-
-    The recording behind this had a muted mic transcribed as one sentence
-    repeated 198 times across 4.6 minutes. Language settings did not change it —
-    the output was byte-identical — so the fix is not to send the silence.
-    """
-
-    def test_silence_between_speech_is_never_sent(self):
-        speech = [(10.0, 20.0), (280.0, 300.0)]
-        chunks = asr.plan_speech_chunks(600.0, 600.0, speech)
-        covered = sum(end - start for start, end in chunks)
-        # Only the speech, plus a padding margin at each edge.
-        self.assertEqual(len(chunks), 2)
-        self.assertLess(covered, 40.0)
-        # The 260s of dead air between them is not in any chunk.
-        for start, end in chunks:
-            self.assertFalse(start < 150.0 < end)
-
-    def test_short_pauses_do_not_fragment_a_region(self):
-        """Splitting on every breath would multiply requests and lose context."""
-        speech = [(10.0, 20.0), (21.0, 30.0), (31.0, 40.0)]
-        chunks = asr.plan_speech_chunks(600.0, 600.0, speech)
-        self.assertEqual(len(chunks), 1)
-        self.assertLessEqual(chunks[0][0], 10.0)
-        self.assertGreaterEqual(chunks[0][1], 40.0)
-
-    def test_speech_is_padded_so_a_boundary_cannot_clip_a_word(self):
-        chunks = asr.plan_speech_chunks(600.0, 600.0, [(100.0, 110.0)])
-        start, end = chunks[0]
-        self.assertLess(start, 100.0)
-        self.assertGreater(end, 110.0)
-        self.assertAlmostEqual(start, 100.0 - asr.SPEECH_PAD, places=6)
+    def test_adjacent_words_fuse_into_one_region(self):
+        speech = tr.speech_from_words(
+            self._words([("one", 5.0, 5.4), ("two", 5.5, 5.9)]), 20.0, pad=0.25
+        )
+        self.assertEqual(speech, [(4.75, 6.15)])
 
     def test_padding_never_runs_past_the_track(self):
-        chunks = asr.plan_speech_chunks(30.0, 600.0, [(0.0, 30.0)])
-        self.assertEqual(chunks, [(0.0, 30.0)])
+        speech = tr.speech_from_words(
+            self._words([("edge", 0.1, 0.4), ("end", 19.8, 20.0)]), 20.0, pad=0.25
+        )
+        self.assertEqual(speech[0][0], 0.0)
+        self.assertEqual(speech[-1][1], 20.0)
 
-    def test_a_long_region_is_still_split_for_upload(self):
-        speech = [(0.0, 1800.0)]
-        chunks = asr.plan_speech_chunks(1800.0, 600.0, speech)
-        self.assertGreater(len(chunks), 1)
-        # Contiguous, and covering the speech exactly once.
-        for before, after in zip(chunks, chunks[1:]):
-            self.assertAlmostEqual(before[1], after[0], places=6)
-        self.assertAlmostEqual(chunks[0][0], 0.0)
-        self.assertAlmostEqual(chunks[-1][1], 1800.0)
+    def test_a_gap_must_clear_the_padding_on_both_sides(self):
+        """Which is why the effective silence threshold is min_duration + 2*pad."""
+        words = self._words([("before", 4.0, 5.0), ("after", 7.0, 8.0)])
+        speech = tr.speech_from_words(words, 20.0, pad=0.25)
+        gap = speech[1][0] - speech[0][1]
+        self.assertAlmostEqual(gap, 2.0 - 0.5, places=6)
 
-    def test_an_empty_speech_map_transcribes_everything(self):
-        """A silent VAD is far likelier to be misconfigured than correct.
+    def test_no_words_is_no_speech(self):
+        self.assertEqual(tr.speech_from_words([], 20.0), [])
+        self.assertEqual(tr.speech_from_words(None, 20.0), [])
 
-        Transcribing nothing would produce a well-formed empty transcript and
-        hide the misconfiguration; the plan stage already warns about a track
-        with no speech, so the honest fallback is to send the audio.
-        """
-        self.assertEqual(asr.plan_speech_chunks(600.0, 600.0, []), [(0.0, 600.0)])
-        self.assertEqual(asr.plan_speech_chunks(600.0, 600.0, None), [(0.0, 600.0)])
+    def test_unusable_timings_are_skipped_not_guessed(self):
+        words = [
+            {"i": 0, "text": "fine", "start": 1.0, "end": 2.0},
+            {"i": 1, "text": "broken", "start": None, "end": 4.0},
+            {"i": 2, "text": "missing"},
+            {"i": 3, "text": "backwards", "start": 9.0, "end": 8.0},
+        ]
+        self.assertEqual(tr.speech_from_words(words, 20.0, pad=0.0), [(1.0, 2.0)])
 
-    def test_it_matches_the_real_episode(self):
-        """Against this track's actual VAD, most of it should go unsent."""
-        # host: 3m18s of speech in a 600s track, the rest hallucinated over.
-        speech = [(0.0, 5.0), (300.0, 310.0), (595.0, 600.0)]
-        chunks = asr.plan_speech_chunks(600.0, 600.0, speech)
-        covered = sum(end - start for start, end in chunks)
-        self.assertLess(covered / 600.0, 0.1)
+    def test_an_interpolated_segment_tiles_its_whole_span(self):
+        """So silence inside it is invisible — losing a cut, never inventing one."""
+        segment = {
+            "text": "one two three four",
+            "offsets": {"from": 0, "to": 10000},
+            "tokens": [{"text": " one", "offsets": {"from": 0, "to": 0}}],
+        }
+        parsed = tr.build_from_segments([segment], "a")
+        self.assertEqual(parsed["approximated_segments"], 1)
+        speech = tr.speech_from_words(parsed["words"], 10.0, pad=0.0)
+        self.assertEqual(speech, [(0.0, 10.0)])
 
 
-class TestHallucinatedTranscript(unittest.TestCase):
-    """A track whose transcript its own audio does not support.
+class TestLoopingTranscript(unittest.TestCase):
+    """What replaces comparing a transcript against an independent speech map.
 
-    Taken from a real episode: Whisper was given a mic that was silent while the
-    other speaker talked, and looped one sentence 198 times over 4.6 minutes —
-    73% of that track. Every check the pipeline had stayed quiet, because they
-    all key off cuts, and no cut is made where another track has speech.
+    There is no independent map any more: it is derived from the transcript, so
+    the two agree by construction. The failure is still detectable in the
+    transcript alone, because Whisper handed something that is not speech does
+    not invent varied text — it repeats. On the episode behind this it produced
+    one sentence 198 times across 4.6 minutes, 73% of that track.
     """
 
     def _meta(self, duration=600.0):
@@ -1771,69 +1627,83 @@ class TestHallucinatedTranscript(unittest.TestCase):
         return {
             "silence_min_duration": 1.5, "silence_keep": 0.4, "edge_keep": 0.25,
             "cut_padding": 0.1, "min_cut": 0.15, "mute_fade": 0.03,
-            "max_cut_fraction": 0.5, "vad_backend": "silero",
+            "max_cut_fraction": 0.5, "speech_pad": 0.25,
         }
 
-    def _loop(self, count, start, step=0.2):
-        """`count` words over a stretch, the way a looping Whisper emits them."""
-        phrase = ["I", "lost", "my", "train", "of", "thought", "here."]
+    def _loop(self, repeats, start, step=0.2):
+        """One phrase over and over, the way a looping Whisper emits it."""
+        phrase = ["I", "lost", "my", "train", "of", "thought", "here", "again"]
         return [
             {"i": index, "text": phrase[index % len(phrase)],
              "start": start + index * step, "end": start + index * step + step * 0.8,
              "segment": 0}
-            for index in range(count)
+            for index in range(repeats * len(phrase))
         ]
 
-    def test_a_track_transcribed_over_its_own_silence_is_reported(self):
-        # host says nothing for the whole window; guest talks throughout, so no
-        # all-track silence exists and nothing is ever cut.
-        words = {"host": self._loop(300, 100.0), "guest": []}
-        speech = {"host": [(0.0, 5.0)], "guest": [(90.0, 200.0)]}
+    def _speech(self, words):
+        return {
+            name: tr.speech_from_words(track, 600.0, pad=0.25)
+            for name, track in words.items()
+        }
+
+    def test_a_looping_track_is_reported(self):
+        words = {"host": self._loop(40, 100.0), "guest": []}
         plan = planner.build_plan(
-            self._meta(), speech, {"host": [], "guest": []}, words, self._params()
+            self._meta(), self._speech(words), {"host": [], "guest": []},
+            words, self._params(),
         )
         warning = " ".join(plan["warnings"])
-        self.assertIn("of host's transcript", warning)
-        self.assertIn("no speech at all", warning)
-        self.assertIn("lost my train of thought", warning)
+        self.assertIn("host's transcript repeats", warning)
+        self.assertIn("i lost my train of thought here again", warning)
+        self.assertIn("WHISPER_VAD", warning)
 
-        # The old cut-based check cannot see this: there is nothing to cut.
-        self.assertEqual(plan["words_lost_to_silence"], {})
-        self.assertEqual(plan["stats"]["per_participant"]["host"]["words_lost_to_silence"], 0)
-        # The new one counts every phantom word, and records a readable sample.
-        record = plan["words_without_speech"]["host"]
-        self.assertEqual(record["count"], 300)
-        self.assertEqual(record["of"], 300)
-        self.assertLessEqual(len(record["sample"]), 20)
-        self.assertEqual(plan["stats"]["per_participant"]["host"]["words_without_speech"], 300)
+        record = plan["looping_transcripts"]["host"]
+        self.assertEqual(record["repeats"], 40)
+        self.assertEqual(record["words"], 320)
 
-    def test_a_transcript_its_track_supports_raises_nothing(self):
-        words = {"host": self._loop(300, 100.0), "guest": []}
-        speech = {"host": [(90.0, 200.0)], "guest": [(90.0, 200.0)]}
+    def test_the_real_shape_is_caught(self):
+        """198 repetitions over 73% of the track, which is what happened."""
+        words = {"host": self._loop(198, 60.0) + self._loop(20, 400.0), "guest": []}
         plan = planner.build_plan(
-            self._meta(), speech, {"host": [], "guest": []}, words, self._params()
+            self._meta(), self._speech(words), {"host": [], "guest": []},
+            words, self._params(),
         )
-        self.assertNotIn(
-            "no speech at all", " ".join(plan["warnings"])
-        )
-        self.assertEqual(plan["words_without_speech"], {})
+        self.assertIn("host", plan["looping_transcripts"])
 
-    def test_a_few_words_over_a_vad_boundary_are_not_worth_a_warning(self):
-        """Below the threshold this must stay silent, or it cries wolf.
-
-        Clipping the odd quiet consonant is normal; a warning on every episode
-        is a warning nobody reads.
-        """
-        words = {"host": self._loop(100, 100.0), "guest": []}
-        # All but the last handful sit inside detected speech.
-        speech = {"host": [(99.0, 118.0)], "guest": [(90.0, 200.0)]}
+    def test_ordinary_speech_raises_nothing(self):
+        words = {
+            "host": [
+                {"i": i, "text": f"word{i}", "start": 10.0 + i * 0.4,
+                 "end": 10.3 + i * 0.4, "segment": 0}
+                for i in range(200)
+            ],
+            "guest": [],
+        }
         plan = planner.build_plan(
-            self._meta(), speech, {"host": [], "guest": []}, words, self._params()
+            self._meta(), self._speech(words), {"host": [], "guest": []},
+            words, self._params(),
         )
-        outside = plan["stats"]["per_participant"]["host"]["words_without_speech"]
-        self.assertGreater(outside, 0)
-        self.assertLess(outside / 100, planner.UNSUPPORTED_WORD_WARN_FRACTION)
-        self.assertNotIn("no speech at all", " ".join(plan["warnings"]))
+        self.assertEqual(plan["looping_transcripts"], {})
+        self.assertNotIn("repeats", " ".join(plan["warnings"]))
+
+    def test_a_catchphrase_is_not_a_loop(self):
+        """A repeated phrase has to account for a real share of the track."""
+        phrase = self._loop(6, 20.0)
+        filler = [
+            {"i": 1000 + i, "text": f"other{i}", "start": 200.0 + i * 0.4,
+             "end": 200.3 + i * 0.4, "segment": 1}
+            for i in range(400)
+        ]
+        words = {"host": phrase + filler, "guest": []}
+        plan = planner.build_plan(
+            self._meta(), self._speech(words), {"host": [], "guest": []},
+            words, self._params(),
+        )
+        self.assertEqual(plan["looping_transcripts"], {})
+
+    def test_a_transcript_too_short_to_judge_is_left_alone(self):
+        words = {"host": self._loop(2, 10.0), "guest": []}
+        self.assertEqual(planner.looping_words(["host"], words), {})
 
 
 class TestPlanBuilder(unittest.TestCase):
@@ -2002,9 +1872,12 @@ class TestPlanBuilder(unittest.TestCase):
             any("safety limit" in w for w in result["warnings"]), result["warnings"]
         )
 
-    def test_no_speech_at_all_is_flagged(self):
+    def test_no_words_at_all_is_flagged(self):
+        """An empty speech map now means an empty transcript, so it says so."""
         result = planner.build_plan(_meta(["a"], 30.0), {"a": []}, {}, {}, PARAMS)
-        self.assertTrue(any("no speech" in w for w in result["warnings"]))
+        warning = " ".join(result["warnings"])
+        self.assertIn("transcribed a single word", warning)
+        self.assertIn("whisper endpoint", warning)
 
     def test_report_renders(self):
         speech = {"a": [(0.0, 10.0), (15.0, 20.0)]}
@@ -2222,7 +2095,7 @@ class TestFinalTranscript(unittest.TestCase):
             "duration": 30.0,
             "participants": ["a", "b"],
             "cuts": [{"start": 10.0, "end": 20.0, "reasons": ["silence"],
-                      "sources": ["vad"], "details": []}],
+                      "sources": ["silence"], "details": []}],
             "mutes": {"a": [{"start": 3.0, "end": 4.0, "reasons": ["stutter"],
                              "text": "I I"}], "b": []},
             "keep": [[0.0, 10.0], [20.0, 30.0]],

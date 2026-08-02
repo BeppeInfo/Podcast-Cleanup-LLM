@@ -3,10 +3,16 @@
 # Offline end-to-end check.
 #
 # Builds a synthetic two-track "episode" with silences in known places, runs the
-# real pipeline over it in a sandbox, and checks the results. Whisper and
-# llama.cpp are skipped, so this needs nothing but ffmpeg and python3 — it
-# exercises the parts that actually touch audio, which are the parts that are
-# awkward to reason about on paper.
+# real pipeline over it in a sandbox, and checks the results. It needs nothing
+# but ffmpeg and python3 — the models are stubbed over HTTP — and it exercises
+# the parts that actually touch audio, which are the parts that are awkward to
+# reason about on paper.
+#
+# Transcription is stubbed rather than skipped, because there is nothing left to
+# skip it to: the pipeline no longer detects speech from the audio. Whisper's own
+# Silero pass decides what gets transcribed and the speech map is derived from
+# the words that come back, so a synthetic episode needs a synthetic transcript,
+# and each case generates one that agrees with the tone in its audio.
 #
 # The synthetic episode is 30 seconds long:
 #
@@ -16,7 +22,9 @@
 #
 # Every internal gap is 1 s, below the 1.5 s threshold, so the only cut should
 # be the 1 s tail — which makes the arithmetic easy to check by hand. A second
-# pass then widens one gap to prove that shortening works too.
+# pass then widens one gap to prove that shortening works too. Those cases pin
+# SPEECH_PAD to 0 so the arithmetic stays the transcript's own; case 11 is where
+# the padding itself is checked.
 
 set -euo pipefail
 
@@ -118,16 +126,109 @@ build_episode() {
     make_track "$incoming/${episode}_bob.flac" 48000 "$duration" "$b_windows"
 }
 
+# --- stub whisper -------------------------------------------------------------
+#
+# Speech is no longer detected from the audio: Whisper's own Silero pass decides
+# what gets transcribed, and the pipeline derives its speech map from the words
+# that come back. So a synthetic episode needs a synthetic transcript, and the
+# two have to agree — the tone is in the audio for the render checks to measure,
+# and the words say where that tone is.
+#
+# Windows are written once, as "start,end start,end", and both the audio
+# expression and the canned transcript are generated from them.
+
+# windows_expr "0,4 10,14" -> between(t,0,4)+between(t,10,14)
+windows_expr() {
+    local expr="" window
+    for window in $1; do
+        [[ -n "$expr" ]] && expr+="+"
+        expr+="between(t,${window%,*},${window#*,})"
+    done
+    printf '%s' "$expr"
+}
+
+# whisper_responses <target.json> <name=windows> ...
+# One reply per track, keyed by the prepared track's filename, each speech window
+# becoming a run of one-word segments. One word per segment is what max_len=1
+# gives on a real server, and it makes every word timing exact rather than
+# interpolated across a sentence.
+whisper_responses() {
+    local target="$1"; shift
+    python3 - "$target" "$@" <<'PY'
+import json, sys
+
+target, tracks = sys.argv[1], sys.argv[2:]
+WORD = 0.5
+replies = {}
+for spec in tracks:
+    name, _, windows = spec.partition("=")
+    segments = []
+    for window in windows.split():
+        start, end = (float(value) for value in window.split(","))
+        moment = start
+        while moment < end - 1e-9:
+            stop = min(moment + WORD, end)
+            segments.append({
+                "text": f"w{len(segments)}",
+                "offsets": {
+                    "from": int(round(moment * 1000)),
+                    "to": int(round(stop * 1000)),
+                },
+            })
+            moment = stop
+    replies[f"{name}.wav"] = {"transcription": segments}
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(replies, handle)
+PY
+}
+
+WHISPER_STUB_PID=""
+WHISPER_STUB_ENDPOINT=""
+
+start_whisper_stub() {
+    local responses="$1"
+    stop_whisper_stub
+    local port_file="$SANDBOX/whisper-port-$$-$CHECKS"
+    rm -f "$port_file"
+    python3 "$ROOT/tests/stub_servers.py" whisper \
+        --responses "$responses" --port-file "$port_file" \
+        ${2:+--request-log "$2"} >/dev/null 2>&1 &
+    WHISPER_STUB_PID=$!
+    local waited=0
+    while [[ ! -f "$port_file" ]]; do
+        sleep 0.05
+        waited=$(( waited + 1 ))
+        if (( waited > 200 )); then
+            printf 'stub whisper server did not start\n' >&2
+            return 1
+        fi
+    done
+    WHISPER_STUB_ENDPOINT="http://127.0.0.1:$(cat "$port_file")"
+}
+
+stop_whisper_stub() {
+    if [[ -n "$WHISPER_STUB_PID" ]]; then
+        kill "$WHISPER_STUB_PID" 2>/dev/null || true
+        wait "$WHISPER_STUB_PID" 2>/dev/null || true
+        WHISPER_STUB_PID=""
+    fi
+}
+
+trap 'stop_whisper_stub; cleanup' EXIT
+
 run_pipeline() {
     local incoming="$1" output="$2" work="$3"; shift 3
-    # Whisper and llama.cpp are out of scope here, so their stages are left out
-    # of the list entirely rather than stubbed.
+    # llama.cpp is out of scope here, so the detect stage is left out of the list
+    # entirely rather than stubbed. Transcription cannot be: the speech map comes
+    # from the transcript now, so the stub whisper server is part of the pipeline
+    # under test rather than a convenience.
     # --root keeps everything this run might write inside the sandbox, including
     # the directories the three explicit options do not name — FAILED_DIR, which
     # the cases that fail on purpose write their logs to.
     "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
         --input "$incoming" --output "$output" --work "$work" \
-        --stages discover,prepare,vad,plan,render,finalize \
+        --whisper-endpoint "$WHISPER_STUB_ENDPOINT" \
+        --stages discover,prepare,transcribe,plan,render,finalize \
         --no-llm --quiet "$@"
 }
 
@@ -139,9 +240,14 @@ printf '%sCase 1: gaps below the threshold are left alone%s\n' "$BOLD" "$RESET"
 # ============================================================================
 
 CASE1="$SANDBOX/case1"
-A_WINDOWS='between(t,0,4)+between(t,10,14)+between(t,20,24)'
-B_WINDOWS='between(t,5,9)+between(t,15,19)+between(t,25,29)'
+A_SPEECH='0,4 10,14 20,24'
+B_SPEECH='5,9 15,19 25,29'
+A_WINDOWS="$(windows_expr "$A_SPEECH")"
+B_WINDOWS="$(windows_expr "$B_SPEECH")"
 build_episode ep001 "$CASE1/incoming" "$A_WINDOWS" "$B_WINDOWS" 30
+whisper_responses "$SANDBOX/case1.words.json" \
+    "alice=$A_SPEECH" "bob=$B_SPEECH"
+start_whisper_stub "$SANDBOX/case1.words.json" "$SANDBOX/case1.requests.jsonl"
 
 CONF="$SANDBOX/case1.conf"
 cat >"$CONF" <<'EOF'
@@ -150,9 +256,10 @@ SILENCE_KEEP="0.40"
 EDGE_KEEP="0.25"
 CUT_PADDING="0.10"
 MIN_CUT="0.15"
-VAD_MIN_SILENCE="0.30"
-SILENCE_THRESHOLD="-35dB"
 RENDER_FRAME_SAMPLES="512"
+# Zero, so the gap arithmetic below is the transcript's own and can be checked by
+# hand. Case 11 covers what the padding does.
+SPEECH_PAD="0"
 EOF
 
 if run_pipeline "$CASE1/incoming" "$CASE1/output" "$CASE1/work" \
@@ -182,20 +289,39 @@ if [[ -f "$PLAN1" ]]; then
     check "removed ≈ 0.75 s" approx "$REMOVED" 0.75 0.06
     fail_note "cuts=$CUT_COUNT removed=${REMOVED}s"
 
-    # A cut that lands inside anybody's speech would be a serious bug.
-    check "no cut overlaps speech" python3 -c '
+    # A cut that lands inside anybody's speech would be a serious bug. Checked
+    # against the words themselves rather than the plan's own map, so a mistake
+    # in deriving that map cannot hide here.
+    check "no cut overlaps a transcribed word" python3 -c '
 import json, sys
 plan = json.load(open(sys.argv[1]))
-speech = []
+words = []
 for path in sys.argv[2:]:
-    speech += [tuple(s) for s in json.load(open(path))["speech"]]
+    words += [(w["start"], w["end"], w["text"])
+              for w in json.load(open(path))["words"]]
 for cut in plan["cuts"]:
-    for start, end in speech:
+    for start, end, text in words:
         overlap = min(cut["end"], end) - max(cut["start"], start)
         if overlap > 0.02:
-            print(f"cut {cut} overlaps speech {(start, end)} by {overlap:.3f}s")
+            print(f"cut {cut} overlaps word {text} {(start, end)} by {overlap:.3f}s")
             sys.exit(1)
-' "$PLAN1" "$CASE1/work/ep001/vad/alice.json" "$CASE1/work/ep001/vad/bob.json"
+' "$PLAN1" "$CASE1/work/ep001/words/alice.words.json" \
+  "$CASE1/work/ep001/words/bob.words.json"
+
+    check "server-side VAD was actually requested" python3 -c '
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    record = json.loads(line)
+    values = record.get("values") or {}
+    if values.get("vad") != "true":
+        print("request", record["index"], "did not ask for VAD:", values)
+        sys.exit(1)
+    for field in ("vad_threshold", "vad_min_silence_duration_ms",
+                  "vad_speech_pad_ms"):
+        if field not in values:
+            print("request", record["index"], "left out", field, ":", values)
+            sys.exit(1)
+' "$SANDBOX/case1.requests.jsonl"
 fi
 
 if [[ -s "$OUT1/alice.flac" && -s "$OUT1/bob.flac" ]]; then
@@ -217,9 +343,13 @@ printf '\n%sCase 2: a long silence is shortened, not removed%s\n' "$BOLD" "$RESE
 
 CASE2="$SANDBOX/case2"
 # Nobody speaks between 8 s and 18 s: a 10 s gap that must shrink to 0.4 s.
-A2='between(t,0,4)+between(t,18,22)'
-B2='between(t,4,8)+between(t,22,26)'
-build_episode ep002 "$CASE2/incoming" "$A2" "$B2" 30
+A2_SPEECH='0,4 18,22'
+B2_SPEECH='4,8 22,26'
+build_episode ep002 "$CASE2/incoming" \
+    "$(windows_expr "$A2_SPEECH")" "$(windows_expr "$B2_SPEECH")" 30
+whisper_responses "$SANDBOX/case2.words.json" \
+    "alice=$A2_SPEECH" "bob=$B2_SPEECH"
+start_whisper_stub "$SANDBOX/case2.words.json"
 
 if run_pipeline "$CASE2/incoming" "$CASE2/output" "$CASE2/work" \
     --config "$CONF" --keep-work >"$SANDBOX/case2.stdout" 2>&1
@@ -241,7 +371,7 @@ if len(inner) != 1:
     sys.exit(1)
 cut = inner[0]
 length = cut["end"] - cut["start"]
-# A 10 s gap keeping 0.4 s leaves a 9.6 s cut, give or take VAD boundaries.
+# A 10 s gap keeping 0.4 s leaves a 9.6 s cut, give or take word boundaries.
 if not 9.0 <= length <= 9.8:
     print(f"internal cut is {length:.3f}s, expected about 9.6s")
     sys.exit(1)
@@ -265,7 +395,10 @@ printf '\n%sCase 3: safety rails%s\n' "$BOLD" "$RESET"
 CASE3="$SANDBOX/case3"
 # Two brief bursts in 60 s: cutting this to the threshold would remove most of
 # the episode, which must be refused rather than silently accepted.
-build_episode ep003 "$CASE3/incoming" 'between(t,1,2)' 'between(t,58,59)' 60
+build_episode ep003 "$CASE3/incoming" \
+    "$(windows_expr '1,2')" "$(windows_expr '58,59')" 60
+whisper_responses "$SANDBOX/case3.words.json" "alice=1,2" "bob=58,59"
+start_whisper_stub "$SANDBOX/case3.words.json"
 
 if run_pipeline "$CASE3/incoming" "$CASE3/output" "$CASE3/work" \
     --config "$CONF" --keep-work >"$SANDBOX/case3.stdout" 2>&1
@@ -296,6 +429,9 @@ printf '\n%sCase 4: dry run touches nothing%s\n' "$BOLD" "$RESET"
 
 CASE4="$SANDBOX/case4"
 build_episode ep004 "$CASE4/incoming" "$A_WINDOWS" "$B_WINDOWS" 30
+# A dry run sends nothing, so the case 1 replies serve; the stub is restarted
+# only so a failure here cannot be blamed on case 3's leftovers.
+start_whisper_stub "$SANDBOX/case1.words.json"
 
 if run_pipeline "$CASE4/incoming" "$CASE4/output" "$CASE4/work" \
     --config "$CONF" --dry-run >"$SANDBOX/case4.stdout" 2>&1
@@ -316,8 +452,8 @@ printf '\n%sCase 5: mismatched sample rates are rejected%s\n' "$BOLD" "$RESET"
 
 CASE5="$SANDBOX/case5"
 mkdir -p "$CASE5/incoming"
-make_track "$CASE5/incoming/ep005_alice.flac" 48000 10 'between(t,0,5)'
-make_track "$CASE5/incoming/ep005_bob.flac"   44100 10 'between(t,5,9)'
+make_track "$CASE5/incoming/ep005_alice.flac" 48000 10 "$(windows_expr '0,5')"
+make_track "$CASE5/incoming/ep005_bob.flac"   44100 10 "$(windows_expr '5,9')"
 
 if run_pipeline "$CASE5/incoming" "$CASE5/output" "$CASE5/work" \
     --config "$CONF" >"$SANDBOX/case5.stdout" 2>&1
@@ -338,15 +474,20 @@ printf '\n%sCase 6: a stutter over crosstalk is muted, not cut%s\n' "$BOLD" "$RE
 # Bob is talking (4-6 s). Cutting there would take a bite out of Bob, so instead
 # Alice's track alone is silenced and the timeline is left exactly as it was.
 #
-# Whisper and the LLM are not available here, so their outputs are injected
-# directly — the point under test is what the plan and the render do with them.
+# The LLM is not available here, and the transcript is written by hand rather
+# than through the stub, because these exact word timings are the point. Note
+# that the words now carry two jobs: they are what the LLM edit refers to, and
+# they are the speech map — so they have to cover the audio the tracks actually
+# contain, or the plan would read the untranscribed parts as silence and cut
+# them.
 
 CASE6="$SANDBOX/case6"
-# Both speak throughout, so there is no silence anywhere to cut.
-build_episode ep006 "$CASE6/incoming" 'between(t,0,20)' 'between(t,4,6)' 20
+# Both speak throughout their windows, so there is no silence anywhere to cut.
+build_episode ep006 "$CASE6/incoming" \
+    "$(windows_expr '0,20')" "$(windows_expr '4,6')" 20
 
 run_pipeline "$CASE6/incoming" "$CASE6/output" "$CASE6/work" \
-    --config "$CONF" --keep-work --stages discover,prepare,vad \
+    --config "$CONF" --keep-work --stages discover,prepare \
     >"$SANDBOX/case6a.stdout" 2>&1 \
     || { check "case 6 setup" false; fail_note "$(tail -n 20 "$SANDBOX/case6a.stdout")"; }
 
@@ -355,17 +496,36 @@ python3 - "$WORK6" <<'INJECT'
 import json, os, sys
 
 work = sys.argv[1]
-# Alice says "a ... eu eu acho": words 1 and 2 are the accidental repetition.
-words = [
-    {"i": 0, "text": "a",    "start": 3.00, "end": 3.20, "segment": 0},
-    {"i": 1, "text": "eu",   "start": 5.00, "end": 5.25, "segment": 0},
-    {"i": 2, "text": "eu",   "start": 5.25, "end": 5.50, "segment": 0},
-    {"i": 3, "text": "acho", "start": 7.00, "end": 7.50, "segment": 0},
+
+# Alice talks across the whole 20 s — every 0.5 s, so her speech map covers the
+# tone — except at 5.0, where "eu eu" is the accidental repetition the LLM found.
+words = []
+moment = 0.0
+stutter = []
+# The 4.5 and 5.5 slots are left empty so the stutter has ordinary room around
+# it: a neighbouring word 0.1 s away would cap the cut padding at half that gap
+# and the mute would come out narrower than CUT_PADDING asked for. Both gaps stay
+# under SILENCE_MIN_DURATION, so neither becomes a silence cut.
+while moment < 20.0 - 1e-9:
+    if abs(moment - 5.0) < 1e-9:
+        for half in (0.0, 0.25):
+            stutter.append(len(words))
+            words.append({"i": len(words), "text": "eu",
+                          "start": 5.0 + half, "end": 5.25 + half, "segment": 0})
+    elif abs(moment - 4.5) < 1e-9 or abs(moment - 5.5) < 1e-9:
+        pass
+    else:
+        words.append({"i": len(words), "text": f"w{len(words)}",
+                      "start": moment, "end": moment + 0.4, "segment": 0})
+    moment += 0.5
+
+# Bob speaks 4-6, which is what makes alice's 5.0-5.5 stutter crosstalk.
+bob = [
+    {"i": 0, "text": "sim",   "start": 4.0, "end": 4.9, "segment": 0},
+    {"i": 1, "text": "claro", "start": 5.0, "end": 6.0, "segment": 0},
 ]
-for name, payload in (
-    ("alice", words),
-    ("bob", [{"i": 0, "text": "sim", "start": 4.5, "end": 5.0, "segment": 0}]),
-):
+
+for name, payload in (("alice", words), ("bob", bob)):
     json.dump(
         {
             "participant": name,
@@ -388,8 +548,8 @@ json.dump(
         "chunk_failures": 0,
         "rejected_count": 0,
         "edits": [{
-            "first": 1, "last": 2, "kind": "repetition", "confidence": 0.95,
-            "start": 5.0, "end": 5.5, "text": "eu eu",
+            "first": stutter[0], "last": stutter[1], "kind": "repetition",
+            "confidence": 0.95, "start": 5.0, "end": 5.5, "text": "eu eu",
         }],
     },
     open(os.path.join(work, "llm", "alice.edits.json"), "w"),
@@ -459,7 +619,7 @@ alice = " ".join(s["text"] for s in data["segments"] if s["participant"] == "ali
 if "eu" in alice.split():
     print(f"muted words are still in the transcript: {alice!r}")
     sys.exit(1)
-if "acho" not in alice:
+if "w0" not in alice.split():
     print(f"surviving words went missing: {alice!r}")
     sys.exit(1)
 ' "$OUT6/ep006_transcript.json"
@@ -476,37 +636,68 @@ printf '\n%sCase 7: the full pipeline against remote Whisper and remote LLM%s\n'
 # repetition Alice makes while Bob is talking has to end up muted, not cut.
 
 CASE7="$SANDBOX/case7"
-build_episode ep007 "$CASE7/incoming" 'between(t,0,20)' 'between(t,4,6)' 20
+build_episode ep007 "$CASE7/incoming" \
+    "$(windows_expr '0,20')" "$(windows_expr '4,6')" 20
 
-# whisper-server verbose_json, one word per segment (what max_len=1 produces).
-cat >"$SANDBOX/whisper-replies.json" <<'EOF'
-[
-  {"task": "transcribe", "language": "pt", "duration": 20.0,
-   "text": " a eu eu acho",
-   "segments": [
-     {"id": 0, "start": 3.00, "end": 3.20, "text": " a"},
-     {"id": 1, "start": 5.00, "end": 5.25, "text": " eu"},
-     {"id": 2, "start": 5.25, "end": 5.50, "text": " eu"},
-     {"id": 3, "start": 7.00, "end": 7.50, "text": " acho"}
-   ]},
-  {"task": "transcribe", "language": "pt", "duration": 20.0,
-   "text": " sim",
-   "segments": [
-     {"id": 0, "start": 4.50, "end": 5.00, "text": " sim"}
-   ]}
+# Both stubs' replies, generated together because they have to agree: the LLM
+# names the repetition by word index, so the indices depend on the transcript the
+# whisper stub hands back. That transcript also has to cover the tone in the
+# audio — it is the speech map now, and anything it leaves out reads as silence
+# and gets cut.
+python3 - "$SANDBOX" <<'REPLIES'
+import json, os, sys
+
+sandbox = sys.argv[1]
+
+# whisper-server verbose_json, one word per segment (what max_len=1 produces),
+# in the OpenAI-ish start/end shape rather than whisper.cpp's own offsets — the
+# client accepts several, and this is the one nothing else covers.
+alice, stutter = [], []
+moment = 0.0
+# 4.5 and 5.5 are left empty for the same reason as case 6: room for the cut
+# padding, without either gap reaching SILENCE_MIN_DURATION.
+while moment < 20.0 - 1e-9:
+    if abs(moment - 5.0) < 1e-9:
+        for half in (0.0, 0.25):
+            stutter.append(len(alice))
+            alice.append({"id": len(alice), "start": 5.0 + half,
+                          "end": 5.25 + half, "text": " eu"})
+    elif abs(moment - 4.5) < 1e-9 or abs(moment - 5.5) < 1e-9:
+        pass
+    else:
+        alice.append({"id": len(alice), "start": moment,
+                      "end": moment + 0.4, "text": f" w{len(alice)}"})
+    moment += 0.5
+
+bob = [
+    {"id": 0, "start": 4.0, "end": 4.9, "text": " sim"},
+    {"id": 1, "start": 5.0, "end": 6.0, "text": " claro"},
 ]
-EOF
+
+with open(os.path.join(sandbox, "whisper-replies.json"), "w") as handle:
+    json.dump([
+        {"task": "transcribe", "language": "pt", "duration": 20.0,
+         "text": " ".join(s["text"].strip() for s in alice), "segments": alice},
+        {"task": "transcribe", "language": "pt", "duration": 20.0,
+         "text": " ".join(s["text"].strip() for s in bob), "segments": bob},
+    ], handle)
 
 # The model's replies. The first is consumed by the startup schema check, which
 # sends one tiny constrained request before any track is analysed; the rest are
 # the tracks in processing order (alice, then bob).
-cat >"$SANDBOX/llama-replies.json" <<'EOF'
-[
-  {"edits": []},
-  {"edits": [{"first": 1, "last": 2, "kind": "repetition", "confidence": 0.95}]},
-  {"edits": []}
-]
-EOF
+with open(os.path.join(sandbox, "llama-replies.json"), "w") as handle:
+    json.dump([
+        {"edits": []},
+        {"edits": [{"first": stutter[0], "last": stutter[1],
+                    "kind": "repetition", "confidence": 0.95}]},
+        {"edits": []},
+    ], handle)
+
+with open(os.path.join(sandbox, "case7-stutter.txt"), "w") as handle:
+    handle.write(f"{stutter[0]} {stutter[1]}\n")
+REPLIES
+
+read -r STUTTER_FIRST STUTTER_LAST < "$SANDBOX/case7-stutter.txt"
 
 start_stub() {  # start_stub <role> <responses> <port-file> <request-log>
     python3 "$ROOT/tests/stub_servers.py" "$1" \
@@ -529,7 +720,7 @@ L_PORT_FILE="$SANDBOX/llama.port"
 W_PID=$(start_stub whisper "$SANDBOX/whisper-replies.json" "$W_PORT_FILE" "$SANDBOX/whisper-requests.jsonl")
 L_PID=$(start_stub llama "$SANDBOX/llama-replies.json" "$L_PORT_FILE" "$SANDBOX/llama-requests.jsonl")
 stop_stubs() { kill "$W_PID" "$L_PID" 2>/dev/null || true; }
-trap 'stop_stubs; cleanup' EXIT
+trap 'stop_stubs; stop_whisper_stub; cleanup' EXIT
 
 if wait_for_port_file "$W_PORT_FILE" && wait_for_port_file "$L_PORT_FILE"; then
     check "stub servers started" true
@@ -586,15 +777,16 @@ for row in rows:
 check "remote segments became word timings" python3 -c '
 import json, sys
 data = json.load(open(sys.argv[1]))
-texts = [w["text"] for w in data["words"]]
-if texts != ["a", "eu", "eu", "acho"]:
-    print("unexpected words:", texts)
+first, last = (int(v) for v in sys.argv[2:4])
+words = data["words"]
+if [w["text"] for w in words[first:last + 1]] != ["eu", "eu"]:
+    print("the repetition is not where the LLM was told it was:", words[first:last + 2])
     sys.exit(1)
-spans = [(w["start"], w["end"]) for w in data["words"]]
-if spans != [(3.0, 3.2), (5.0, 5.25), (5.25, 5.5), (7.0, 7.5)]:
+spans = [(w["start"], w["end"]) for w in words[first:last + 1]]
+if spans != [(5.0, 5.25), (5.25, 5.5)]:
     print("timings did not survive the round trip:", spans)
     sys.exit(1)
-' "$WORK7/words/alice.words.json"
+' "$WORK7/words/alice.words.json" "$STUTTER_FIRST" "$STUTTER_LAST"
 
 check "the LLM was asked through the chat endpoint, with a JSON schema" python3 -c '
 import json, sys
@@ -656,7 +848,7 @@ if [[ -s "$OUT7/alice.flac" && -s "$OUT7/bob.flac" ]]; then
 fi
 
 stop_stubs
-trap cleanup EXIT
+trap 'stop_whisper_stub; cleanup' EXIT
 
 # ============================================================================
 printf '\n%sCase 8: input format is independent of output format%s\n' "$BOLD" "$RESET"
@@ -686,6 +878,9 @@ else
     make_track_as "$CASE8/incoming/ep008_bob.wav" pcm_s16le "" 48000 30 "$B_WINDOWS"
 fi
 fail_note "alice=wav bob=$BOB_KIND, output requested as flac"
+
+# Same speech windows as case 1, so the same canned transcript fits.
+start_whisper_stub "$SANDBOX/case1.words.json"
 
 CONF8="$SANDBOX/case8.conf"
 cat "$CONF" >"$CONF8"
@@ -818,8 +1013,9 @@ printf '\n%sCase 9: the same participant in two formats is refused%s\n' "$BOLD" 
 
 CASE9="$SANDBOX/case9"
 mkdir -p "$CASE9/incoming"
-make_track "$CASE9/incoming/ep009_alice.flac" 48000 10 'between(t,0,5)'
-make_track_as "$CASE9/incoming/ep009_alice.wav" pcm_s16le "" 48000 10 'between(t,0,5)'
+make_track "$CASE9/incoming/ep009_alice.flac" 48000 10 "$(windows_expr '0,5')"
+make_track_as "$CASE9/incoming/ep009_alice.wav" pcm_s16le "" 48000 10 \
+    "$(windows_expr '0,5')"
 
 if run_pipeline "$CASE9/incoming" "$CASE9/output" "$CASE9/work" \
     --config "$CONF8" >"$SANDBOX/case9.stdout" 2>&1
@@ -845,6 +1041,8 @@ CASE10="$SANDBOX/case10"
 mkdir -p "$CASE10/incoming"
 make_track "$CASE10/incoming/ep010_alice.flac" 48000 30 "$A_WINDOWS"
 make_track "$CASE10/incoming/ep010_bob.flac"   44100 30 "$B_WINDOWS"
+# Case 1's windows again, so its transcript fits both tracks.
+start_whisper_stub "$SANDBOX/case1.words.json"
 
 if run_pipeline "$CASE10/incoming" "$CASE10/output" "$CASE10/work" \
     --config "$CONF" >"$SANDBOX/case10a.stdout" 2>&1
@@ -885,6 +1083,56 @@ if [[ -s "$OUT10/alice.flac" && -s "$OUT10/bob.flac" ]]; then
         'head -c 200 "$1" | grep -q "aresample=48000,asetnsamples"' \
         _ "$CASE10/work/ep010/render/bob.filter"
 fi
+
+# ============================================================================
+printf '\n%sCase 11: SPEECH_PAD decides what counts as a gap%s\n' "$BOLD" "$RESET"
+# ============================================================================
+#
+# The only threshold left. Whisper's word timings are approximate, so each word
+# is widened before the union that makes the speech map, and a gap has to clear
+# SILENCE_MIN_DURATION *plus twice the padding* before it is silence. Here the
+# gap is 1.8 s: a cut at SPEECH_PAD=0, nothing at 0.25, same audio and same
+# transcript both times.
+
+CASE11="$SANDBOX/case11"
+A11_SPEECH='0,10'
+B11_SPEECH='11.8,20'
+whisper_responses "$SANDBOX/case11.words.json" \
+    "alice=$A11_SPEECH" "bob=$B11_SPEECH"
+start_whisper_stub "$SANDBOX/case11.words.json"
+
+internal_cuts() {  # internal_cuts <plan.json>
+    python3 -c '
+import json, sys
+plan = json.load(open(sys.argv[1]))
+print(len([c for c in plan["cuts"] if "silence" in c["reasons"]]))
+' "$1"
+}
+
+for PAD in 0 0.25; do
+    SLUG="${PAD/./_}"
+    build_episode ep011 "$CASE11/incoming-$SLUG" \
+        "$(windows_expr "$A11_SPEECH")" "$(windows_expr "$B11_SPEECH")" 20
+    CONF11="$SANDBOX/case11-$SLUG.conf"
+    cat "$CONF" >"$CONF11"
+    printf 'SPEECH_PAD="%s"\n' "$PAD" >>"$CONF11"
+
+    if run_pipeline "$CASE11/incoming-$SLUG" "$CASE11/output-$SLUG" \
+        "$CASE11/work-$SLUG" --config "$CONF11" --keep-work \
+        >"$SANDBOX/case11-$SLUG.stdout" 2>&1
+    then
+        CUTS11=$(internal_cuts "$CASE11/work-$SLUG/ep011/plan.json")
+        if [[ "$PAD" == 0 ]]; then
+            check "an unpadded 1.8s gap is a cut" test "$CUTS11" = "1"
+        else
+            check "the same gap padded to 1.3s is left alone" test "$CUTS11" = "0"
+        fi
+        fail_note "SPEECH_PAD=$PAD -> $CUTS11 internal cut(s)"
+    else
+        check "case 11 run at SPEECH_PAD=$PAD" false
+        fail_note "$(tail -n 20 "$SANDBOX/case11-$SLUG.stdout")"
+    fi
+done
 
 # ============================================================================
 

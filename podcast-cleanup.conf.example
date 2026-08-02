@@ -87,8 +87,8 @@ WHISPER_API_KEY=""
 #WHISPER_API_KEY_FILE="/etc/podcast-cleanup/whisper.key"
 
 # Audio is uploaded in chunks of this many seconds; 0 sends the whole track in
-# one request. Boundaries are nudged onto the middle of a silence found by the
-# VAD stage, so a chunk edge does not land inside a word. Chunking also means
+# one request. Boundaries are nudged onto the middle of a quiet spot ffmpeg
+# found, so a chunk edge does not land inside a word. Chunking also means
 # progress is reported as the run goes rather than only at the end.
 WHISPER_CHUNK_SECONDS="600"
 WHISPER_REQUEST_TIMEOUT="1800"
@@ -105,6 +105,48 @@ WHISPER_LANG="auto"
 
 # Passed through verbatim, e.g. --prompt for domain vocabulary.
 WHISPER_EXTRA_ARGS=""
+
+# --------------------------------------------------- Whisper's Silero pass --
+
+# This is the only speech detection in the pipeline, and it does two jobs at
+# once. Whisper transcribes only what Silero calls speech — handed silence it
+# invents text, and loops a phrase while doing it — and the plan then derives its
+# speech map from the words that come back. So what is silence to cut, and what
+# is speech to protect, is decided here.
+#
+# Turning this off means silence is transcribed too, and whatever Whisper invents
+# over it becomes speech in the plan, because nothing else looks at the audio.
+WHISPER_VAD="1"
+
+# A remote whisper-server is given the Silero model at launch and cannot be told
+# per request, so this is for local whisper-cli runs only:
+#
+#     whisper-server -m <model> --host 0.0.0.0 --port 8081 \
+#         -vm /srv/llm/models/whisper/ggml-silero-v6.2.0.bin
+#
+# Fetch one with whisper.cpp's models/download-vad-model.sh silero-v6.2.0. Every
+# other setting below travels with each request, so the same server serves runs
+# that want different values, and other clients of it are unaffected.
+WHISPER_VAD_MODEL="/srv/llm/models/whisper/ggml-silero-v6.2.0.bin"
+
+# Speech probability above which Silero calls a frame speech. whisper.cpp's own
+# default.
+WHISPER_VAD_THRESHOLD="0.5"
+WHISPER_VAD_MIN_SPEECH_MS="250"
+
+# How long silence must last before it ends a speech segment. whisper.cpp
+# defaults to 100 ms, which splits on every breath: each segment then reaches
+# Whisper with less of its surroundings, and Whisper punctuates from context. So
+# this sits well past a natural pause instead. It is also the knob that decides
+# how finely the derived speech map is broken up.
+WHISPER_VAD_MIN_SILENCE_MS="1000"
+
+# Margin added to each end of a speech segment. whisper.cpp defaults to 30 ms; a
+# word's opening consonant is quieter than the vowel behind it, so segment edges
+# are exactly where Silero errs, and a clipped edge here is a word that never
+# reaches the transcript at all.
+WHISPER_VAD_SPEECH_PAD_MS="300"
+WHISPER_VAD_SAMPLES_OVERLAP="0.1"
 
 # Local Whisper never runs at the same time as a locally managed llama-server:
 # every track is transcribed and the process exits before the LLM stage begins.
@@ -203,42 +245,31 @@ LLM_CONCURRENCY="1"
 
 # ------------------------------------------------------- silence definition --
 
-# "ffmpeg"  — silencedetect, level based. No extra dependencies.
-# "silero"  — Silero VAD, speech based, and markedly better at not mistaking
-#             breathing or room tone for speech (or speech for silence). Worth
-#             the dependency if levels vary across an episode.
+# Silence is where the transcript has no words. There is no separate detector and
+# no threshold to tune: Whisper's Silero pass (above) decided what to transcribe,
+# and the speech map is the padded union of the words it returned.
 #
-# "silero" is satisfied by either of two packages, whichever is installed:
+# Every word is widened by this much before that union, which prices every cut. A
+# gap between words has to exceed SILENCE_MIN_DURATION *plus twice this* before it
+# is silence at all, and the padding is also how much of Whisper's timing error a
+# cut is not allowed to eat. Whisper's word boundaries sit within a couple of
+# hundred milliseconds of the truth, and further out where a segment arrived
+# without per-token timings and its words had to be spread across it evenly.
 #
-#   silero-vad     the reference implementation, and the one used when both are
-#                  present. Pulls in torch and torchaudio, about 970 MB.
-#   pysilero_vad   the same model as a 2 MB ggml build with no dependencies at
-#                  all, and roughly twice as fast. Worth preferring unless you
-#                  want the reference segmentation exactly; to use it while
-#                  silero-vad is also installed, point PYTHON_BIN at an
-#                  interpreter that only has pysilero_vad.
-#
-# They agree closely — on the test sample both find the same five speech spans
-# with every boundary inside one 32 ms chunk of the other — but not bit for bit,
-# so the VAD output records which one ran.
-VAD_BACKEND="ffmpeg"
+# Raise it for rarer, more conservative cuts; lower it for tighter, more numerous
+# ones. At 0 a cut may start at the exact millisecond Whisper claims a word ended.
+SPEECH_PAD="0.25"
 
-# Anything quieter than this counts as silence, for the ffmpeg backend.
+# Where a long track may be split into upload chunks. Nothing here decides what
+# is speech, so it only has to find *a* quiet spot, not judge one — the cost of
+# getting it wrong is one word damaged at one boundary, not a wrong edit.
 #
-# It belongs below the quietest speech and above the noise floor. On a real
-# recording here, speech ran from -21dB down to -39dB over a floor near -50dB:
-# -35dB sat inside that speech range and cut the quiet end of it, -45dB clears it.
-#
-# It errs low on purpose, because the two mistakes do not cost the same. Too high
-# and quiet speech is cut, which is damage you only find by listening; too low and
-# some room tone survives, which is merely a less tight edit.
-#
-# Raise it toward -35dB for a loud, close-mic'd recording where more silence
-# should go; drop it toward -55dB for a quiet one. The run now warns when a
-# silence cut swallows words the transcript has, which is the signal that this
-# is set too high.
-SILENCE_THRESHOLD="-45dB"
-SILERO_THRESHOLD="0.5"
+# The threshold errs low on purpose: too high and a split lands in quiet speech;
+# too low and it simply falls at the nominal position instead. On a real recording
+# here, speech ran from -21dB down to -39dB over a floor near -50dB, so -45dB
+# clears the quiet end of speech.
+SPLIT_SILENCE_THRESHOLD="-45dB"
+SPLIT_MIN_SILENCE="0.30"
 
 # A stretch of time counts as silence only when *no* track has speech in it.
 # Gaps longer than SILENCE_MIN_DURATION are shortened to SILENCE_KEEP rather
@@ -249,7 +280,7 @@ SILENCE_KEEP="0.40"
 # Silence kept at the very beginning and end of the episode.
 EDGE_KEEP="0.25"
 
-# Speech margin preserved either side of every cut, guarding against a VAD
+# Speech margin preserved either side of every cut, guarding against a word
 # boundary that clips a consonant.
 CUT_PADDING="0.10"
 

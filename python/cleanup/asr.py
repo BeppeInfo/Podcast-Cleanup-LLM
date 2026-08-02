@@ -5,12 +5,19 @@ is the alternative: POST the prepared audio to a `whisper-server` `/inference`
 endpoint and convert whatever comes back into the same segment shape, so
 `transcript.build_from_segments` reassembles words identically either way.
 
-Two things make this more than a plain upload.
+Three things make this more than a plain upload.
+
+**Server-side VAD.** whisper.cpp runs Silero over the audio and transcribes only
+what it calls speech. Asking for that is the whole reason this pipeline no longer
+detects speech itself: handed silence, Whisper invents text and loops a phrase
+while doing it. The parameters travel per request, so a shared server needs
+nothing at launch but `-vm` pointing at the Silero model — `vad_model` is the one
+setting the request cannot carry.
 
 **Chunking.** A two-hour track is ~230 MB of 16 kHz mono PCM, and sending it as
 one request means no progress for however long the server takes. It is split
-instead — and the split points are chosen inside silence the VAD stage already
-found, so a chunk boundary does not land in the middle of a word.
+instead, on quiet spots ffmpeg found, so a boundary does not land mid-word. That
+hint is only ever used to choose a split point — never as a speech map.
 
 **Tolerant parsing.** whisper-server's response shape has varied between
 versions and `response_format` values. Rather than pin one, several shapes are
@@ -39,17 +46,18 @@ MIN_CHUNK_SECONDS = 20.0
 # --- chunk planning -----------------------------------------------------------
 
 
-def plan_audio_chunks(duration: float, target: float, speech=None):
+def plan_audio_chunks(duration: float, target: float, loud=None):
     """Split [0, duration) into chunks of roughly `target` seconds.
 
-    Where the VAD's speech map is available, each boundary is nudged onto the
-    middle of a nearby silence, so no word is cut in half. Without it, or when
-    no silence is close enough, the boundary falls where it falls.
+    `loud` is the non-silent stretches ffmpeg reported, and each boundary is
+    nudged onto the middle of a nearby quiet spot so no word is cut in half.
+    Without it, or when no quiet spot is close enough, the boundary falls where
+    it falls: one damaged word every `target` seconds, at a known position.
     """
     if target <= 0 or duration <= target:
         return [(0.0, duration)]
 
-    silence = iv.complement(iv.normalize(speech or []), 0.0, duration)
+    silence = iv.complement(iv.normalize(loud or []), 0.0, duration)
     chunks: list[tuple[float, float]] = []
     cursor = 0.0
 
@@ -76,62 +84,6 @@ def plan_audio_chunks(duration: float, target: float, speech=None):
         cursor = split
 
     chunks.append((cursor, duration))
-    return chunks
-
-
-# Pauses shorter than this stay inside a speech region rather than splitting it.
-# Cutting on every breath would multiply the requests and strip the surrounding
-# context Whisper uses to punctuate, and it buys nothing: a two-second pause is
-# not what it hallucinates over.
-SPEECH_MERGE_GAP = 2.0
-
-# Margin kept either side of every speech region. The VAD's boundaries are its
-# own judgement, and a word's opening consonant is usually quieter than the
-# vowel behind it, so the edges are exactly where it errs.
-SPEECH_PAD = 0.5
-
-
-def plan_speech_chunks(duration: float, target: float, speech=None):
-    """Chunks covering only what this track's VAD calls speech.
-
-    Whisper invents text when handed silence, and loops a phrase while doing it:
-    on the recording this was written for it produced one sentence 198 times
-    across 4.6 minutes of a muted mic — 73% of that track — and every stage
-    downstream then worked faithfully on fiction. The cheapest defence is to
-    stop sending it the silence.
-
-    Regions are padded and fused before use, so the cost of the VAD being
-    slightly wrong at a boundary is a little extra silence rather than a
-    clipped word.
-
-    Falls back to covering everything when there is no speech map, or when the
-    map is empty. An empty map is far more likely to be a misconfigured VAD than
-    a genuinely silent track, and transcribing nothing would hide that behind an
-    empty transcript that looks perfectly well-formed.
-    """
-    spans = iv.normalize(speech or [])
-    if not spans:
-        return plan_audio_chunks(duration, target, speech)
-
-    regions = iv.normalize(
-        [(max(0.0, s - SPEECH_PAD), min(duration, e + SPEECH_PAD)) for s, e in spans],
-        gap=SPEECH_MERGE_GAP,
-    )
-
-    chunks: list[tuple[float, float]] = []
-    for start, end in regions:
-        span = end - start
-        if target <= 0 or span <= target:
-            chunks.append((start, end))
-            continue
-        # Too long for one request: split it with the usual boundary logic,
-        # working in region-local time and shifting back onto the timeline.
-        local = [
-            (max(0.0, s - start), min(span, e - start))
-            for s, e in spans if e > start and s < end
-        ]
-        for lo, hi in plan_audio_chunks(span, target, local):
-            chunks.append((start + lo, start + hi))
     return chunks
 
 
@@ -387,27 +339,27 @@ def transcribe(
     *,
     language: str = "auto",
     chunk_seconds: float = 600.0,
-    speech=None,
+    loud=None,
     temperature: float = 0.0,
     retries: int = 1,
     on_progress=None,
-    skip_silence: bool = True,
+    vad: bool = True,
+    vad_options: dict | None = None,
 ) -> dict:
     """Transcribe one prepared track, returning the parsed words structure.
 
-    `skip_silence` sends only the stretches this track's own VAD calls speech.
-    It is on by default because the alternative is inviting hallucination, but
-    it does mean speech the VAD missed is never transcribed at all — so how much
-    was skipped comes back in the result, and the caller says so out loud.
+    `vad` asks the server to run Silero first and transcribe only speech. It is
+    on by default because the alternative is inviting hallucination — and
+    because everything downstream reads the returned words as this track's
+    speech map, so silence reaching the model would become speech in the plan.
+
+    `loud` is ffmpeg's non-silent stretches, used only to place chunk
+    boundaries.
     """
     from . import transcript as tr
 
     duration, _ = wav_info(wav_path)
-    chunks = (
-        plan_speech_chunks(duration, chunk_seconds, speech)
-        if skip_silence
-        else plan_audio_chunks(duration, chunk_seconds, speech)
-    )
+    chunks = plan_audio_chunks(duration, chunk_seconds, loud)
 
     fields = {
         "response_format": "verbose_json",
@@ -420,6 +372,13 @@ def transcribe(
     }
     if language and language != "auto":
         fields["language"] = language
+    if vad:
+        # Older server builds parse none of these and httplib ignores what it
+        # does not know, so an unsupported build looks exactly like a working
+        # one until the transcript arrives full of invented speech. Nothing here
+        # can tell the difference; the readiness check reports what it can.
+        fields["vad"] = "true"
+        fields.update({key: str(value) for key, value in (vad_options or {}).items()})
 
     segments: list[dict] = []
     workdir = tempfile.mkdtemp(prefix="podcast-asr-")
@@ -462,12 +421,9 @@ def transcribe(
     segments.sort(key=lambda segment: segment["offsets"]["from"])
     parsed = tr.build_from_segments(segments, participant)
     parsed["chunks"] = len(chunks)
-    # What was actually put in front of the model. Worth recording because the
-    # difference between this and the track length is audio nothing will ever
-    # transcribe: if the VAD was wrong, the words are simply missing, and there
-    # is nothing in the transcript itself to show for it.
-    covered = sum(end - start for start, end in chunks)
+    # The whole track went to the server; what it chose to transcribe is the
+    # server's VAD decision, and the plan stage measures it by deriving the
+    # speech map from these words.
     parsed["audio_seconds"] = round(duration, 3)
-    parsed["transcribed_seconds"] = round(min(covered, duration), 3)
-    parsed["skipped_seconds"] = round(max(0.0, duration - covered), 3)
+    parsed["server_vad"] = bool(vad)
     return parsed

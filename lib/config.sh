@@ -51,7 +51,8 @@ config_defaults() {
     : "${WHISPER_API_KEY:=}"
     : "${WHISPER_API_KEY_FILE:=}"
     # Audio is uploaded in chunks of this many seconds (0 sends the whole
-    # track). Boundaries are nudged into silence found by the VAD stage.
+    # track). Boundaries are nudged onto a quiet spot ffmpeg found, so a split
+    # does not land mid-word.
     : "${WHISPER_CHUNK_SECONDS:=600}"
     : "${WHISPER_REQUEST_TIMEOUT:=1800}"
 
@@ -59,13 +60,31 @@ config_defaults() {
     : "${WHISPER_MODEL:=/srv/llm/models/whisper/ggml-large-v3-turbo.bin}"
     : "${WHISPER_THREADS:=$(nproc 2>/dev/null || echo 4)}"
     : "${WHISPER_LANG:=auto}"
-    # Send only the stretches the VAD calls speech, rather than the whole track.
-    # Whisper invents text over silence and loops a phrase while doing it, so the
-    # silence is worth withholding. The cost is that speech the VAD missed is
-    # never transcribed at all, which is why the stage reports how much it
-    # skipped. Set to 0 to send everything, the way this worked before.
-    : "${WHISPER_SKIP_SILENCE:=1}"
     : "${WHISPER_EXTRA_ARGS:=}"
+
+    # Whisper's own Silero pass ----------------------------------------------
+    # This is the only speech detection in the pipeline. Whisper transcribes just
+    # what Silero calls speech, and the plan derives its speech map from the words
+    # that come back — so these settings decide both what gets transcribed and
+    # what counts as silence to cut. Turning it off (0) means silence is
+    # transcribed too, and whatever Whisper invents there becomes speech in the
+    # plan, because nothing else looks at the audio.
+    : "${WHISPER_VAD:=1}"
+    # The Silero model. A remote server takes it at launch (-vm) and cannot be
+    # told per request, so this is for local whisper-cli runs only; get one with
+    # whisper.cpp's models/download-vad-model.sh.
+    : "${WHISPER_VAD_MODEL:=/srv/llm/models/whisper/ggml-silero-v6.2.0.bin}"
+    : "${WHISPER_VAD_THRESHOLD:=0.5}"
+    : "${WHISPER_VAD_MIN_SPEECH_MS:=250}"
+    # whisper.cpp defaults this to 100ms, which ends a speech segment at every
+    # breath. Each segment is transcribed with less of its surroundings, and
+    # Whisper punctuates from context, so it is raised well past a natural pause.
+    : "${WHISPER_VAD_MIN_SILENCE_MS:=1000}"
+    # whisper.cpp defaults to 30ms. A word's opening consonant is quieter than
+    # the vowel behind it, so segment edges are exactly where Silero errs, and
+    # here a clipped edge is a word that never reaches the transcript at all.
+    : "${WHISPER_VAD_SPEECH_PAD_MS:=300}"
+    : "${WHISPER_VAD_SAMPLES_OVERLAP:=0.1}"
 
     # llama.cpp -------------------------------------------------------------
     # LLAMA_ENDPOINT: if set, an already-running server is used as-is and this
@@ -118,22 +137,25 @@ config_defaults() {
     # arithmetic against LLM_CHUNK_WORDS and warns before wasting an episode.
     : "${LLM_CONCURRENCY:=1}"
 
-    # Voice activity / silence ----------------------------------------------
-    : "${VAD_BACKEND:=ffmpeg}"            # ffmpeg | silero
-    # ffmpeg backend only. The threshold belongs below the quietest speech and
-    # above the noise floor. On a real recording here, speech ranged from -21dB
-    # down to -39dB with a floor near -50dB: -35dB sat *inside* that speech
-    # range and cut the quiet end of it, while -45dB clears it.
+    # Chunk boundaries ------------------------------------------------------
+    # Only used to pick where a long track is split into requests. Nothing here
+    # decides what is speech — Whisper's Silero pass does that — so these want to
+    # be loose enough to find *a* quiet spot, not accurate enough to trust.
     #
-    # It errs low on purpose, because the two mistakes do not cost the same.
-    # Too high cuts quiet speech, which is damage found only by listening; too
-    # low leaves some room tone, which is merely a less tight edit.
-    : "${SILENCE_THRESHOLD:=-45dB}"
-    # Detection granularity, not the editing threshold: the speech map is built
-    # at this resolution and SILENCE_MIN_DURATION decides what to act on.
-    : "${VAD_MIN_SILENCE:=0.30}"
-    : "${SILERO_THRESHOLD:=0.5}"          # silero backend only
-    : "${SILERO_MODEL_DIR:=}"             # optional local torch.hub cache dir
+    # The threshold errs low on purpose: too high and a split lands in quiet
+    # speech, costing that word; too low and it just falls at the nominal
+    # position instead. On a real recording here, speech ran from -21dB down to
+    # -39dB over a floor near -50dB, so -45dB clears the quiet end of speech.
+    : "${SPLIT_SILENCE_THRESHOLD:=-45dB}"
+    : "${SPLIT_MIN_SILENCE:=0.30}"
+
+    # Speech map ------------------------------------------------------------
+    # Every transcribed word is widened by this much before the union that makes
+    # the speech map, which decides two things: how much of Whisper's timing
+    # error a cut may eat, and how long a gap between words has to be before it
+    # is silence at all (SILENCE_MIN_DURATION plus twice this). Raising it makes
+    # cuts rarer and safer; lowering it makes them tighter and more numerous.
+    : "${SPEECH_PAD:=0.25}"
 
     # A gap where no track has speech becomes a candidate only past this length.
     : "${SILENCE_MIN_DURATION:=1.5}"
@@ -345,13 +367,15 @@ config_validate() {
     local v
     for v in SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \
              MUTE_FADE LLM_MAX_EDIT_SECONDS LLM_MIN_CONFIDENCE DURATION_TOLERANCE \
-             SILERO_THRESHOLD MAX_CUT_FRACTION VAD_MIN_SILENCE \
+             MAX_CUT_FRACTION SPLIT_MIN_SILENCE SPEECH_PAD \
+             WHISPER_VAD_THRESHOLD WHISPER_VAD_SAMPLES_OVERLAP \
              WHISPER_CHUNK_SECONDS WHISPER_REQUEST_TIMEOUT; do
         _require_number "$v"
     done
     for v in LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP LLM_MAX_EDIT_WORDS WHISPER_JOBS \
              FFMPEG_JOBS LLAMA_PORT LLAMA_CTX OUTPUT_COMPRESSION \
-             LLM_CONCURRENCY RENDER_FRAME_SAMPLES; do
+             LLM_CONCURRENCY RENDER_FRAME_SAMPLES WHISPER_VAD_MIN_SPEECH_MS \
+             WHISPER_VAD_MIN_SILENCE_MS WHISPER_VAD_SPEECH_PAD_MS; do
         _require_int "$v"
     done
 
@@ -360,11 +384,6 @@ config_validate() {
 
     (( RENDER_FRAME_SAMPLES >= 64 && RENDER_FRAME_SAMPLES <= 8192 )) \
         || die "RENDER_FRAME_SAMPLES must be between 64 and 8192, got $RENDER_FRAME_SAMPLES"
-
-    case "$VAD_BACKEND" in
-        ffmpeg|silero) ;;
-        *) die "VAD_BACKEND must be 'ffmpeg' or 'silero', got '$VAD_BACKEND'" ;;
-    esac
 
     case "$FAILED_ACTION" in
         log|move) ;;
@@ -441,6 +460,14 @@ config_need_whisper() {
         [[ "$DRY_RUN" == 1 ]] || die "Whisper model not found: $WHISPER_MODEL"
         log_warn "dry run: no Whisper model at $WHISPER_MODEL"
     fi
+    # The Silero model is whisper-cli's own argument, so it has to be here for a
+    # local run. A remote server was given one at launch instead, and nothing on
+    # this side can check that from here.
+    if [[ "$WHISPER_VAD" == 1 && ! -f "$WHISPER_VAD_MODEL" ]]; then
+        [[ "$DRY_RUN" == 1 ]] \
+            && log_warn "dry run: no Silero model at $WHISPER_VAD_MODEL" \
+            || die "WHISPER_VAD=1 needs the Silero model at WHISPER_VAD_MODEL ($WHISPER_VAD_MODEL). Fetch one with whisper.cpp's models/download-vad-model.sh silero-v6.2.0 — or set WHISPER_VAD=0, and accept that silence gets transcribed and whatever Whisper invents there becomes speech in the plan"
+    fi
     log_debug "whisper: $WHISPER ($(basename "$WHISPER_MODEL"))"
 }
 
@@ -504,11 +531,13 @@ config_dump() {
              WHISPER_ENDPOINT WHISPER_ENDPOINT_PATH WHISPER_CHUNK_SECONDS \
              WHISPER_REQUEST_TIMEOUT \
              WHISPER_BIN WHISPER_MODEL WHISPER_THREADS WHISPER_LANG WHISPER_JOBS \
-             WHISPER_SKIP_SILENCE \
+             WHISPER_VAD WHISPER_VAD_MODEL WHISPER_VAD_THRESHOLD \
+             WHISPER_VAD_MIN_SPEECH_MS WHISPER_VAD_MIN_SILENCE_MS \
+             WHISPER_VAD_SPEECH_PAD_MS WHISPER_VAD_SAMPLES_OVERLAP \
              LLAMA_ENDPOINT LLAMA_SERVER_BIN LLAMA_MODEL LLAMA_HOST LLAMA_PORT \
              LLAMA_CTX LLAMA_NGL LLAMA_MODEL_NAME LLM_API LLM_MAX_REPLY_TOKENS \
              LLM_CHECK_SCHEMA LLM_CONCURRENCY \
-             VAD_BACKEND SILENCE_THRESHOLD SILERO_THRESHOLD \
+             SPLIT_SILENCE_THRESHOLD SPLIT_MIN_SILENCE SPEECH_PAD \
              SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \
              MUTE_FADE LLM_ENABLE LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP \
              LLM_MAX_EDIT_WORDS LLM_MAX_EDIT_SECONDS LLM_MIN_CONFIDENCE \

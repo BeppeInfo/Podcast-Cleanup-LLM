@@ -31,7 +31,7 @@ declare -A TRACK_CODEC=()
 LLAMA_PID=""
 LLAMA_URL=""
 
-ALL_STAGES=(discover prepare vad transcribe detect plan render finalize)
+ALL_STAGES=(discover prepare transcribe detect plan render finalize)
 
 # --- helpers -----------------------------------------------------------------
 
@@ -93,10 +93,7 @@ write_params() {
     printf '  "cut_padding": %s,\n'          "$CUT_PADDING"          >>"$target"
     printf '  "min_cut": %s,\n'              "$MIN_CUT"              >>"$target"
     printf '  "mute_fade": %s,\n'            "$MUTE_FADE"            >>"$target"
-    # Not a number and not used in any calculation: the plan reports which
-    # backend produced the speech map, so its advice can name a setting that
-    # applies. Validated to ffmpeg|silero, so it needs no quoting care.
-    printf '  "vad_backend": "%s",\n'        "$VAD_BACKEND"          >>"$target"
+    printf '  "speech_pad": %s,\n'           "$SPEECH_PAD"           >>"$target"
     printf '  "max_cut_fraction": %s\n'      "$MAX_CUT_FRACTION"     >>"$target"
     printf '}\n' >>"$target"
 }
@@ -183,7 +180,7 @@ stage_discover() {
     STAGING_DIR="$OUT_DIR/.staging"
 
     if [[ "$DRY_RUN" != 1 ]]; then
-        mkdir -p "$WORK"/{prep,vad,asr,words,llm,render,logs} "$STAGE_DIR" "$OUT_DIR"
+        mkdir -p "$WORK"/{prep,asr,words,llm,render,logs} "$STAGE_DIR" "$OUT_DIR"
     fi
 
     # From here on the run log lives with the episode. Carry over what the
@@ -245,7 +242,7 @@ resume_context() {
     OUT_DIR="$OUTPUT_DIR/$EPISODE_ID"
     STAGING_DIR="$OUT_DIR/.staging"
     [[ -d "$WORK" ]] || die "no work directory for episode '$EPISODE_ID' at $WORK"
-    mkdir -p "$WORK"/{prep,vad,asr,words,llm,render,logs} "$STAGE_DIR" "$OUT_DIR"
+    mkdir -p "$WORK"/{prep,asr,words,llm,render,logs} "$STAGE_DIR" "$OUT_DIR"
     log_init "$WORK/logs/run.log"
     config_need_ffmpeg
     load_meta
@@ -319,57 +316,19 @@ stage_prepare() {
     stage_end "${#PARTICIPANTS[@]} tracks decoded"
 }
 
-# ============================================================================
-# vad — where is there speech, per track
-# ============================================================================
+# Where a long track may be split, for the transcribe stage. Only the boundary
+# placement rides on this: whether a spot is quiet enough to split on is a much
+# smaller question than what counts as speech, which Whisper's own Silero pass
+# answers. Written per track and skipped entirely for a track short enough to go
+# in one request.
+write_silence_log() {
+    local participant="$1" wav="$2" target="$3"
 
-stage_vad() {
-    stage_begin vad "detecting speech (backend: $VAD_BACKEND)"
-    config_need_ffmpeg
-
-    local -a markers=()
-    local participant target marker wav
-
-    for participant in "${PARTICIPANTS[@]}"; do
-        target="$WORK/vad/$participant.json"
-        marker="$STAGE_DIR/vad-$participant.ok"
-        wav="$WORK/prep/$participant.wav"
-        markers+=("$marker")
-
-        if [[ -s "$target" && -f "$marker" ]]; then
-            log_debug "$participant already analysed"
-            continue
-        fi
-        rm -f "$marker"
-        [[ -s "$wav" || "$DRY_RUN" == 1 ]] || die "missing prepared track: $wav"
-
-        if [[ "$VAD_BACKEND" == silero ]]; then
-            # Silero holds a torch model, so these run strictly one at a time.
-            log_info "silero: $participant"
-            run py vad-silero --wav "$wav" --participant "$participant" \
-                --threshold "$SILERO_THRESHOLD" \
-                --duration "${TRACK_DURATION[$participant]}" --out "$target" \
-                || die "Silero VAD failed on $participant"
-            state_touch "$marker"
-        else
-            pool_slot "$FFMPEG_JOBS"
-            (
-                silence_log="$WORK/vad/$participant.silence.log"
-                run_to_file "$silence_log" \
-                    "$FFMPEG" -nostdin -v info -i "$wav" \
-                    -af "silencedetect=noise=${SILENCE_THRESHOLD}:d=${VAD_MIN_SILENCE}" \
-                    -f null - \
-                    && run py vad-ffmpeg --log "$silence_log" \
-                        --duration "${TRACK_DURATION[$participant]}" \
-                        --participant "$participant" --out "$target" \
-                    && state_touch "$marker"
-            ) &
-        fi
-    done
-
-    pool_wait "speech detection" "${markers[@]}"
-    state_mark vad
-    stage_end "${#PARTICIPANTS[@]} tracks analysed"
+    run_to_file "$target" \
+        "$FFMPEG" -nostdin -v info -i "$wav" \
+        -af "silencedetect=noise=${SPLIT_SILENCE_THRESHOLD}:d=${SPLIT_MIN_SILENCE}" \
+        -f null - \
+        || log_warn "could not scan $participant for quiet spots; chunk boundaries may land mid-word"
 }
 
 # ============================================================================
@@ -408,6 +367,19 @@ stage_transcribe() {
             --output-json-full --print-progress -t "$WHISPER_THREADS"
         )
         [[ "$WHISPER_LANG" != "auto" ]] && whisper_args+=(-l "$WHISPER_LANG")
+        # Same Silero pass the remote path asks the server for. Without it this
+        # track's silence gets transcribed, and whatever Whisper invents there
+        # becomes speech in the plan.
+        if [[ "$WHISPER_VAD" == 1 ]]; then
+            whisper_args+=(
+                --vad -vm "$WHISPER_VAD_MODEL"
+                -vt "$WHISPER_VAD_THRESHOLD"
+                -vspd "$WHISPER_VAD_MIN_SPEECH_MS"
+                -vsd "$WHISPER_VAD_MIN_SILENCE_MS"
+                -vp "$WHISPER_VAD_SPEECH_PAD_MS"
+                -vo "$WHISPER_VAD_SAMPLES_OVERLAP"
+            )
+        fi
         # Deliberately unquoted: this is a user-supplied argument string.
         # shellcheck disable=SC2206
         [[ -n "$WHISPER_EXTRA_ARGS" ]] && whisper_args+=($WHISPER_EXTRA_ARGS)
@@ -469,16 +441,37 @@ stage_transcribe_remote() {
         [[ -s "$wav" || "$DRY_RUN" == 1 ]] || die "missing prepared track: $wav"
 
         log_info "whisper (remote): $participant ($index/$total)"
+
+        # Only a track that will actually be split needs somewhere to split it.
+        local silence_log=""
+        if [[ "$WHISPER_CHUNK_SECONDS" != 0 && "$DRY_RUN" != 1 ]] \
+           && awk -v d="${TRACK_DURATION[$participant]:-0}" \
+                  -v c="$WHISPER_CHUNK_SECONDS" 'BEGIN{exit !(d > c)}'; then
+            silence_log="$WORK/asr/$participant.silence.log"
+            write_silence_log "$participant" "$wav" "$silence_log"
+        fi
+
         local -a args=(
             transcribe-remote
             --wav "$wav" --participant "$participant" --out "$target"
             --endpoint "$WHISPER_ENDPOINT" --path "$WHISPER_ENDPOINT_PATH"
-            --vad "$WORK/vad/$participant.json"
-            --chunk-seconds "$WHISPER_CHUNK_SECONDS" \
-            $([[ "$WHISPER_SKIP_SILENCE" == 1 ]] || printf '%s' "--no-skip-silence")
+            --duration "${TRACK_DURATION[$participant]}"
+            --chunk-seconds "$WHISPER_CHUNK_SECONDS"
             --language "$WHISPER_LANG"
             --request-timeout "$WHISPER_REQUEST_TIMEOUT"
         )
+        [[ -n "$silence_log" ]] && args+=(--silence-log "$silence_log")
+        if [[ "$WHISPER_VAD" == 1 ]]; then
+            args+=(
+                --vad-threshold "$WHISPER_VAD_THRESHOLD"
+                --vad-min-speech-ms "$WHISPER_VAD_MIN_SPEECH_MS"
+                --vad-min-silence-ms "$WHISPER_VAD_MIN_SILENCE_MS"
+                --vad-speech-pad-ms "$WHISPER_VAD_SPEECH_PAD_MS"
+                --vad-samples-overlap "$WHISPER_VAD_SAMPLES_OVERLAP"
+            )
+        else
+            args+=(--no-vad)
+        fi
         if [[ "$DRY_RUN" == 1 ]]; then
             run py "${args[@]}"
         else
@@ -746,7 +739,7 @@ stage_plan() {
     stage_begin plan "deciding what to cut and what to mute"
 
     if [[ "$DRY_RUN" == 1 ]]; then
-        log_info "would unify $WORK/vad and $WORK/llm into $WORK/plan.json"
+        log_info "would unify $WORK/words and $WORK/llm into $WORK/plan.json"
         stage_end "dry run"
         return 0
     fi
@@ -756,7 +749,6 @@ stage_plan() {
         plan
         --meta "$WORK/meta.json"
         --params "$WORK/params.json"
-        --vad-dir "$WORK/vad"
         --words-dir "$WORK/words"
         --out "$WORK/plan.json"
         --report "$WORK/edit-report.txt"

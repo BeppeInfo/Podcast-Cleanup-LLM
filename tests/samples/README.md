@@ -31,10 +31,11 @@ manual checks against real servers:
 mkdir -p /tmp/podcast-check/incoming
 cp tests/samples/sample_speaker.flac /tmp/podcast-check/incoming/
 
-# Everything but detect, against a real whisper-server.
+# Everything but detect, against a real whisper-server. That server must have
+# been launched with -vm pointing at a Silero model, or it will transcribe the
+# silence too and the plan will read the invented words as speech.
 clean-podcast.sh --root /tmp/podcast-check \
-    --whisper-endpoint http://your-server:8081 \
-    --stages discover,prepare,vad,transcribe,plan,render,finalize --no-llm
+    --whisper-endpoint http://your-server:8081 --no-llm
 
 # Add detect once an LLM endpoint is available. A router-mode server also
 # needs LLAMA_MODEL_NAME set to one of the ids in /v1/models.
@@ -53,16 +54,14 @@ matched the frame-exact prediction to 0.000 s.
 
 Two things this recording exposes that synthetic audio cannot:
 
-**`SILENCE_THRESHOLD="-35dB"` is too aggressive for a quiet recording** — this
-clip is what moved the default down to `-45dB`. Silence cuts only, `--no-llm`:
+**Whisper places words where there is no audio.** It transcribes a final `right`
+across 9.94–11.34 s, a span whose peak is −50.4 dB — the noise floor. Word timings
+are not evidence that a word was spoken. This is the reason `SPEECH_PAD` exists
+and the reason `WHISPER_VAD` matters: the server's Silero pass is what keeps that
+kind of invention out of the transcript in the first place, and once the speech map
+is derived from the transcript, anything that gets in becomes speech in the plan.
 
-| `SILENCE_THRESHOLD` | removed | cuts |
-| --- | --- | --- |
-| `-35dB` (the old default) | 42.7% | 3 |
-| `-45dB` (current default) | 29.5% | 3 |
-| `-55dB` | 1.9% | 1 |
-
-The levels tell the whole story:
+**The levels, which is why a level threshold was the wrong tool.**
 
 | | measured peak |
 | --- | --- |
@@ -70,25 +69,21 @@ The levels tell the whole story:
 | `I don't know` | **−39.2 dB** |
 | the invented `right` | −50.4 dB (noise floor) |
 
-A threshold belongs below the quietest speech and above the noise floor. `-35dB`
-fell *between the two kinds of speech* — under the loud parts, over the quiet
-ones — so `I don't know` was cut while the rest survived. `-45dB` lands in the
-intended band. Nothing was broken; the VAD applied the threshold it was given,
-and the threshold was in the wrong place.
+A level threshold has to sit below the quietest speech and above the noise floor,
+and this clip shows how narrow that band can be: the old `-35dB` default fell
+*between two kinds of speech in the same sentence*, cutting `I don't know` while
+the rest survived. Nothing was broken — the threshold was simply in the wrong
+place, and a single number for a whole episode has no right value when loudness
+varies within one breath.
 
-That band only exists if the recording has one. `VAD_BACKEND="silero"` decides on
-speech rather than level and is the better answer when loudness varies across an
-episode.
+### Historical: the two local VAD backends
 
-**Whisper places words where there is no audio.** It transcribes a final
-`right` across 9.94–11.34 s, a span whose peak is −50.4 dB — the noise floor.
-Word timings are not evidence that a word was spoken.
+Kept as the measurement that justified removing them. Neither `VAD_BACKEND` nor
+`SILERO_THRESHOLD` exists any more — speech detection is whisper.cpp's Silero pass
+(§7 of DESIGN.md) — so this is a record, not guidance.
 
-### The two backends, same audio, same servers
-
-Only `VAD_BACKEND` differs. Measured when `-35dB` was still the default, so the
-`ffmpeg` column is the old behaviour — it is what the change to `-45dB` was
-reacting to:
+Same audio, same servers, only the backend differing. The `ffmpeg` column was
+measured when `-35dB` was still the default:
 
 | | `ffmpeg` (−35dB) | `silero` |
 | --- | --- | --- |
@@ -103,65 +98,34 @@ ffmpeg     well you know            you remember that there's a way            t
 silero     well you know I don't know you remember that there's a way          to fix that
 ```
 
-Silero produces the edit a person would: it hears the quiet `I don't know` that
-the level threshold missed, so the mid-clip silence cut disappears entirely. Both
-backends make the *same* LLM cut — 7.080–8.170, the repeated `there's a way` — so
-the detection stage is unaffected by the VAD choice, as it should be. Both renders
-matched their frame-exact prediction to 0.000 s.
+Silero produced the edit a person would: it heard the quiet `I don't know` that the
+level threshold missed. Both backends made the *same* LLM cut — 7.080–8.170, the
+repeated `there's a way` — so the detection stage was unaffected by the choice, and
+both renders matched their frame-exact prediction to 0.000 s.
 
-The one word silero still loses is `right`, and that is the correct answer:
-it is a Whisper hallucination over a −50.4 dB noise floor, so a speech-based VAD
-is right to call it silence. Which is the warning behaving as intended — under a
-good VAD it stops crying wolf about quiet speech and reports only the genuine
-anomaly.
+That result is the argument for the current design taken one step further: if
+Silero is the right judge, and whisper.cpp will run Silero itself before
+transcribing, then the transcript already carries its judgement and a second copy
+here was redundant. The two Silero packages this used to choose between agreed to
+within one 32 ms chunk of each other, which is quantisation rather than
+disagreement — and neither is a dependency any more.
 
-### The two Silero packages
+### What to check on a re-run
 
-`VAD_BACKEND="silero"` is served by whichever package is installed —
-`silero-vad` preferred, `pysilero_vad` otherwise. A full run on this sample
-through each:
+The lost-word warning these numbers came from no longer exists: it compared the
+transcript against an independent speech map, and there is no longer one to compare
+against (DESIGN.md §7 explains why keeping a check that cannot fail is worse than
+removing it). What is worth looking at instead:
 
-| cut | `pysilero_vad` | `silero-vad` | delta |
-| --- | --- | --- | --- |
-| lead_in | 0.000–0.456 | 0.000–0.450 | 6 ms |
-| false_start | 7.080–8.170 | 7.080–8.170 | 0 ms |
-| lead_out | 9.784–11.331 | 9.750–11.331 | 34 ms |
-
-Same cuts for the same reasons, 27.3% removed against 27.6%, and the LLM edit
-identical to the millisecond. Every difference is inside one 32 ms chunk, which
-is `pysilero_vad`'s granularity — so this is quantisation, not disagreement.
-Both renders matched their frame-exact prediction.
-
-Not bit-identical, though, which is why `vad/<p>.json` records an
-`implementation` field: reproducing a plan exactly needs the package that made
-it.
-
-Installing either: `pysilero_vad` is 2 MB and pulls nothing. `silero-vad` wants
-`torch` and `torchaudio`, about 970 MB, and on a CPU-only machine both must come
-from `--index-url https://download.pytorch.org/whl/cpu` — otherwise `silero-vad`
-pulls a CUDA `torchaudio` that dies on `libcudart`. Neither is needed by the
-offline suites; put them in a venv and point `PYTHON_BIN` at it rather than
-making them hard dependencies.
-
-### Both findings are caught
-
-A full run at the current `-45dB` default removes 39.1%, finishes without
-`--force`, and warns:
-
-```
-! 2 transcribed word(s) on speaker fall inside cuts nothing asked for:
-  "know right". The VAD heard silence where the transcript has words …
-```
-
-At the old `-35dB` the same warning named four words, `know I don't right`, and
-the run reached 52.3% — over `MAX_CUT_FRACTION`, so it refused without `--force`.
-Both are the rails working: the refusal was reporting a misconfiguration, not
-being fussy, and lowering the threshold removed the cause rather than the symptom.
-
-Either way the repetition the LLM removed on purpose is correctly left out of the
-count. The residual `right` is the Whisper hallucination and is expected to stay
-until something reconciles the two notions of speech.
-
-This sample is the regression test for that warning in its real form. The unit
-tests cover the logic; only real audio produces speech at −39 dB and a
-hallucination at −50 dB.
+- **Is `right` in the transcript at all?** With the server running Silero it should
+  not be — a −50.4 dB span is not speech, and keeping it out is the whole point of
+  doing the VAD before transcription rather than after.
+- **Does `I don't know` survive?** At −39.2 dB it is the quiet speech that a level
+  threshold cut. Silero should hear it; if it goes missing, lower
+  `WHISPER_VAD_THRESHOLD`.
+- **Removed fraction and cut count**, from `sample_edit-report.txt`. Roughly 27%
+  was the figure with a speech-based judge; a jump toward 50% means silence is
+  being found where speech is.
+- **The repetition at 7.080–8.170**, which is the one thing only real speech can
+  exercise: the LLM cut it in a verified run at confidence 0.9, and synthetic audio
+  cannot reach that stage at all because Whisper normalises invented stutters away.

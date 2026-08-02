@@ -1,4 +1,10 @@
-"""Unify silence detection and LLM findings into one edit plan.
+"""Unify the transcript's silence and the LLM's findings into one edit plan.
+
+Both inputs are now derived from the same transcript: silence is where Whisper
+returned no words (`transcript.speech_from_words`), and edits are what the LLM
+found in those words. There is no second opinion about the audio to cross-check
+against — see `looping_words` for what is still checkable, and DESIGN.md for why
+that trade was taken.
 
 Two kinds of operation come out of this, and the distinction is the heart of
 the pipeline:
@@ -55,7 +61,7 @@ def _silence_cuts(gaps, duration, params) -> list[dict]:
                     "start": round(span[0], 4),
                     "end": round(span[1], 4),
                     "reason": reason,
-                    "source": "vad",
+                    "source": "silence",
                     "gap": round(end - start, 3),
                 }
             )
@@ -75,92 +81,74 @@ def _pad_edit(words, edit, duration, cut_padding) -> tuple[float, float]:
     return start, end
 
 
-# A word has to be more than half swallowed to count as removed. Cuts are padded
-# by CUT_PADDING and land on frame boundaries, so clipping the very edge of a
-# neighbouring word is normal and not worth reporting.
-LOST_WORD_FRACTION = 0.5
+# Length of the repeated run this looks for, in words. Long enough that ordinary
+# speech does not repeat it by accident ("you know what I mean", "and then I"),
+# short enough to catch a looping clause rather than only a whole sentence.
+LOOP_SHINGLE = 8
 
-# Some words always land outside the VAD's idea of speech — a boundary clips a
-# quiet consonant, a breath gets counted in. Only a wholesale disagreement is
-# evidence of anything, so this is deliberately far above the usual noise.
-UNSUPPORTED_WORD_WARN_FRACTION = 0.25
+# How often a run must recur before it is a loop rather than a turn of phrase.
+LOOP_MIN_REPEATS = 5
+
+# And how much of the track those repeats must account for. A podcast can
+# legitimately repeat a catchphrase; it cannot legitimately spend a quarter of
+# its words on one clause.
+LOOP_WARN_FRACTION = 0.25
 
 
-def _words_without_speech(participants, words, speech) -> dict:
-    """Words a track claims where that same track's VAD heard nothing.
+def looping_words(participants, words) -> dict:
+    """Tracks whose transcript repeats one run of words far past plausibility.
 
-    Deliberately a different question from _words_lost_to_silence, which asks
-    whether a *cut* swallowed words. Cuts only happen where every track is
-    silent, so that check is blind to the case that matters most: one speaker's
-    mic producing transcript while another speaker is talking. Nothing is cut
-    there, so nothing is reported, however invented the words are.
+    This is the check that replaces comparing a transcript against an
+    independent speech map. There is no independent map any more — Whisper's own
+    VAD decides what gets transcribed and the map is derived from what comes
+    back, so the two can never disagree by construction.
 
-    This asks whether a track's own audio supports its own transcript. It is the
-    question that catches Whisper looping: on the recording that prompted it,
-    198 repetitions of one sentence covered 73% of a track over 4.6 minutes of a
-    silent mic, and the cut-based check reported 17 words.
+    What remains detectable is the shape of the failure itself. Handed silence
+    or noise, Whisper does not invent varied text: it repeats. On the recording
+    that prompted all of this it produced one sentence 198 times across 4.6
+    minutes of a muted mic, 73% of that track. That is visible in the transcript
+    alone, and needs no second opinion about the audio.
     """
-    unsupported: dict[str, list[dict]] = {}
+    import collections
+
+    looping: dict[str, dict] = {}
     for participant in participants:
-        spans = speech.get(participant) or []
-        phantom = []
-        for word in words.get(participant) or []:
-            try:
-                start = float(word["start"])
-                end = float(word["end"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            length = end - start
-            if length <= iv.EPS:
-                continue
-            if iv.overlap_amount((start, end), spans) < LOST_WORD_FRACTION * length:
-                phantom.append(word)
-        if phantom:
-            unsupported[participant] = phantom
-    return unsupported
-
-
-def _words_lost_to_silence(participants, words, cut_spans, chosen_spans) -> dict:
-    """Words a cut removes that no edit asked to remove.
-
-    The VAD's "speech" and the transcript's "words" are two independent
-    opinions, and nothing else compares them: the published transcript is
-    rebuilt from the rendered timeline, so a word cut away simply disappears
-    from it and the result stays self-consistent. That is what makes the
-    disagreement worth reporting — it cannot be seen in the output.
-
-    Either side may be the wrong one. A level-based VAD misses quiet speech;
-    Whisper places words over near-silence. So this reports rather than
-    corrects.
-    """
-    if not cut_spans:
-        return {}
-    lost: dict[str, list[dict]] = {}
-    for participant in participants:
-        casualties = []
-        for word in words.get(participant) or []:
-            try:
-                start = float(word["start"])
-                end = float(word["end"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            span = end - start
-            if span <= iv.EPS:
-                continue
-            if iv.overlap_amount((start, end), cut_spans) < LOST_WORD_FRACTION * span:
-                continue
-            # An edit asking for this word is the system working, not a
-            # disagreement — the LLM stage removes words on purpose.
-            if iv.overlap_amount((start, end), chosen_spans.get(participant, [])) > iv.EPS:
-                continue
-            casualties.append(word)
-        if casualties:
-            lost[participant] = casualties
-    return lost
+        track = [
+            "".join(ch for ch in (w.get("text") or "").lower() if ch.isalnum())
+            for w in words.get(participant) or []
+        ]
+        if len(track) < LOOP_SHINGLE * LOOP_MIN_REPEATS:
+            continue
+        counts = collections.Counter(
+            tuple(track[i : i + LOOP_SHINGLE])
+            for i in range(len(track) - LOOP_SHINGLE + 1)
+        )
+        run, repeats = counts.most_common(1)[0]
+        if repeats < LOOP_MIN_REPEATS:
+            continue
+        # Each repeat accounts for at least the run itself. Overlapping shingles
+        # of a longer repeated sentence all report the same count, so this
+        # under-counts a long loop rather than inflating a short one.
+        covered = min(repeats * LOOP_SHINGLE, len(track))
+        if covered / len(track) < LOOP_WARN_FRACTION:
+            continue
+        looping[participant] = {
+            "repeats": repeats,
+            "words": len(track),
+            "covered": covered,
+            "text": " ".join(word for word in run if word),
+        }
+    return looping
 
 
 def build_plan(meta, speech, edits, words, params) -> dict:
-    """Assemble the plan. `speech`/`edits`/`words` are keyed by participant."""
+    """Assemble the plan. `speech`/`edits`/`words` are keyed by participant.
+
+    `speech` comes from `transcript.speech_from_words` — the padded union of the
+    words Whisper returned, not a separate opinion about the audio. Silence is
+    therefore "no words here", and the padding is what keeps a cut off the edge
+    of a word whose timing is approximate.
+    """
     duration = float(meta["duration"])
     participants = [track["participant"] for track in meta["tracks"]]
 
@@ -173,13 +161,10 @@ def build_plan(meta, speech, edits, words, params) -> dict:
 
     if not speech_all:
         warnings.append(
-            "no speech detected on any track — check the VAD threshold before trusting this plan"
+            "no track transcribed a single word, so the whole episode reads as "
+            "silence — check that the whisper endpoint returned anything at all "
+            "before trusting this plan"
         )
-
-    # Spans some edit deliberately asked to remove, per participant. Used below
-    # to tell a word that was chosen for removal from one that merely fell
-    # inside a silence cut.
-    chosen_spans: dict[str, list[tuple[float, float]]] = {p: [] for p in participants}
 
     # Classify every LLM finding as a global cut or a single-track mute.
     for participant in participants:
@@ -195,7 +180,6 @@ def build_plan(meta, speech, edits, words, params) -> dict:
             start, end = _pad_edit(track_words, edit, duration, params["cut_padding"])
             if end - start < iv.EPS:
                 continue
-            chosen_spans[participant].append((start, end))
             crosstalk = iv.overlap_amount((start, end), others)
             common = {
                 "start": round(start, 4),
@@ -237,49 +221,21 @@ def build_plan(meta, speech, edits, words, params) -> dict:
     cut_spans = [(c["start"], c["end"]) for c in cuts]
     keep = iv.complement(cut_spans, 0.0, duration)
 
-    lost_words = _words_lost_to_silence(participants, words, cut_spans, chosen_spans)
-    # Advice that names a setting the run is not using is worse than none, so it
-    # follows the backend that actually produced the speech map.
-    if params.get("vad_backend") == "silero":
-        remedy = (
-            "Silero already judges speech rather than level, so the likelier "
-            "cause is Whisper placing words over near-silence; lower "
-            "SILERO_THRESHOLD only if the audio really has speech there"
-        )
-    else:
-        remedy = (
-            "lower SILENCE_THRESHOLD if this is quiet speech, or "
-            "VAD_BACKEND=silero to judge speech over level. Whisper also "
-            "invents words over near-silence, so check the audio before "
-            "trusting either side"
-        )
-    for participant, lost in sorted(lost_words.items()):
-        sample = " ".join(w.get("text", "") for w in lost[:6])
-        if len(lost) > 6:
-            sample += " …"
+    # Nothing here compares the transcript against the audio any more, because
+    # the speech map is made of the transcript. What is still visible is Whisper
+    # repeating itself, which is how it fails when it is given something that is
+    # not speech.
+    looping = looping_words(participants, words)
+    for participant, detail in sorted(looping.items()):
         warnings.append(
-            f"{len(lost)} transcribed word(s) on {participant} fall inside cuts "
-            f"nothing asked for: \"{sample.strip()}\". The VAD heard silence "
-            f"where the transcript has words — {remedy}"
-        )
-
-    # The stronger check: not "did a cut remove words" but "does this track's
-    # own audio support its own transcript at all". A transcript this far out of
-    # step with its track is not a tuning problem, so the advice is to look at
-    # the audio rather than to move a threshold.
-    unsupported = _words_without_speech(participants, words, speech)
-    for participant, phantom in sorted(unsupported.items()):
-        total = len(words.get(participant) or [])
-        if not total or len(phantom) / total < UNSUPPORTED_WORD_WARN_FRACTION:
-            continue
-        sample = " ".join(w.get("text", "") for w in phantom[:8])
-        warnings.append(
-            f"{len(phantom) / total * 100:.0f}% of {participant}'s transcript "
-            f"({len(phantom)} of {total} words) sits where that track has no "
-            f"speech at all: \"{sample.strip()} …\". Whisper invents text over "
-            "near-silence, and repeats a phrase when it does; treat this "
-            "transcript, and every edit derived from it, as unreliable until "
-            "the audio is checked"
+            f"{participant}'s transcript repeats \"{detail['text']}\" "
+            f"{detail['repeats']} times, accounting for at least "
+            f"{detail['covered'] / detail['words'] * 100:.0f}% of its "
+            f"{detail['words']} words. That is what Whisper does when handed "
+            "something that is not speech; treat this transcript, the speech map "
+            "derived from it, and every edit built on it as unreliable until the "
+            "audio is checked. If the server is not running Silero over the "
+            "audio first, WHISPER_VAD is what turns that on"
         )
 
     # A muted stretch inside a cut is moot; trim mutes down to what survives,
@@ -331,7 +287,7 @@ def build_plan(meta, speech, edits, words, params) -> dict:
         "silence_gaps": len(gaps),
         "cut_count": len(cuts),
         "cut_from_silence": sum(
-            1 for c in cuts if any(s == "vad" for s in c["sources"])
+            1 for c in cuts if any(s == "silence" for s in c["sources"])
         ),
         "cut_from_llm": sum(
             1 for c in cuts if any(s.startswith("llm:") for s in c["sources"])
@@ -343,10 +299,9 @@ def build_plan(meta, speech, edits, words, params) -> dict:
         "per_participant": {
             p: {
                 "speech": round(iv.total(speech.get(p, [])), 3),
+                "words": len(words.get(p) or []),
                 "edits_found": len(edits.get(p) or []),
                 "mutes": len(resolved_mutes.get(p, [])),
-                "words_lost_to_silence": len(lost_words.get(p, [])),
-                "words_without_speech": len(unsupported.get(p, [])),
             }
             for p in participants
         },
@@ -360,29 +315,8 @@ def build_plan(meta, speech, edits, words, params) -> dict:
         "cuts": cuts,
         "mutes": resolved_mutes,
         "keep": [[round(s, 4), round(e, 4)] for s, e in keep],
-        # Kept in full so the disagreement can be inspected word by word
-        # rather than only counted in the report.
-        "words_lost_to_silence": {
-            participant: [
-                {"text": w.get("text", ""), "start": w.get("start"), "end": w.get("end")}
-                for w in lost
-            ]
-            for participant, lost in sorted(lost_words.items())
-        },
-        # Counted in full but sampled in the record: a hallucinating Whisper can
-        # produce thousands of these, and a plan file nobody can read is its own
-        # kind of unhelpful.
-        "words_without_speech": {
-            participant: {
-                "count": len(phantom),
-                "of": len(words.get(participant) or []),
-                "sample": [
-                    {"text": w.get("text", ""), "start": w.get("start"),
-                     "end": w.get("end")}
-                    for w in phantom[:20]
-                ],
-            }
-            for participant, phantom in sorted(unsupported.items())
+        "looping_transcripts": {
+            participant: detail for participant, detail in sorted(looping.items())
         },
         "stats": stats,
         "warnings": warnings,
@@ -409,7 +343,8 @@ def format_report(plan) -> str:
     for participant, values in stats["per_participant"].items():
         lines.append(
             f"  {participant:<16} speech {_hms(values['speech'])}  "
-            f"edits found {values['edits_found']:<4} muted {values['mutes']}"
+            f"words {values['words']:<6} edits found {values['edits_found']:<4} "
+            f"muted {values['mutes']}"
         )
 
     kinds: dict[str, int] = {}
