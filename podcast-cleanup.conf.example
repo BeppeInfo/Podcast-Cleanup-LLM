@@ -137,7 +137,9 @@ LLAMA_PORT="8081"
 # agree. At the default LLM_CHUNK_WORDS=350 a request is ~3.3k prompt tokens plus
 # 2048 reserved for the reply, so a slot needs about 6k. Note that llama-server
 # divides -c among --parallel slots: -c 8192 --parallel 4 leaves 2048 each and
-# truncates. See "Running the servers" in the README.
+# truncates. Raising LLM_CONCURRENCY below therefore means raising this too —
+# the detect stage does the arithmetic and warns before an episode is wasted.
+# See "Running the servers" in the README.
 LLAMA_CTX="8192"
 
 # Layers offloaded to GPU (99 = all, 0 = CPU only).
@@ -182,6 +184,22 @@ LLM_MAX_REPLY_TOKENS="2048"
 # track had been dropped as unparseable — an episode reporting no edits at all,
 # which is indistinguishable from clean speech. Costs one request.
 LLM_CHECK_SCHEMA="1"
+
+# How many transcript windows are sent at once. Windows are independent, so this
+# is pure throughput: at 1 the server decodes at batch size 1, which is bound by
+# memory bandwidth and leaves most of a CPU idle however many cores it has.
+#
+# It has to agree with the server's slot count, because nothing can detect a
+# mismatch: too high and the surplus just queues inside the server, invisibly.
+#   - a server this script starts gets --parallel from this value, unless
+#     LLAMA_EXTRA_ARGS already pins one with -np
+#   - with LLAMA_ENDPOINT, set this to the -np that server was launched with
+#
+# And raise LLAMA_CTX with it. Splitting the KV cache is the default once a slot
+# count is given, so -c is shared out among the slots and each window still has
+# to fit in its share. The detect stage checks and warns, but it can only do the
+# arithmetic for a server it starts itself.
+LLM_CONCURRENCY="1"
 
 # ------------------------------------------------------- silence definition --
 

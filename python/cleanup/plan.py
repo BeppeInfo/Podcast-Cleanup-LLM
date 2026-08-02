@@ -80,6 +80,45 @@ def _pad_edit(words, edit, duration, cut_padding) -> tuple[float, float]:
 # neighbouring word is normal and not worth reporting.
 LOST_WORD_FRACTION = 0.5
 
+# Some words always land outside the VAD's idea of speech — a boundary clips a
+# quiet consonant, a breath gets counted in. Only a wholesale disagreement is
+# evidence of anything, so this is deliberately far above the usual noise.
+UNSUPPORTED_WORD_WARN_FRACTION = 0.25
+
+
+def _words_without_speech(participants, words, speech) -> dict:
+    """Words a track claims where that same track's VAD heard nothing.
+
+    Deliberately a different question from _words_lost_to_silence, which asks
+    whether a *cut* swallowed words. Cuts only happen where every track is
+    silent, so that check is blind to the case that matters most: one speaker's
+    mic producing transcript while another speaker is talking. Nothing is cut
+    there, so nothing is reported, however invented the words are.
+
+    This asks whether a track's own audio supports its own transcript. It is the
+    question that catches Whisper looping: on the recording that prompted it,
+    198 repetitions of one sentence covered 73% of a track over 4.6 minutes of a
+    silent mic, and the cut-based check reported 17 words.
+    """
+    unsupported: dict[str, list[dict]] = {}
+    for participant in participants:
+        spans = speech.get(participant) or []
+        phantom = []
+        for word in words.get(participant) or []:
+            try:
+                start = float(word["start"])
+                end = float(word["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            length = end - start
+            if length <= iv.EPS:
+                continue
+            if iv.overlap_amount((start, end), spans) < LOST_WORD_FRACTION * length:
+                phantom.append(word)
+        if phantom:
+            unsupported[participant] = phantom
+    return unsupported
+
 
 def _words_lost_to_silence(participants, words, cut_spans, chosen_spans) -> dict:
     """Words a cut removes that no edit asked to remove.
@@ -224,6 +263,25 @@ def build_plan(meta, speech, edits, words, params) -> dict:
             f"where the transcript has words — {remedy}"
         )
 
+    # The stronger check: not "did a cut remove words" but "does this track's
+    # own audio support its own transcript at all". A transcript this far out of
+    # step with its track is not a tuning problem, so the advice is to look at
+    # the audio rather than to move a threshold.
+    unsupported = _words_without_speech(participants, words, speech)
+    for participant, phantom in sorted(unsupported.items()):
+        total = len(words.get(participant) or [])
+        if not total or len(phantom) / total < UNSUPPORTED_WORD_WARN_FRACTION:
+            continue
+        sample = " ".join(w.get("text", "") for w in phantom[:8])
+        warnings.append(
+            f"{len(phantom) / total * 100:.0f}% of {participant}'s transcript "
+            f"({len(phantom)} of {total} words) sits where that track has no "
+            f"speech at all: \"{sample.strip()} …\". Whisper invents text over "
+            "near-silence, and repeats a phrase when it does; treat this "
+            "transcript, and every edit derived from it, as unreliable until "
+            "the audio is checked"
+        )
+
     # A muted stretch inside a cut is moot; trim mutes down to what survives,
     # and fuse those close enough that their fades would otherwise collide.
     fade_gap = 2.0 * params["mute_fade"]
@@ -288,6 +346,7 @@ def build_plan(meta, speech, edits, words, params) -> dict:
                 "edits_found": len(edits.get(p) or []),
                 "mutes": len(resolved_mutes.get(p, [])),
                 "words_lost_to_silence": len(lost_words.get(p, [])),
+                "words_without_speech": len(unsupported.get(p, [])),
             }
             for p in participants
         },
@@ -309,6 +368,21 @@ def build_plan(meta, speech, edits, words, params) -> dict:
                 for w in lost
             ]
             for participant, lost in sorted(lost_words.items())
+        },
+        # Counted in full but sampled in the record: a hallucinating Whisper can
+        # produce thousands of these, and a plan file nobody can read is its own
+        # kind of unhelpful.
+        "words_without_speech": {
+            participant: {
+                "count": len(phantom),
+                "of": len(words.get(participant) or []),
+                "sample": [
+                    {"text": w.get("text", ""), "start": w.get("start"),
+                     "end": w.get("end")}
+                    for w in phantom[:20]
+                ],
+            }
+            for participant, phantom in sorted(unsupported.items())
         },
         "stats": stats,
         "warnings": warnings,

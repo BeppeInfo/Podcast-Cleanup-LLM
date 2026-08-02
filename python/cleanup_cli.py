@@ -314,6 +314,7 @@ def cmd_transcribe_remote(args):
         speech=speech,
         temperature=args.temperature,
         on_progress=_progress,
+        skip_silence=args.skip_silence,
     )
     _write_json(args.out, parsed)
 
@@ -321,6 +322,21 @@ def cmd_transcribe_remote(args):
     print(
         f"{words} words in {segments} segments over {parsed['chunks']} chunk(s)"
     )
+    skipped = parsed.get("skipped_seconds") or 0.0
+    if skipped > 0.5:
+        share = skipped / max(parsed.get("audio_seconds") or 1.0, 1e-6)
+        detail = (
+            f"{skipped:.0f}s of {parsed['audio_seconds']:.0f}s ({share * 100:.0f}%) "
+            "was not sent to Whisper: the VAD heard no speech there"
+        )
+        # Skipping silence is the point, but skipping most of a track is also
+        # what a wrong VAD threshold looks like, and the words it drops leave no
+        # trace in the transcript to notice later.
+        if share > 0.5:
+            print(f"WARN {detail}. If that track really was talking, lower the "
+                  "VAD threshold or set WHISPER_SKIP_SILENCE=0", flush=True)
+        else:
+            print(f"note: {detail}")
     if parsed["approximated_segments"]:
         # Worth saying plainly: it decides how tightly a stutter can be cut.
         share = parsed["approximated_segments"] / max(segments, 1)
@@ -389,17 +405,44 @@ def cmd_detect(args):
         accepted=kinds,
         audit_path=args.audit,
         on_progress=_progress,
+        concurrency=args.concurrency,
     )
     _write_json(args.out, result)
     print(
         f"{len(result['edits'])} edits accepted, {result['rejected_count']} rejected "
         f"over {result['chunks']} chunks"
     )
-    if result["chunk_failures"]:
+    if result.get("chunks_truncated"):
         print(
-            f"warning: {result['chunk_failures']} of {result['chunks']} chunks "
-            "produced no usable response; those stretches were left untouched"
+            f"WARN {result['chunks_truncated']} of {result['chunks']} chunks ran "
+            "past LLM_MAX_REPLY_TOKENS; the edits they had already emitted were "
+            "kept, but the tail of those windows went unjudged. Raise it, or "
+            "lower LLM_CHUNK_WORDS so a window yields fewer edits.",
+            flush=True,
         )
+    if result["chunk_failures"]:
+        failed, total = result["chunk_failures"], result["chunks"]
+        print(
+            f"WARN {failed} of {total} chunks produced no usable response; "
+            "those stretches were left untouched",
+            flush=True,
+        )
+        # Every chunk failing is not per-item tolerance doing its job, it is the
+        # whole track silently keeping its disfluencies while the report shows a
+        # clean-looking zero. DESIGN.md §9 invariant 10: a fault that hits every
+        # chunk identically must not be able to pass for the survivable kind.
+        # Exit 4 so the shell marks the track failed rather than done — the run
+        # still carries on, but it will not claim this track was analysed, and
+        # --from detect will retry it instead of skipping it as complete.
+        if failed == total and total > 0:
+            print(
+                f"WARN every chunk failed for {result['participant']}: this "
+                "track was not analysed at all. If they timed out, the endpoint "
+                "is too slow for LLM_CONCURRENCY windows at once — lower it, or "
+                "raise LLAMA_REQUEST_TIMEOUT.",
+                flush=True,
+            )
+            raise SystemExit(4)
 
 
 # --- plan ---------------------------------------------------------------------
@@ -628,6 +671,10 @@ def build_parser():
     p.add_argument("--out", required=True)
     p.add_argument("--vad", help="VAD result, used to place chunk boundaries in silence")
     p.add_argument("--chunk-seconds", type=float, default=600.0)
+    p.add_argument(
+        "--no-skip-silence", dest="skip_silence", action="store_false",
+        help="send the whole track, including stretches the VAD calls silence",
+    )
     p.add_argument("--language", default="auto")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--request-timeout", type=float, default=1800.0)
@@ -667,6 +714,10 @@ def build_parser():
     p.add_argument("--max-reply-tokens", type=int, default=2048)
     p.add_argument("--model-name", default="")
     p.add_argument("--kinds", default="stutter,repetition,false_start")
+    p.add_argument(
+        "--concurrency", type=int, default=1,
+        help="windows in flight at once; match the server's --parallel slots",
+    )
     p.set_defaults(func=cmd_detect)
 
     p = sub.add_parser("plan", help="unify silence and edits into an edit plan")
@@ -717,6 +768,12 @@ def main(argv=None):
     except llm.SchemaIgnored as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
+    except llm.ModelUnavailable as exc:
+        # Every remaining window would fail the same way, so this ends the run
+        # rather than the track. Exit 5 keeps it distinct from 4 ("this track
+        # could not be analysed"), which is survivable and lets the rest finish.
+        print(f"error: {exc}", file=sys.stderr)
+        return 5
     except BrokenPipeError:
         return 1
     return 0

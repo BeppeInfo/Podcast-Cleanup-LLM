@@ -474,7 +474,8 @@ stage_transcribe_remote() {
             --wav "$wav" --participant "$participant" --out "$target"
             --endpoint "$WHISPER_ENDPOINT" --path "$WHISPER_ENDPOINT_PATH"
             --vad "$WORK/vad/$participant.json"
-            --chunk-seconds "$WHISPER_CHUNK_SECONDS"
+            --chunk-seconds "$WHISPER_CHUNK_SECONDS" \
+            $([[ "$WHISPER_SKIP_SILENCE" == 1 ]] || printf '%s' "--no-skip-silence")
             --language "$WHISPER_LANG"
             --request-timeout "$WHISPER_REQUEST_TIMEOUT"
         )
@@ -503,6 +504,46 @@ llm_schema_check_flag() {
     return 0
 }
 
+# The slot count LLAMA_EXTRA_ARGS pins, if it pins one. An explicit -np there is
+# the user being specific about their server, so it wins over LLM_CONCURRENCY
+# and we add no flag of our own.
+llm_explicit_slots() {
+    # shellcheck disable=SC2206
+    local -a extra=($LLAMA_EXTRA_ARGS)
+    local i
+    for (( i = 0; i < ${#extra[@]}; i++ )); do
+        case "${extra[i]}" in
+            -np|--parallel)     printf '%s' "${extra[i + 1]:-}"; return 0 ;;
+            -np=*|--parallel=*) printf '%s' "${extra[i]#*=}";    return 0 ;;
+        esac
+    done
+    return 0
+}
+
+# Unless llama-server is given --kv-unified, -c is the whole KV budget and each
+# slot gets -c / -np (rounded down to a multiple of 256). So raising the slot
+# count silently shrinks the window every chunk has to fit into, and a chunk
+# that no longer fits is refused, dropped, and reported only as a track that
+# found suspiciously few disfluencies.
+#
+# Roughly eight tokens per word — each one travels twice, in the flowing text
+# and again in the indexed listing — plus the ~570-token instruction prefix and
+# whatever is reserved for the reply, rounded up to the next 1024. That is the
+# arithmetic behind the sizing table in the README, and it reproduces it
+# exactly; if one moves, move the other.
+llm_context_warning() {
+    local slots="$1"
+    [[ "$slots" =~ ^[0-9]+$ ]] && (( slots > 0 )) || return 0
+
+    local per_slot=$(( LLAMA_CTX / slots ))
+    local needed=$(( LLM_CHUNK_WORDS * 8 + 570 + LLM_MAX_REPLY_TOKENS ))
+    needed=$(( (needed + 1023) / 1024 * 1024 ))
+    (( per_slot >= needed )) && return 0
+
+    log_warn "LLAMA_CTX=$LLAMA_CTX split over $slots slots leaves ~$per_slot tokens each, but a ${LLM_CHUNK_WORDS}-word window needs roughly $needed"
+    log_warn "raise LLAMA_CTX to $(( needed * slots )), lower LLM_CHUNK_WORDS, or add --kv-unified to LLAMA_EXTRA_ARGS — otherwise chunks are refused and those disfluencies survive"
+}
+
 llama_start() {
     config_need_python
 
@@ -511,6 +552,12 @@ llama_start() {
     if [[ -n "$LLAMA_ENDPOINT" ]]; then
         LLAMA_URL="$LLAMA_ENDPOINT"
         log_info "using the llama server already at $LLAMA_URL"
+        # Its slot count and context are its own business — nothing here can
+        # read them back, so the arithmetic llm_context_warning does for a
+        # server we start cannot be done for this one.
+        if (( LLM_CONCURRENCY > 1 )); then
+            log_info "sending $LLM_CONCURRENCY windows at a time; that server needs at least that many --parallel slots, each with room for a ${LLM_CHUNK_WORDS}-word window"
+        fi
         [[ "$DRY_RUN" == 1 ]] && return 0
         # Unquoted on purpose: the helper yields one flag or no argument at all.
         # shellcheck disable=SC2046
@@ -524,8 +571,27 @@ llama_start() {
 
     LLAMA_URL="http://${LLAMA_HOST}:${LLAMA_PORT}"
     local server_log="$WORK/logs/llama-server.log"
+
+    # One slot per window we intend to have in flight, unless LLAMA_EXTRA_ARGS
+    # already says otherwise. Deriving it here is what keeps the two settings
+    # from drifting apart: a server with fewer slots than LLM_CONCURRENCY does
+    # not fail, it just queues the surplus internally and looks slow for no
+    # visible reason.
+    local -a parallel=()
+    local slots
+    slots=$(llm_explicit_slots)
+    if [[ -n "$slots" ]]; then
+        log_debug "LLAMA_EXTRA_ARGS pins the slot count at $slots; not deriving one"
+    elif (( LLM_CONCURRENCY > 1 )); then
+        slots="$LLM_CONCURRENCY"
+        parallel=(--parallel "$LLM_CONCURRENCY")
+    else
+        slots=1
+    fi
+    llm_context_warning "$slots"
+
     log_info "starting llama-server on $LLAMA_URL ($(basename "$LLAMA_MODEL"))"
-    log_raw "\$ $LLAMA_SERVER -m $LLAMA_MODEL --host $LLAMA_HOST --port $LLAMA_PORT -c $LLAMA_CTX -ngl $LLAMA_NGL $LLAMA_EXTRA_ARGS"
+    log_raw "\$ $LLAMA_SERVER -m $LLAMA_MODEL --host $LLAMA_HOST --port $LLAMA_PORT -c $LLAMA_CTX -ngl $LLAMA_NGL ${parallel[*]} $LLAMA_EXTRA_ARGS"
 
     if [[ "$DRY_RUN" == 1 ]]; then
         return 0
@@ -541,6 +607,7 @@ llama_start() {
         --port "$LLAMA_PORT" \
         -c "$LLAMA_CTX" \
         -ngl "$LLAMA_NGL" \
+        "${parallel[@]}" \
         "${extra[@]}" \
         >"$server_log" 2>&1 &
     LLAMA_PID=$!
@@ -626,6 +693,7 @@ stage_detect() {
             --request-timeout "$LLAMA_REQUEST_TIMEOUT" --kinds "$LLM_ACCEPT_KINDS" \
             --api "$LLM_API" --max-reply-tokens "$LLM_MAX_REPLY_TOKENS" \
             --model-name "$LLAMA_MODEL_NAME" \
+            --concurrency "$LLM_CONCURRENCY" \
             || rc=$?
 
         if (( rc == 0 )); then
@@ -641,7 +709,20 @@ stage_detect() {
             # reasoning: every track would fail identically and silently.
             llama_stop
             die "the LLM endpoint ignored the JSON schema. Try LLM_API=completion, then resume with: $0 --episode $EPISODE_ID --from detect"
+        elif (( rc == 5 )); then
+            # Exit 5 is a server that is up but has no model to serve. Same
+            # reasoning as 2 and 3: it is a property of the server, so every
+            # remaining track would fail identically. A router can drop the
+            # model *during* the run — transcribe takes minutes, and nothing
+            # reloads it with --no-models-autoload — so this is worth its own
+            # message rather than one wasted track after another.
+            llama_stop
+            die "the LLM endpoint has no model loaded${LLAMA_MODEL_NAME:+ for '$LLAMA_MODEL_NAME'}. Load it, then resume with: $0 --episode $EPISODE_ID --from detect"
         else
+            # Exit 4 is every chunk of this track failing — the track was not
+            # analysed at all, rather than analysed and found clean. It lands
+            # here with the other per-track failures on purpose: one bad track
+            # is survivable, and the run should still deliver the rest.
             failed=$(( failed + 1 ))
             log_warn "edit detection failed for $participant; that track keeps its disfluencies"
         fi

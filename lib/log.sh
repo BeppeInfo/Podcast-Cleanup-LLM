@@ -281,12 +281,17 @@ parse_whisper_progress() {
     fi
 }
 
-# Our Python CLI emits "PROGRESS <done> <total>".
+# Our Python CLI emits "PROGRESS <done> <total>", and "WARN <text>" for anything
+# the operator has to see. Without the WARN case a stage can fail in every chunk
+# and still look healthy on screen: only the file log would carry it, and the
+# report would show a track with no edits, which reads exactly like clean audio.
 parse_python_progress() {
     if [[ "$1" == PROGRESS\ * ]]; then
         local _tag done total
         read -r _tag done total <<<"$1"
         progress "$done" "$total" "$2"
+    elif [[ "$1" == WARN\ * ]]; then
+        log_warn "${1#WARN }"
     fi
 }
 

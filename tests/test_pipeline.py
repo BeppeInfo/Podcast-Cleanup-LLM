@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 import wave
 
@@ -24,6 +25,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from cleanup import intervals as iv
 from cleanup import asr, llm, plan as planner, render, transcript as tr, vad
+# The CLI itself, for the exit codes the shell branches on. Importing is safe:
+# it only runs main() under __main__.
+import cleanup_cli as cli
 
 
 # --- a tiny evaluator for the ffmpeg expression subset we generate ------------
@@ -665,7 +669,8 @@ class _StubLlamaServer:
     records the requests it received so the payload contract can be checked.
     """
 
-    def __init__(self, replies, health_status=200, api_key=None):
+    def __init__(self, replies, health_status=200, api_key=None, responder=None,
+                 auth_delay=0.0):
         import http.server
         import threading
 
@@ -673,6 +678,15 @@ class _StubLlamaServer:
         self.requests = []
         self.paths = []
         self.seen_auth = []
+        # Canned replies are handed out in arrival order, which says nothing
+        # useful once requests overlap. A responder answers from the request
+        # itself instead, so a reply belongs to its window however they race.
+        self.responder = responder
+        # How many POSTs were being served at the same moment, at the busiest
+        # point. The only direct evidence that concurrency reached the wire.
+        self.in_flight = 0
+        self.peak_in_flight = 0
+        self._counter_lock = threading.Lock()
         # Set to send a hand-built envelope instead of the usual wrapping, for
         # the response shapes only some servers produce.
         self.raw_reply = None
@@ -698,6 +712,11 @@ class _StubLlamaServer:
                     return True
                 if self.headers.get("Authorization") == f"Bearer {api_key}":
                     return True
+                # A refusal that takes a moment, so a test measuring how many
+                # requests escape before the client gives up is measuring the
+                # client's reaction and not the scheduler's mood.
+                if auth_delay:
+                    time.sleep(auth_delay)
                 length = int(self.headers.get("Content-Length", 0))
                 if length:
                     self.rfile.read(length)
@@ -718,14 +737,30 @@ class _StubLlamaServer:
                 if not self._authorised():
                     return
                 length = int(self.headers.get("Content-Length", 0))
-                outer.requests.append(json.loads(self.rfile.read(length)))
+                payload = json.loads(self.rfile.read(length))
+                outer.requests.append(payload)
                 outer.paths.append(self.path)
+                with outer._counter_lock:
+                    outer.in_flight += 1
+                    outer.peak_in_flight = max(
+                        outer.peak_in_flight, outer.in_flight
+                    )
+                try:
+                    self._reply_to(payload)
+                finally:
+                    with outer._counter_lock:
+                        outer.in_flight -= 1
+
+            def _reply_to(self, payload):
                 if outer.raw_reply is not None:
                     self._send(outer.raw_status, outer.raw_reply)
                     return
-                reply = (
-                    outer.replies.pop(0) if outer.replies else {"edits": []}
-                )
+                if outer.responder is not None:
+                    reply = outer.responder(payload)
+                else:
+                    reply = (
+                        outer.replies.pop(0) if outer.replies else {"edits": []}
+                    )
                 if reply is None:
                     self._send(500, {"error": "boom"})
                     return
@@ -871,13 +906,28 @@ class TestAgainstStubServer(unittest.TestCase):
         self.assertNotIn("model", server.requests[0])
 
     def test_a_refusal_carries_the_servers_own_words(self):
-        """"HTTP Error 400: Bad Request" alone sends you reading code."""
+        """"HTTP Error 400: Bad Request" alone sends you reading code.
+
+        The example used to be "model is not loaded"; that one now raises
+        ModelUnavailable, because it condemns every window rather than this one.
+        A context overflow is the genuinely per-chunk kind of refusal.
+        """
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_status = 400
+        server.raw_reply = {"error": {"message": "the prompt is too long"}}
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        with self.assertRaises(llm.EndpointError) as caught:
+            client.complete("hi", llm.response_schema(["stutter"]))
+        self.assertIn("the prompt is too long", str(caught.exception))
+
+    def test_the_unloaded_model_refusal_also_quotes_the_server(self):
         server = _StubLlamaServer([])
         self.addCleanup(server.close)
         server.raw_status = 400
         server.raw_reply = {"error": {"message": "model is not loaded"}}
         client = llm.LlamaClient(server.endpoint, timeout=10)
-        with self.assertRaises(llm.EndpointError) as caught:
+        with self.assertRaises(llm.ModelUnavailable) as caught:
             client.complete("hi", llm.response_schema(["stutter"]))
         self.assertIn("model is not loaded", str(caught.exception))
 
@@ -996,6 +1046,270 @@ class TestAgainstStubServer(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0]["accepted"], 1)
         self.assertEqual(lines[0]["words"], [0, 2])
+        self.assertIsNone(lines[0]["error"])
+
+    def test_audit_says_outright_when_a_chunk_failed(self):
+        """A failed window and a clean one must not read alike.
+
+        A real episode had every window of a track time out, and the audit was
+        read as the model finding nothing to cut. Both write empty `raw`, zero
+        accepted and nothing rejected; they differed only in `content`, which is
+        null for a failure *and* null whenever edits were kept — overloaded
+        enough that the reader guessed wrong. `error` states it instead.
+        """
+        parsed = self._words(["eu", "eu", "acho"])
+
+        audit = os.path.join(tempfile.mkdtemp(), "audit.jsonl")
+        # `None` makes the stub answer HTTP 500, so the chunk exhausts its
+        # retries and is dropped exactly as a timeout would be.
+        self._detect(parsed, [None, None, None], audit_path=audit, retries=2)
+        with open(audit, encoding="utf-8") as handle:
+            failed = json.loads(handle.readline())
+
+        clean_audit = os.path.join(tempfile.mkdtemp(), "audit.jsonl")
+        self._detect(parsed, [{"edits": []}], audit_path=clean_audit)
+        with open(clean_audit, encoding="utf-8") as handle:
+            clean = json.loads(handle.readline())
+
+        # Everything describing the outcome agrees...
+        for field in ("raw", "accepted", "rejected"):
+            self.assertEqual(failed[field], clean[field], field)
+        # ...so `error` has to carry the difference, and carry the reason.
+        self.assertIsNone(clean["error"])
+        self.assertIn("500", failed["error"])
+
+        # The overload that caused the misreading: `content` is null for a
+        # failure and also null for a chunk whose edits were all accepted, so it
+        # cannot be used to tell the two apart.
+        kept_audit = os.path.join(tempfile.mkdtemp(), "audit.jsonl")
+        self._detect(
+            parsed,
+            [{"edits": [{"first": 0, "last": 1, "kind": "stutter",
+                         "confidence": 0.9}]}],
+            audit_path=kept_audit,
+        )
+        with open(kept_audit, encoding="utf-8") as handle:
+            kept = json.loads(handle.readline())
+        self.assertIsNone(kept["content"])
+        self.assertIsNone(failed["content"])
+        self.assertIsNone(kept["error"])
+
+    def test_every_chunk_failing_is_not_reported_as_success(self):
+        """A track nothing could be learned about must not exit 0.
+
+        Dropping the odd window is deliberate tolerance; dropping all of them
+        means the track was never analysed, and exiting 0 would let the shell
+        mark it done, skip it on resume, and publish a report showing zero edits
+        — which reads exactly like clean speech. Invariant 10.
+        """
+        import io, contextlib
+        parsed = self._words(["eu", "eu", "acho", "que", "sim"])
+        server = _StubLlamaServer([None] * 12)   # every attempt answers HTTP 500
+        self.addCleanup(server.close)
+
+        out = os.path.join(tempfile.mkdtemp(), "edits.json")
+        words = os.path.join(tempfile.mkdtemp(), "words.json")
+        with open(words, "w", encoding="utf-8") as handle:
+            json.dump(parsed, handle)
+
+        argv = ["detect", "--words", words, "--endpoint", server.endpoint,
+                "--out", out, "--chunk-words", "2", "--overlap", "0",
+                "--kinds", "stutter"]
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            with self.assertRaises(SystemExit) as caught:
+                cli.main(argv)
+        self.assertEqual(caught.exception.code, 4)
+        self.assertIn("every chunk failed", buffer.getvalue())
+
+        # The edits file is still written, so the rest of the run can proceed
+        # with this track simply keeping its disfluencies.
+        with open(out, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["edits"], [])
+
+    def test_some_chunks_failing_is_still_a_success(self):
+        """Partial loss is the tolerated case and must stay exit 0."""
+        import io, contextlib
+        parsed = self._words(["eu", "eu", "acho", "que", "sim"])
+        # First window answers, the rest fail: a survivable partial result.
+        server = _StubLlamaServer(
+            [{"edits": [{"first": 0, "last": 1, "kind": "stutter",
+                         "confidence": 0.9}]}] + [None] * 12
+        )
+        self.addCleanup(server.close)
+        out = os.path.join(tempfile.mkdtemp(), "edits.json")
+        words = os.path.join(tempfile.mkdtemp(), "words.json")
+        with open(words, "w", encoding="utf-8") as handle:
+            json.dump(parsed, handle)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                cli.main(["detect", "--words", words, "--endpoint",
+                          server.endpoint, "--out", out, "--chunk-words", "2",
+                          "--overlap", "0", "--kinds", "stutter"]),
+                0,
+            )
+
+    def _truncated_reply(self, count, cut_mid_object=True):
+        """A reply of `count` complete edits, then cut off part-way through one.
+
+        Shaped like what llama.cpp actually returned: pretty-printed, and the
+        cut landing inside an object rather than neatly between them.
+        """
+        body = ",\n".join(
+            '    {\n      "first": %d,\n      "last": %d,\n'
+            '      "kind": "repetition",\n      "confidence": 0.99\n    }'
+            % (index * 2, index * 2 + 1)
+            for index in range(count)
+        )
+        text = '{\n  "edits": [\n' + body
+        return text + ',\n    {\n      "first": 998,\n      "las' if cut_mid_object else text
+
+    def test_a_reply_cut_off_at_the_token_ceiling_keeps_what_arrived(self):
+        """45 real findings should not be lost to a missing closing bracket.
+
+        This is the shape of an actual failure: the model emitted dozens of
+        edits, ran into max_reply_tokens mid-object, and the whole window was
+        discarded because the JSON would not parse.
+        """
+        parsed = self._words([f"w{index}" for index in range(40)])
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_reply = {
+            "choices": [{
+                "message": {"role": "assistant",
+                            "content": self._truncated_reply(12)},
+                "finish_reason": "length",
+            }]
+        }
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        audit = os.path.join(tempfile.mkdtemp(), "audit.jsonl")
+        result = llm.detect(
+            client, parsed, chunk_words=40, overlap=0,
+            limits={"max_words": 4, "max_seconds": 3.0, "min_confidence": 0.6},
+            accepted=["stutter", "repetition"], audit_path=audit,
+        )
+        # All 12 complete edits survive; only the 13th, cut in half, is lost.
+        self.assertEqual(len(result["edits"]), 12)
+        # Truncation is not a failure — the edits are as valid as any other —
+        # but it is reported, because the rest of the window went unjudged.
+        self.assertEqual(result["chunk_failures"], 0)
+        self.assertEqual(result["chunks_truncated"], 1)
+
+        with open(audit, encoding="utf-8") as handle:
+            record = json.loads(handle.readline())
+        self.assertTrue(record["truncated"])
+        self.assertEqual(record["salvaged"], 12)
+        self.assertIsNone(record["error"])
+
+    def test_truncation_is_not_retried(self):
+        """Deterministic decoding means a retry reproduces it exactly.
+
+        Retrying cost three full 2048-token generations per window on a real
+        episode, for three identical truncated replies.
+        """
+        parsed = self._words([f"w{index}" for index in range(40)])
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_reply = {
+            "choices": [{"message": {"content": self._truncated_reply(3)},
+                         "finish_reason": "length"}]
+        }
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        llm.detect(
+            client, parsed, chunk_words=40, overlap=0,
+            limits={"max_words": 4, "max_seconds": 3.0, "min_confidence": 0.6},
+            accepted=["stutter", "repetition"], retries=2,
+        )
+        self.assertEqual(len(server.requests), 1)
+
+    def test_truncation_with_nothing_salvageable_is_a_failure(self):
+        parsed = self._words([f"w{index}" for index in range(40)])
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_reply = {
+            "choices": [{"message": {"content": '{\n  "edits": [\n    {\n  "fir'},
+                         "finish_reason": "length"}]
+        }
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        result = llm.detect(
+            client, parsed, chunk_words=40, overlap=0,
+            limits={"max_words": 4, "max_seconds": 3.0, "min_confidence": 0.6},
+            accepted=["stutter", "repetition"],
+        )
+        self.assertEqual(result["chunk_failures"], 1)
+        self.assertEqual(result["edits"], [])
+
+    def test_salvage_handles_the_shapes_a_cut_can_land_on(self):
+        whole = self._truncated_reply(3, cut_mid_object=False)
+        self.assertEqual(len(llm._salvage_edits(whole)), 3)
+        self.assertEqual(len(llm._salvage_edits(self._truncated_reply(3))), 3)
+        # Cut exactly on the separator, and cut before any object closes.
+        self.assertEqual(len(llm._salvage_edits(whole + ",")), 3)
+        self.assertEqual(llm._salvage_edits('{"edits": ['), [])
+        self.assertEqual(llm._salvage_edits(""), [])
+        self.assertEqual(llm._salvage_edits("not json at all"), [])
+        # A complete, well-formed reply salvages to exactly its own contents.
+        self.assertEqual(
+            llm._salvage_edits(json.dumps({"edits": [{"first": 1, "last": 2}]})),
+            [{"first": 1, "last": 2}],
+        )
+
+    def test_a_server_with_no_model_ends_the_run(self):
+        """The model is the server's state, so one window's 400 condemns all.
+
+        Seen for real: the router unloaded the model while transcribe was
+        running, and detect burned a whole stage rediscovering that per window.
+        """
+        parsed = self._words([f"w{index}" for index in range(40)])
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_reply = {"error": {"message": "model is not loaded"}}
+        server.raw_status = 400
+        client = llm.LlamaClient(server.endpoint, timeout=10, model="qwen-podcast")
+        with self.assertRaises(llm.ModelUnavailable) as caught:
+            llm.detect(
+                client, parsed, chunk_words=4, overlap=0,
+                limits={"max_words": 4, "max_seconds": 3.0, "min_confidence": 0.6},
+                accepted=["stutter"], retries=2, concurrency=2,
+            )
+        self.assertIn("qwen-podcast", str(caught.exception))
+        # Not retried, and the queued windows never go out: one or two requests
+        # for the workers already in flight, not one per window.
+        self.assertLessEqual(len(server.requests), 2)
+
+    def test_it_exits_5_so_the_shell_can_tell_it_apart(self):
+        import io, contextlib
+        parsed = self._words([f"w{index}" for index in range(8)])
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_reply = {"error": {"message": "model is not loaded"}}
+        server.raw_status = 400
+        words = os.path.join(tempfile.mkdtemp(), "words.json")
+        with open(words, "w", encoding="utf-8") as handle:
+            json.dump(parsed, handle)
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = cli.main(["detect", "--words", words, "--endpoint",
+                             server.endpoint, "--out",
+                             os.path.join(tempfile.mkdtemp(), "e.json"),
+                             "--kinds", "stutter"])
+        self.assertEqual(code, 5)
+        self.assertIn("not serving", buffer.getvalue())
+
+    def test_an_ordinary_400_is_still_only_that_chunk(self):
+        """Narrow matching matters: a context overflow must stay survivable."""
+        parsed = self._words([f"w{index}" for index in range(8)])
+        server = _StubLlamaServer([])
+        self.addCleanup(server.close)
+        server.raw_reply = {"error": {"message": "the prompt is too long"}}
+        server.raw_status = 400
+        client = llm.LlamaClient(server.endpoint, timeout=10)
+        result = llm.detect(
+            client, parsed, chunk_words=8, overlap=0,
+            limits={"max_words": 4, "max_seconds": 3.0, "min_confidence": 0.6},
+            accepted=["stutter"], retries=0,
+        )
+        self.assertEqual(result["chunk_failures"], 1)
 
     def test_multiple_chunks_are_deduplicated(self):
         # 30 words with a 10-word window and 4-word overlap: several chunks, and
@@ -1012,6 +1326,128 @@ class TestAgainstStubServer(unittest.TestCase):
         self.assertEqual(len(result["edits"]), 1)
         self.assertEqual((result["edits"][0]["first"], result["edits"][0]["last"]),
                          (6, 7))
+
+
+class TestDetectConcurrency(unittest.TestCase):
+    """Several windows in flight at once, against a --parallel llama-server.
+
+    The claim being tested is that this is a throughput change and nothing
+    else. Chunks are planned up front and reconciled by index afterwards, so
+    the wire order genuinely does not matter — but only if nothing downstream
+    quietly depends on it. These pin that down, because the failure mode is not
+    a crash: it is an audit file or an edit list that shuffles between runs and
+    can no longer be compared against the previous one.
+    """
+
+    WINDOW = re.compile(r"they start at (\d+) and end at (\d+)")
+
+    def _words(self, count):
+        return {
+            "participant": "alice",
+            "language": "pt",
+            "words": [
+                {"i": index, "text": f"w{index}", "start": index * 0.5,
+                 "end": index * 0.5 + 0.4, "segment": 0}
+                for index in range(count)
+            ],
+            "segments": [],
+        }
+
+    def _run(self, concurrency, *, delay=None, audit=None, words=350,
+             api_key=None, client_key=None, auth_delay=0.0):
+        """Detect over `words` words, one edit reported per window.
+
+        `delay` is called with the window's first index and returns how long
+        that reply should take, so a test can decide the order the answers come
+        back in — including the reverse of the order they were asked for.
+        """
+        def responder(payload):
+            first, _ = self.WINDOW.search(
+                payload["messages"][0]["content"]
+            ).groups()
+            first = int(first)
+            if delay:
+                time.sleep(delay(first))
+            return {"edits": [{"first": first, "last": first + 1,
+                               "kind": "repetition", "confidence": 0.9}]}
+
+        server = _StubLlamaServer([], responder=responder, api_key=api_key,
+                                  auth_delay=auth_delay)
+        self.addCleanup(server.close)
+        # Kept for the tests whose subject is a run that raises before
+        # returning, and so never gets the server back the usual way.
+        self.server = server
+        client = llm.LlamaClient(server.endpoint, timeout=10, api_key=client_key)
+        result = llm.detect(
+            client,
+            self._words(words),
+            chunk_words=100,
+            overlap=10,
+            limits={"max_words": 4, "max_seconds": 3.0, "min_confidence": 0.6},
+            accepted=["stutter", "repetition"],
+            audit_path=audit,
+            concurrency=concurrency,
+        )
+        return result, server
+
+    def _audit(self):
+        return os.path.join(tempfile.mkdtemp(), "audit.jsonl")
+
+    def test_parallel_run_matches_the_sequential_one_exactly(self):
+        sequential_audit, parallel_audit = self._audit(), self._audit()
+        sequential, _ = self._run(1, audit=sequential_audit)
+        parallel, _ = self._run(4, audit=parallel_audit)
+
+        # The fixture has to span several windows, or this proves nothing.
+        self.assertEqual(sequential["chunks"], 4)
+        self.assertGreater(len(sequential["edits"]), 1)
+
+        self.assertEqual(sequential, parallel)
+        with open(sequential_audit) as handle:
+            first_run = handle.read()
+        with open(parallel_audit) as handle:
+            self.assertEqual(first_run, handle.read())
+
+    def test_windows_really_do_overlap_on_the_wire(self):
+        _, server = self._run(4, delay=lambda first: 0.05)
+        self.assertGreater(server.peak_in_flight, 1)
+
+    def test_the_default_keeps_one_request_in_flight(self):
+        _, server = self._run(1, delay=lambda first: 0.02)
+        self.assertEqual(server.peak_in_flight, 1)
+
+    def test_answers_arriving_backwards_still_record_in_chunk_order(self):
+        """The audit is a diffable record, so its order cannot be a race.
+
+        Chunk 0 is made the slowest, so the replies finish in the reverse of
+        the order they were asked for.
+        """
+        audit = self._audit()
+        self._run(4, delay=lambda first: max(0.0, 0.2 - first * 0.0005),
+                  audit=audit)
+        with open(audit) as handle:
+            records = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual([r["chunk"] for r in records], [0, 1, 2, 3])
+        self.assertEqual([r["words"][0] for r in records], [0, 90, 180, 270])
+
+    def test_a_refused_key_stops_the_track_without_sending_every_window(self):
+        """A bad key must not become hundreds of doomed requests.
+
+        Sequentially this cost one wasted request. Every window is submitted to
+        the pool up front now, so without cancelling the queue, giving up would
+        still work through all of it first.
+        """
+        total = len(llm.plan_chunks(4000, 100, 10))
+        self.assertGreater(total, 20)
+        with self.assertRaises(llm.AuthRejected):
+            self._run(4, words=4000, api_key="right", client_key="wrong",
+                      auth_delay=0.05)
+        self.assertLess(len(self.server.seen_auth), total)
+
+    def test_more_workers_than_windows_is_harmless(self):
+        result, server = self._run(16, words=50)
+        self.assertEqual(result["chunks"], 1)
+        self.assertEqual(len(server.requests), 1)
 
 
 class TestApiKeyAuth(unittest.TestCase):
@@ -1246,6 +1682,158 @@ class TestVadTranscriptDisagreement(unittest.TestCase):
         speech = {"a": [(0.0, 4.0), (14.0, 20.0)]}
         result = planner.build_plan(_meta(["a"], 20.0), speech, {}, {}, PARAMS)
         self.assertEqual(result["words_lost_to_silence"], {})
+
+
+class TestSpeechOnlyChunking(unittest.TestCase):
+    """Silence is withheld from Whisper, because it invents text over it.
+
+    The recording behind this had a muted mic transcribed as one sentence
+    repeated 198 times across 4.6 minutes. Language settings did not change it —
+    the output was byte-identical — so the fix is not to send the silence.
+    """
+
+    def test_silence_between_speech_is_never_sent(self):
+        speech = [(10.0, 20.0), (280.0, 300.0)]
+        chunks = asr.plan_speech_chunks(600.0, 600.0, speech)
+        covered = sum(end - start for start, end in chunks)
+        # Only the speech, plus a padding margin at each edge.
+        self.assertEqual(len(chunks), 2)
+        self.assertLess(covered, 40.0)
+        # The 260s of dead air between them is not in any chunk.
+        for start, end in chunks:
+            self.assertFalse(start < 150.0 < end)
+
+    def test_short_pauses_do_not_fragment_a_region(self):
+        """Splitting on every breath would multiply requests and lose context."""
+        speech = [(10.0, 20.0), (21.0, 30.0), (31.0, 40.0)]
+        chunks = asr.plan_speech_chunks(600.0, 600.0, speech)
+        self.assertEqual(len(chunks), 1)
+        self.assertLessEqual(chunks[0][0], 10.0)
+        self.assertGreaterEqual(chunks[0][1], 40.0)
+
+    def test_speech_is_padded_so_a_boundary_cannot_clip_a_word(self):
+        chunks = asr.plan_speech_chunks(600.0, 600.0, [(100.0, 110.0)])
+        start, end = chunks[0]
+        self.assertLess(start, 100.0)
+        self.assertGreater(end, 110.0)
+        self.assertAlmostEqual(start, 100.0 - asr.SPEECH_PAD, places=6)
+
+    def test_padding_never_runs_past_the_track(self):
+        chunks = asr.plan_speech_chunks(30.0, 600.0, [(0.0, 30.0)])
+        self.assertEqual(chunks, [(0.0, 30.0)])
+
+    def test_a_long_region_is_still_split_for_upload(self):
+        speech = [(0.0, 1800.0)]
+        chunks = asr.plan_speech_chunks(1800.0, 600.0, speech)
+        self.assertGreater(len(chunks), 1)
+        # Contiguous, and covering the speech exactly once.
+        for before, after in zip(chunks, chunks[1:]):
+            self.assertAlmostEqual(before[1], after[0], places=6)
+        self.assertAlmostEqual(chunks[0][0], 0.0)
+        self.assertAlmostEqual(chunks[-1][1], 1800.0)
+
+    def test_an_empty_speech_map_transcribes_everything(self):
+        """A silent VAD is far likelier to be misconfigured than correct.
+
+        Transcribing nothing would produce a well-formed empty transcript and
+        hide the misconfiguration; the plan stage already warns about a track
+        with no speech, so the honest fallback is to send the audio.
+        """
+        self.assertEqual(asr.plan_speech_chunks(600.0, 600.0, []), [(0.0, 600.0)])
+        self.assertEqual(asr.plan_speech_chunks(600.0, 600.0, None), [(0.0, 600.0)])
+
+    def test_it_matches_the_real_episode(self):
+        """Against this track's actual VAD, most of it should go unsent."""
+        # host: 3m18s of speech in a 600s track, the rest hallucinated over.
+        speech = [(0.0, 5.0), (300.0, 310.0), (595.0, 600.0)]
+        chunks = asr.plan_speech_chunks(600.0, 600.0, speech)
+        covered = sum(end - start for start, end in chunks)
+        self.assertLess(covered / 600.0, 0.1)
+
+
+class TestHallucinatedTranscript(unittest.TestCase):
+    """A track whose transcript its own audio does not support.
+
+    Taken from a real episode: Whisper was given a mic that was silent while the
+    other speaker talked, and looped one sentence 198 times over 4.6 minutes —
+    73% of that track. Every check the pipeline had stayed quiet, because they
+    all key off cuts, and no cut is made where another track has speech.
+    """
+
+    def _meta(self, duration=600.0):
+        return {
+            "episode_id": "ep001",
+            "duration": duration,
+            "tracks": [{"participant": "host"}, {"participant": "guest"}],
+        }
+
+    def _params(self):
+        return {
+            "silence_min_duration": 1.5, "silence_keep": 0.4, "edge_keep": 0.25,
+            "cut_padding": 0.1, "min_cut": 0.15, "mute_fade": 0.03,
+            "max_cut_fraction": 0.5, "vad_backend": "silero",
+        }
+
+    def _loop(self, count, start, step=0.2):
+        """`count` words over a stretch, the way a looping Whisper emits them."""
+        phrase = ["I", "lost", "my", "train", "of", "thought", "here."]
+        return [
+            {"i": index, "text": phrase[index % len(phrase)],
+             "start": start + index * step, "end": start + index * step + step * 0.8,
+             "segment": 0}
+            for index in range(count)
+        ]
+
+    def test_a_track_transcribed_over_its_own_silence_is_reported(self):
+        # host says nothing for the whole window; guest talks throughout, so no
+        # all-track silence exists and nothing is ever cut.
+        words = {"host": self._loop(300, 100.0), "guest": []}
+        speech = {"host": [(0.0, 5.0)], "guest": [(90.0, 200.0)]}
+        plan = planner.build_plan(
+            self._meta(), speech, {"host": [], "guest": []}, words, self._params()
+        )
+        warning = " ".join(plan["warnings"])
+        self.assertIn("of host's transcript", warning)
+        self.assertIn("no speech at all", warning)
+        self.assertIn("lost my train of thought", warning)
+
+        # The old cut-based check cannot see this: there is nothing to cut.
+        self.assertEqual(plan["words_lost_to_silence"], {})
+        self.assertEqual(plan["stats"]["per_participant"]["host"]["words_lost_to_silence"], 0)
+        # The new one counts every phantom word, and records a readable sample.
+        record = plan["words_without_speech"]["host"]
+        self.assertEqual(record["count"], 300)
+        self.assertEqual(record["of"], 300)
+        self.assertLessEqual(len(record["sample"]), 20)
+        self.assertEqual(plan["stats"]["per_participant"]["host"]["words_without_speech"], 300)
+
+    def test_a_transcript_its_track_supports_raises_nothing(self):
+        words = {"host": self._loop(300, 100.0), "guest": []}
+        speech = {"host": [(90.0, 200.0)], "guest": [(90.0, 200.0)]}
+        plan = planner.build_plan(
+            self._meta(), speech, {"host": [], "guest": []}, words, self._params()
+        )
+        self.assertNotIn(
+            "no speech at all", " ".join(plan["warnings"])
+        )
+        self.assertEqual(plan["words_without_speech"], {})
+
+    def test_a_few_words_over_a_vad_boundary_are_not_worth_a_warning(self):
+        """Below the threshold this must stay silent, or it cries wolf.
+
+        Clipping the odd quiet consonant is normal; a warning on every episode
+        is a warning nobody reads.
+        """
+        words = {"host": self._loop(100, 100.0), "guest": []}
+        # All but the last handful sit inside detected speech.
+        speech = {"host": [(99.0, 118.0)], "guest": [(90.0, 200.0)]}
+        plan = planner.build_plan(
+            self._meta(), speech, {"host": [], "guest": []}, words, self._params()
+        )
+        outside = plan["stats"]["per_participant"]["host"]["words_without_speech"]
+        self.assertGreater(outside, 0)
+        self.assertLess(outside / 100, planner.UNSUPPORTED_WORD_WARN_FRACTION)
+        self.assertNotIn("no speech at all", " ".join(plan["warnings"]))
 
 
 class TestPlanBuilder(unittest.TestCase):

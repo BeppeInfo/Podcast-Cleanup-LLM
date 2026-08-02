@@ -346,6 +346,46 @@ the per-chunk tolerance, inverted: dropping a window is survivable precisely
 because it is rare, so a fault that would drop *every* window must not be
 allowed to look like the survivable case.
 
+### Windows may go in parallel, and nothing observable changes
+
+The first real episode made the cost of one-at-a-time obvious: the server was
+busy the whole time and the machine was not, because a single request decodes at
+batch size 1, which is bound by memory bandwidth rather than by cores.
+`LLM_CONCURRENCY` puts several windows in flight against a llama-server given
+matching `--parallel` slots.
+
+Nothing about the design resisted this. Windows are planned up front by
+`plan_chunks`, none depends on another's answer, and overlaps are reconciled
+afterwards by `_dedupe` sorting on index — so the wire order was never load
+bearing. What *was* at risk is everything a person looks at afterwards. The
+audit JSONL is meant to be diffed against a previous run, and an edit list that
+shuffles between runs cannot be. So results are consumed in **submission order,
+not completion order**: `detect` blocks on the oldest outstanding window,
+validates it, writes its audit line, then advances the progress count. This
+costs no throughput, because the window being waited on is itself still in
+flight — the same number of requests are outstanding either way.
+
+Two things follow from the same choice:
+
+- **Only `LLM_CONCURRENCY` windows are ever submitted**, topped up one at a time
+  as each is consumed, rather than the whole track being queued into the pool.
+  That is what keeps a refused key costing one wasted request instead of one per
+  chunk. Submitting everything up front broke exactly that, and the test written
+  long before this feature — "one attempt, not three" — is what caught it.
+- **The default stays 1.** A server with one slot gains nothing, and the setting
+  is only correct when it matches how the server was actually launched. Too high
+  is not an error: the surplus queues inside the server where the client cannot
+  see it, and the run merely looks slow.
+
+The sharp edge is context, not concurrency. Giving llama-server an explicit
+`-np` takes the slot count out of "auto", which is also what turns `--kv-unified`
+off, so `-c` is split and each slot gets `n_ctx / n_parallel`. Raising the slot
+count therefore *shrinks* the window each chunk must fit into, and a chunk that
+no longer fits is refused, dropped, and shows up only as a track that found
+suspiciously little. `stage_detect` does that arithmetic before the episode and
+warns — but only for a server it starts itself, since a remote one's `-c` and
+`-np` cannot be read back.
+
 ## 7. Model placement and memory
 
 Whisper and the LLM are configured independently. Empty `WHISPER_ENDPOINT` or
@@ -477,15 +517,29 @@ are marked.
    rest of the run.
 10. **A fault that would affect every chunk identically stops the run.** Per-item
     tolerance — dropping a window whose response cannot be used — is only safe
-    because it is rare. A refused key or an unhonoured schema would drop all of
-    them and finish reporting no edits, which is indistinguishable from clean
-    speech, so both abort instead. Any new whole-run failure mode belongs here
-    rather than in the per-chunk `except`.
+    because it is rare. A refused key, an unhonoured schema, or a server with no
+    model loaded would drop all of them and finish reporting no edits, which is
+    indistinguishable from clean speech, so all three abort instead (exit 2, 3
+    and 5). A track where *every* window failed for ordinary reasons is the
+    weaker case: exit 4, which fails that track and lets the rest of the episode
+    finish. Any new whole-run failure mode belongs here rather than in the
+    per-chunk `except`.
+
+    The unloaded model earned its place the hard way. A router with
+    `--no-models-autoload` dropped the model *during* the transcribe stage, so
+    the readiness check at the top of `detect` had passed several minutes
+    earlier and every window then failed with an ordinary-looking HTTP 400.
+    Checking a server before a long stage does not prove it will still be there
+    after it.
+11. **Detection does not depend on how many windows are in flight.** Raising
+    `LLM_CONCURRENCY` changes speed and nothing else: the edits, the audit file
+    and the failure count come out byte-identical to a sequential run, because
+    windows are consumed in submission order however they are answered.
 
 ## 10. Testing strategy
 
 ```sh
-python3 tests/test_pipeline.py    # 88 tests, 13 classes, ~14 s, stdlib only
+python3 tests/test_pipeline.py    # 156 tests, 21 classes, ~60 s, stdlib only
 ./tests/selftest.sh               # 64 checks, 10 cases, ~17 s, ffmpeg only
 ```
 
@@ -680,6 +734,8 @@ Cross-reference for [§9](#9-invariants):
 | 7. inputs deleted only after verification | selftest cases 1 (deleted), 3 (preserved on failure) |
 | 8. transcript matches the rendered audio | `TestFinalTranscript`, selftest case 6 |
 | 9. failure is recoverable | selftest case 3 (work dir kept), 6 and 7 (resume via `--from`) |
+| 10. a whole-run fault aborts | `TestApiKeyAuth`, `TestAgainstStubServer` schema cases |
+| 11. concurrency changes speed only | `TestDetectConcurrency` (result and audit compared against a sequential run) |
 
 Invariant 6 is the gap worth remembering. It cannot be observed without loading
 two real models, so it is held structurally instead: `stage_transcribe` waits for
@@ -768,4 +824,5 @@ authority. The ones whose meaning is easy to get wrong:
 | `PODCAST_ROOT` | the whole layout; the four directory settings override it individually |
 | `LLM_API` | `chat` lets the server apply the model's template; `completion` is the raw-prompt fallback |
 | `LLM_CHECK_SCHEMA` | one request that turns a silent whole-run failure into an immediate one |
+| `LLM_CONCURRENCY` | throughput only; correct only when it matches the server's slot count, and `LLAMA_CTX` has to be split that many ways |
 | `*_API_KEY_FILE` | preferred over the inline form; the key never reaches argv or the log |

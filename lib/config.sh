@@ -59,6 +59,12 @@ config_defaults() {
     : "${WHISPER_MODEL:=/srv/llm/models/whisper/ggml-large-v3-turbo.bin}"
     : "${WHISPER_THREADS:=$(nproc 2>/dev/null || echo 4)}"
     : "${WHISPER_LANG:=auto}"
+    # Send only the stretches the VAD calls speech, rather than the whole track.
+    # Whisper invents text over silence and loops a phrase while doing it, so the
+    # silence is worth withholding. The cost is that speech the VAD missed is
+    # never transcribed at all, which is why the stage reports how much it
+    # skipped. Set to 0 to send everything, the way this worked before.
+    : "${WHISPER_SKIP_SILENCE:=1}"
     : "${WHISPER_EXTRA_ARGS:=}"
 
     # llama.cpp -------------------------------------------------------------
@@ -98,6 +104,19 @@ config_defaults() {
     # Send one tiny schema-constrained request before the episode starts, to
     # catch a server that answers /health but does not honour response_format.
     : "${LLM_CHECK_SCHEMA:=1}"
+    # How many transcript windows are in flight at once. Chunks are independent,
+    # so this is pure throughput: at 1 the server decodes at batch size 1, which
+    # is memory-bandwidth-bound and leaves most of a CPU idle.
+    #
+    # It has to match the server's slot count. A server we start ourselves gets
+    # --parallel from this value; for LLAMA_ENDPOINT, set it to the -np the
+    # server was launched with. Going higher only queues requests inside the
+    # server, where this side cannot see them.
+    #
+    # Mind LLAMA_CTX with it: unless llama-server was given --kv-unified, -c is
+    # the total and each slot gets -c / -np. The detect stage checks that
+    # arithmetic against LLM_CHUNK_WORDS and warns before wasting an episode.
+    : "${LLM_CONCURRENCY:=1}"
 
     # Voice activity / silence ----------------------------------------------
     : "${VAD_BACKEND:=ffmpeg}"            # ffmpeg | silero
@@ -332,9 +351,12 @@ config_validate() {
     done
     for v in LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP LLM_MAX_EDIT_WORDS WHISPER_JOBS \
              FFMPEG_JOBS LLAMA_PORT LLAMA_CTX OUTPUT_COMPRESSION \
-             RENDER_FRAME_SAMPLES; do
+             LLM_CONCURRENCY RENDER_FRAME_SAMPLES; do
         _require_int "$v"
     done
+
+    (( LLM_CONCURRENCY >= 1 )) \
+        || die "LLM_CONCURRENCY must be at least 1, got $LLM_CONCURRENCY"
 
     (( RENDER_FRAME_SAMPLES >= 64 && RENDER_FRAME_SAMPLES <= 8192 )) \
         || die "RENDER_FRAME_SAMPLES must be between 64 and 8192, got $RENDER_FRAME_SAMPLES"
@@ -482,9 +504,10 @@ config_dump() {
              WHISPER_ENDPOINT WHISPER_ENDPOINT_PATH WHISPER_CHUNK_SECONDS \
              WHISPER_REQUEST_TIMEOUT \
              WHISPER_BIN WHISPER_MODEL WHISPER_THREADS WHISPER_LANG WHISPER_JOBS \
+             WHISPER_SKIP_SILENCE \
              LLAMA_ENDPOINT LLAMA_SERVER_BIN LLAMA_MODEL LLAMA_HOST LLAMA_PORT \
              LLAMA_CTX LLAMA_NGL LLAMA_MODEL_NAME LLM_API LLM_MAX_REPLY_TOKENS \
-             LLM_CHECK_SCHEMA \
+             LLM_CHECK_SCHEMA LLM_CONCURRENCY \
              VAD_BACKEND SILENCE_THRESHOLD SILERO_THRESHOLD \
              SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \
              MUTE_FADE LLM_ENABLE LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP \

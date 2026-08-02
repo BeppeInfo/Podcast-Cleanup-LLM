@@ -10,3 +10,12 @@ podcast-cleanup.conf
 /output/
 /work/
 /failed/
+
+# Real recordings used for manual testing. Nobody consented to these being
+# published, so they must never become a commit — and the checkout root is
+# where they naturally land. The tracked sample under tests/samples/ is the
+# only audio that belongs in git.
+/*.flac
+/*.wav
+/*.m4a
+/*.mp3

@@ -13,10 +13,18 @@ Two decisions shape this module:
 
 The server is expected to be up already — process lifetime is the shell's job,
 because Whisper must be finished and gone before the model is loaded.
+
+Chunks are independent by construction — every window is planned up front and
+overlaps are reconciled afterwards — so `concurrency` can put several in flight
+at once against a llama-server started with `--parallel`. It stays at 1 unless
+asked, because a server with one slot gains nothing from it and the fan-out has
+to match how the server was actually launched.
 """
 
 from __future__ import annotations
 
+import collections
+import concurrent.futures
 import json
 import time
 import urllib.error
@@ -186,6 +194,25 @@ class SchemaIgnored(Exception):
     """
 
 
+class ModelUnavailable(Exception):
+    """The server is up but is not serving the model we asked for.
+
+    A whole-run fault wearing a per-request disguise. It arrives as an ordinary
+    HTTP 400 on one window, but the model is a property of the server, so every
+    remaining window will fail identically — and a router with
+    --no-models-autoload will not fix itself while we retry. Seen for real: the
+    router unloaded the model during the transcribe stage, and the detect stage
+    then spent itself discovering that four windows at a time.
+    """
+
+
+# Phrases a llama.cpp router uses when the model is not there to serve. Matched
+# narrowly on purpose: turning a per-chunk error into a run-ending one is the
+# right call for a server-state problem and the wrong call for anything else.
+_MODEL_GONE = ("model is not loaded", "model not loaded", "model not found",
+               "unknown model")
+
+
 class LlamaClient:
     """Client for a llama.cpp server, whichever model it happens to be serving.
 
@@ -199,6 +226,11 @@ class LlamaClient:
 
     api="completion" keeps the old raw-prompt path for a server that lacks the
     chat endpoint, or to compare the two against the same episode.
+
+    One instance is shared by every worker thread in detect(). That is safe
+    because nothing here is per-request state: the fields are settings fixed at
+    construction, and each call builds its own Request and reads its own
+    response.
     """
 
     def __init__(
@@ -257,6 +289,16 @@ class LlamaClient:
             # Any other refusal: keep what the server actually said. "HTTP Error
             # 400: Bad Request" alone sends you reading code instead of config.
             detail = _error_detail(exc)
+            lowered = detail.lower()
+            if any(phrase in lowered for phrase in _MODEL_GONE):
+                raise ModelUnavailable(
+                    f"the llama endpoint is not serving "
+                    + (f"'{self.model}'" if self.model else "a model")
+                    + f": {detail}. Load it before the run — a router started "
+                    "with --no-models-autoload will not load it on demand, and "
+                    "it can unload between the schema check and the detect "
+                    "stage if the episode spends long enough in transcribe."
+                ) from exc
             raise EndpointError(
                 f"the llama endpoint refused the request (HTTP {exc.code})"
                 + (f": {detail}" if detail else "")
@@ -316,6 +358,19 @@ class LlamaClient:
         return False
 
     def complete(self, prompt: str, schema: dict, max_tokens: int | None = None) -> str:
+        return self.complete_detailed(prompt, schema, max_tokens)[0]
+
+    def complete_detailed(
+        self, prompt: str, schema: dict, max_tokens: int | None = None
+    ) -> tuple[str, str]:
+        """The reply, and why generation stopped.
+
+        The reason is worth carrying because a reply cut off at the token
+        ceiling is truncated JSON, and truncated JSON fails to parse in exactly
+        the way a broken server does. Told them apart, the caller can keep the
+        edits that did arrive and report the real cause; conflated, hours go
+        into suspecting the endpoint.
+        """
         budget = max_tokens or self.max_reply_tokens
         if self.api == "completion":
             result = self._post(
@@ -329,12 +384,14 @@ class LlamaClient:
                     "json_schema": schema,
                 },
             )
-            return result.get("content", "")
+            # llama.cpp's raw endpoint flags a reply stopped by n_predict here.
+            finish = "length" if result.get("stopped_limit") else "stop"
+            return result.get("content", ""), finish
 
         result = self._post(
             "/v1/chat/completions", self._chat_payload(prompt, schema, budget)
         )
-        return _chat_content(result)
+        return _chat_content(result), _chat_finish(result)
 
     def _chat_payload(self, prompt: str, schema: dict, budget: int) -> dict:
         payload = {
@@ -374,7 +431,9 @@ class LlamaClient:
         )
         try:
             content = self.complete(probe, schema, max_tokens=128)
-        except AuthRejected:
+        except (AuthRejected, ModelUnavailable):
+            # Both already say exactly what is wrong and both end the run;
+            # wrapping them in SchemaIgnored would only blur the diagnosis.
             raise
         except Exception as exc:
             # A server in router mode serves several models and refuses a
@@ -427,6 +486,47 @@ def _error_detail(exc: urllib.error.HTTPError) -> str:
     if isinstance(error, dict):
         return str(error.get("message") or error)[:200]
     return str(error)[:200]
+
+
+def _chat_finish(result: dict) -> str:
+    """Why the server stopped generating; "stop" when it does not say."""
+    choices = result.get("choices") or []
+    if not choices:
+        return "stop"
+    return choices[0].get("finish_reason") or "stop"
+
+
+def _salvage_edits(content: str) -> list:
+    """Whole edit objects from a reply that was cut off part-way through one.
+
+    A truncated array is not junk: everything before the cut is complete and
+    goes through exactly the same validation as any other edit. Discarding the
+    lot because the closing bracket is missing throws away dozens of real
+    findings — on the episode that prompted this, 45 of them in one window.
+    """
+    if not content:
+        return []
+    key = content.find('"edits"')
+    start = content.find("[", key if key >= 0 else 0)
+    if start < 0:
+        return []
+
+    decoder = json.JSONDecoder()
+    edits: list = []
+    index = start + 1
+    while index < len(content):
+        while index < len(content) and content[index] in " \t\r\n,":
+            index += 1
+        if index >= len(content) or content[index] != "{":
+            break
+        try:
+            edit, index = decoder.raw_decode(content, index)
+        except ValueError:
+            break  # the object the cut landed in; everything before it is kept
+        if not isinstance(edit, dict):
+            break
+        edits.append(edit)
+    return edits
 
 
 def _chat_content(result: dict) -> str:
@@ -522,6 +622,68 @@ def _dedupe(edits):
     return out
 
 
+def _run_chunk(client, words, first, last, accepted, limits, schema, retries) -> dict:
+    """One window's round trip, retries included.
+
+    Runs on a worker thread, so it reports what happened rather than acting on
+    it: printing and accumulating are left to the caller, which handles chunks
+    in order and so keeps the output the same however the requests interleave.
+    """
+    prompt = build_prompt(words, first, last, accepted, limits["max_words"])
+
+    content = None
+    for attempt in range(max(0, retries) + 1):
+        try:
+            content, finish = client.complete_detailed(prompt, schema)
+
+            if finish == "length":
+                # The reply ran into max_reply_tokens. Retrying is pointless —
+                # temperature 0 and top_k 1 make it deterministic, so two more
+                # attempts would generate the identical truncated reply and cost
+                # the same tokens again. Keep what arrived and move on.
+                salvaged = _salvage_edits(content)
+                return {
+                    "edits": salvaged,
+                    "content": content,
+                    "error": None if salvaged else
+                             "reply hit the LLM_MAX_REPLY_TOKENS ceiling before "
+                             "a single complete edit",
+                    "truncated": True,
+                    "salvaged": len(salvaged),
+                }
+
+            answer = json.loads(content)
+            if not isinstance(answer, dict):
+                # Valid JSON of the wrong shape. Treated as a parse failure so
+                # it takes the retry-then-drop path with everything else that
+                # comes back unusable, instead of raising AttributeError below
+                # and taking the whole track down with it.
+                raise json.JSONDecodeError("expected a JSON object", content or "", 0)
+            return {
+                "edits": answer.get("edits") or [],
+                "content": content,
+                "error": None,
+                "truncated": False,
+                "salvaged": 0,
+            }
+        # Deliberately not caught: AuthRejected and ModelUnavailable. Both are
+        # properties of the server rather than of this window, so retrying
+        # wastes time and dropping the chunk would turn a misconfiguration into
+        # an episode that quietly found no edits.
+        except (
+            urllib.error.URLError,
+            json.JSONDecodeError,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            if attempt == retries:
+                return {
+                    "edits": [], "content": content, "error": str(exc),
+                    "truncated": False, "salvaged": 0,
+                }
+            time.sleep(1.5 * (attempt + 1))
+
+
 def detect(
     client: LlamaClient,
     parsed,
@@ -533,68 +695,127 @@ def detect(
     audit_path: str | None = None,
     retries: int = 2,
     on_progress=None,
+    concurrency: int = 1,
 ) -> dict:
-    """Run detection over one participant's transcript."""
+    """Run detection over one participant's transcript.
+
+    `concurrency` is how many windows may be in flight at once. It should match
+    the slot count the llama-server was given (`--parallel`): more than that
+    just queues inside the server, and the queue is invisible from here.
+    """
     words = parsed["words"]
     chunks = plan_chunks(len(words), chunk_words, overlap)
     schema = response_schema(accepted)
+    workers = max(1, min(int(concurrency), len(chunks) or 1))
 
     collected: list[dict] = []
     rejected: list[dict] = []
     failures = 0
+    truncated = 0
     audit = open(audit_path, "w", encoding="utf-8") if audit_path else None
 
     try:
-        for index, (first, last) in enumerate(chunks):
-            if on_progress:
-                on_progress(index + 1, len(chunks))
-            prompt = build_prompt(words, first, last, accepted, limits["max_words"])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            # Only `workers` windows are ever outstanding, rather than the whole
+            # track being queued at once. That is what keeps a refused key
+            # costing one wasted request instead of one per chunk: nothing is
+            # sent that we have not already decided to wait for.
+            pending: collections.deque = collections.deque()
+            submitted = 0
 
-            content = None
-            for attempt in range(retries + 1):
-                try:
-                    content = client.complete(prompt, schema)
-                    parsed_response = json.loads(content)
-                    break
-                # Deliberately not caught: AuthRejected. Retrying a refused key
-                # only wastes time, and dropping the chunk would turn a
-                # misconfiguration into an episode that quietly found no edits.
-                except (
-                    urllib.error.URLError,
-                    json.JSONDecodeError,
-                    TimeoutError,
-                    OSError,
-                ) as exc:
-                    if attempt == retries:
-                        failures += 1
-                        print(
-                            f"  chunk {index + 1}/{len(chunks)} "
-                            f"(words {first}-{last}) failed: {exc}"
+            def top_up():
+                nonlocal submitted
+                while submitted < len(chunks) and len(pending) < workers:
+                    first, last = chunks[submitted]
+                    pending.append(
+                        pool.submit(
+                            _run_chunk, client, words, first, last,
+                            accepted, limits, schema, retries,
                         )
-                        parsed_response = {"edits": []}
-                    else:
-                        time.sleep(1.5 * (attempt + 1))
-
-            raw_edits = parsed_response.get("edits") or []
-            kept, dropped = _validate(raw_edits, words, first, last, limits, accepted)
-            collected.extend(kept)
-            rejected.extend(dropped)
-
-            if audit:
-                audit.write(
-                    json.dumps(
-                        {
-                            "chunk": index,
-                            "words": [first, last],
-                            "raw": raw_edits,
-                            "accepted": len(kept),
-                            "rejected": dropped,
-                            "content": content if not kept and content else None,
-                        },
-                        ensure_ascii=False,
                     )
-                    + "\n"
-                )
+                    submitted += 1
+
+            top_up()
+            try:
+                # Consumed in submission order rather than completion order.
+                # Several windows are in flight, but the audit file, the
+                # warnings and the progress count are all built in chunk order,
+                # so nothing a reader sees afterwards depends on which slot
+                # happened to answer first. Waiting on the oldest costs no
+                # throughput — the one being waited on is itself still in
+                # flight, so `workers` requests are outstanding either way.
+                for index in range(len(chunks)):
+                    outcome = pending.popleft().result()
+                    top_up()
+                    first, last = chunks[index]
+
+                    if outcome["error"]:
+                        failures += 1
+                        # WARN-prefixed so the shell's parser puts it on screen.
+                        # A chunk that fails is invisible in the output — the
+                        # track simply reports fewer edits — so it has to be
+                        # loud where someone is watching, not only in the log.
+                        print(
+                            f"WARN chunk {index + 1}/{len(chunks)} "
+                            f"(words {first}-{last}) failed: {outcome['error']}",
+                            flush=True,
+                        )
+                    elif outcome["truncated"]:
+                        truncated += 1
+                        # Not a failure — the salvaged edits are as good as any
+                        # other — but the window was cut short, so some of its
+                        # disfluencies were never reported and no one would
+                        # otherwise know to look.
+                        print(
+                            f"WARN chunk {index + 1}/{len(chunks)} "
+                            f"(words {first}-{last}) hit the reply token ceiling; "
+                            f"kept the {outcome['salvaged']} complete edits it "
+                            "had emitted, the rest of that window was not judged",
+                            flush=True,
+                        )
+
+                    raw_edits = outcome["edits"]
+                    content = outcome["content"]
+                    kept, dropped = _validate(
+                        raw_edits, words, first, last, limits, accepted
+                    )
+                    collected.extend(kept)
+                    rejected.extend(dropped)
+
+                    if audit:
+                        audit.write(
+                            json.dumps(
+                                {
+                                    "chunk": index,
+                                    "words": [first, last],
+                                    # Null unless the window never produced a
+                                    # usable answer. Without it a timeout and a
+                                    # genuine "nothing to remove here" write the
+                                    # identical line — empty raw, no rejects, no
+                                    # content — and the audit stops being able to
+                                    # tell a broken track from a clean one.
+                                    "error": outcome["error"],
+                                    "truncated": outcome["truncated"],
+                                    "salvaged": outcome["salvaged"],
+                                    "raw": raw_edits,
+                                    "accepted": len(kept),
+                                    "rejected": dropped,
+                                    "content": content if not kept and content else None,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+
+                    if on_progress:
+                        on_progress(index + 1, len(chunks))
+            except BaseException:
+                # A refused key aborts the track. Without this, leaving the
+                # `with` block would wait for the windows already queued behind
+                # this one to be sent too, all doomed the same way.
+                for future in pending:
+                    future.cancel()
+                raise
     finally:
         if audit:
             audit.close()
@@ -611,6 +832,7 @@ def detect(
         "participant": parsed["participant"],
         "chunks": len(chunks),
         "chunk_failures": failures,
+        "chunks_truncated": truncated,
         "edits": merged,
         "rejected_count": len(rejected),
     }

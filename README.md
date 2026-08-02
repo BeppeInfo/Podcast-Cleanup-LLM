@@ -152,7 +152,7 @@ llama-server \
   divided among slots, so `-c 8192 --parallel 4` leaves 2048 per slot and
   silently truncates the prompt. At the default `LLM_CHUNK_WORDS=350` a request
   is ~3.3k prompt tokens plus 2048 reserved for the reply, so a slot needs
-  ~6k. Either keep `--parallel 1`, or multiply `-c` by the slot count.
+  ~6k. Multiply `-c` by the slot count.
 
   | `LLM_CHUNK_WORDS` | prompt tokens | minimum context per slot |
   | --- | --- | --- |
@@ -160,6 +160,23 @@ llama-server \
   | 250 | ~2.5k | 5120 |
   | 350 (default) | ~3.3k | 6144 |
   | 500 | ~4.5k | 7168 |
+
+  The division is what llama.cpp does when the KV cache is split, which is the
+  default as soon as `--parallel` is given a number — passing `-np` takes the
+  slot count out of "auto", and `--kv-unified` defaults to on only while it is
+  auto. With `--kv-unified` forced on, one sequence may use the whole `-c`, but
+  the buffer is still a single pool every slot draws from, so the total budget
+  is unchanged and a busy moment fails on load rather than deterministically.
+  For a batch job that is the worse trade: prefer sizing `-c` for the slots.
+
+- **More slots is the way to make the detect stage faster.** At one request in
+  flight the server decodes at batch size 1, which is bound by memory bandwidth
+  and leaves most of a CPU idle; several slots let it batch the decode steps
+  together. Give the server `--parallel N` and set `LLM_CONCURRENCY=N` to
+  match — the two have to agree, since anything beyond the slot count just
+  queues inside the server where the client cannot see it. A server this script
+  starts gets `--parallel` derived from `LLM_CONCURRENCY` automatically, and the
+  detect stage checks the context arithmetic above before the episode starts.
 
 - **`LLAMA_CTX` in the config does nothing for a remote server** — it is only
   passed to a server this script starts itself. The remote server's own `-c`
@@ -172,7 +189,9 @@ llama-server \
 - Expect **~58 requests per participant** for a 2 h track at ~150 wpm, so the
   model is loaded once and hit repeatedly. The client sends `cache_prompt: true`
   and the ~570-token instruction prefix is identical every time, so prompt
-  caching earns its keep — another reason to prefer one slot over several.
+  caching earns its keep. Slots each keep their own copy of that prefix, so
+  running several costs one extra prefill apiece and no more — not a reason to
+  stay at one slot.
 - Sampling is fixed per request (`temperature: 0`, `top_k: 1`) and the JSON
   schema travels with each call, so server-side sampling defaults and
   `--grammar-file` are irrelevant.
@@ -397,7 +416,7 @@ word, so padding cannot eat into real speech.
 ## Tests
 
 ```sh
-python3 tests/test_pipeline.py    # 88 unit tests, no external tools needed
+python3 tests/test_pipeline.py    # 156 unit tests, no external tools needed
 ./tests/selftest.sh               # 64 end-to-end checks, needs only ffmpeg
 ```
 
@@ -461,3 +480,9 @@ and writes JSON and never touches audio.
   is a config setting rather than a per-track choice.
 - `WHISPER_JOBS` stays at 1 unless there is RAM for several Whisper instances. It
   never overlaps with the LLM stage either way.
+- `LLM_CONCURRENCY` is the one to reach for when the detect stage is the slow
+  part and the machine running the model looks idle — one request at a time
+  decodes at batch size 1 and cannot use the cores. Set it to the server's
+  `--parallel` slot count, and raise `LLAMA_CTX` by the same factor, since the
+  slots divide it. It changes speed only: the edits, the audit log and the
+  report come out identical to a sequential run.
