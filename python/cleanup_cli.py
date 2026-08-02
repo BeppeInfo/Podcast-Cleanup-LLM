@@ -317,8 +317,11 @@ def cmd_transcribe_remote(args):
         loud=loud,
         temperature=args.temperature,
         on_progress=_progress,
+        on_note=lambda message: print(f"note: {message}", flush=True),
         vad=args.vad,
         vad_options=options,
+        recover=args.recover,
+        speech_pad=args.speech_pad,
     )
     _write_json(args.out, parsed)
 
@@ -326,6 +329,26 @@ def cmd_transcribe_remote(args):
     print(
         f"{words} words in {segments} segments over {parsed['chunks']} chunk(s)"
     )
+    recovery = parsed.get("recovery") or {}
+    if recovery.get("spans"):
+        detail = (
+            f"{recovery['spans']} stretch(es) of loud audio came back with no "
+            f"words; re-asked about {recovery['attempted']} and recovered "
+            f"{recovery['recovered_segments']} word(s) from "
+            f"{recovery['recovered_spans']}"
+        )
+        if recovery["recovered_spans"]:
+            # Worth saying out loud rather than burying: this is Whisper having
+            # dropped a decode window, and the recovery having worked.
+            print(f"note: {detail}", flush=True)
+        else:
+            print(f"note: {detail} — probably not speech, then")
+        if recovery.get("skipped"):
+            print(
+                f"WARN {recovery['skipped']} further stretch(es) were left "
+                "unasked; that many is not the occasional skipped window",
+                flush=True,
+            )
     empty = parsed.get("chunks_without_speech") or 0
     if empty:
         # Normal on a two-mic recording; total silence is not.
@@ -713,6 +736,14 @@ def build_parser():
     p.add_argument("--vad-min-silence-ms", type=int)
     p.add_argument("--vad-speech-pad-ms", type=int)
     p.add_argument("--vad-samples-overlap", type=float)
+    p.add_argument(
+        "--no-recover", dest="recover", action="store_false",
+        help="do not re-ask about loud stretches the first pass returned no words for",
+    )
+    p.add_argument(
+        "--speech-pad", type=float, default=0.25,
+        help="match the plan stage's SPEECH_PAD, so both ask the same question",
+    )
     p.add_argument("--language", default="auto")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--request-timeout", type=float, default=1800.0)

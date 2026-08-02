@@ -607,6 +607,174 @@ class TestServerSideVadRequest(unittest.TestCase):
         self.assertEqual(parsed["audio_seconds"], 2.0)
 
 
+class TestSkippedWindowRecovery(unittest.TestCase):
+    """Re-asking about a decode window Whisper threw away.
+
+    Whisper works in 30-second windows and discards one whose decode ends on a
+    lone timestamp token, saying nothing about it. Re-sending that span on its own
+    changes the window alignment, so the audio no longer falls in a discarded
+    window — which is the only thing that gets those words back, and is what the
+    level scan makes possible by saying where to look.
+    """
+
+    class _Recorder:
+        """A server that omits one span from the first (long) request only."""
+
+        def __init__(self, hole=(40.0, 62.0), recover=True):
+            self.hole = hole
+            self.recover = recover
+            self.requests = []
+
+        def _words(self, base, length):
+            out = []
+            moment = 0.0
+            while moment < length - 1e-9:
+                at = base + moment
+                # The hole exists only when the whole track is asked for at once.
+                blind = self.hole[0] <= at < self.hole[1] and length > 30.0
+                if not blind:
+                    out.append({
+                        "text": f"w{int(at * 10)}",
+                        "offsets": {"from": int(at * 1000),
+                                    "to": int((at + 0.4) * 1000)},
+                    })
+                moment += 0.5
+            return out
+
+        def transcribe_file(self, path, fields):
+            import wave as wavemod
+            with wavemod.open(path, "rb") as handle:
+                length = handle.getnframes() / float(handle.getframerate())
+            # The offset is applied by the caller, so answer in local time and
+            # let asr shift it. Recovery slices start at their own zero.
+            base = 0.0
+            self.requests.append((round(length, 2), dict(fields)))
+            if not self.recover and len(self.requests) > 1:
+                return {"segments": []}
+            return {"transcription": self._words(base, length)}
+
+    def _wav(self, seconds=120.0):
+        import struct
+        import wave as wavemod
+
+        path = os.path.join(tempfile.mkdtemp(), "track.wav")
+        with wavemod.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16000)
+            handle.writeframes(struct.pack("<h", 1000) * int(seconds * 16000))
+        return path
+
+    def test_missing_spans_are_found_from_the_level_scan(self):
+        segments = [
+            {"text": "a", "offsets": {"from": 0, "to": 5000}},
+            {"text": "b", "offsets": {"from": 70000, "to": 75000}},
+        ]
+        loud = [(0.0, 5.0), (40.0, 62.0), (70.0, 75.0)]
+        spans = asr.missing_spans(segments, loud, 120.0, 0.25)
+        self.assertEqual(len(spans), 1)
+        self.assertAlmostEqual(spans[0][0], 40.0, places=2)
+        self.assertAlmostEqual(spans[0][1], 62.0, places=2)
+
+    def test_neighbouring_gaps_are_asked_about_as_one(self):
+        """Split spans lose the words on the seam, each retry dropping the other's
+        edge as already known. Observed doing exactly that on a real episode."""
+        segments = [{"text": "a", "offsets": {"from": 0, "to": 5000}}]
+        # A brief dip below the level threshold at 47s and 52s splits one skipped
+        # window into three.
+        loud = [(0.0, 5.0), (41.0, 47.0), (47.2, 52.0), (52.3, 62.0)]
+        spans = asr.missing_spans(segments, loud, 120.0, 0.25)
+        self.assertEqual(len(spans), 1, spans)
+        self.assertAlmostEqual(spans[0][0], 41.0, places=2)
+        self.assertAlmostEqual(spans[0][1], 62.0, places=2)
+
+    def test_short_gaps_are_not_chased(self):
+        """One request per stretch, so it must not chase a timing artefact."""
+        segments = [{"text": "a", "offsets": {"from": 0, "to": 5000}}]
+        loud = [(0.0, 5.0), (6.0, 7.5)]
+        self.assertEqual(asr.missing_spans(segments, loud, 120.0, 0.25), [])
+
+    def test_ordinary_inter_word_gaps_are_not_a_missing_span(self):
+        """The trap the merge above walks into if it fuses the wrong thing.
+
+        A transcribed track is a run of short word spans with small gaps between
+        them. Fusing *gaps* across those words would make the whole track read as
+        missing; the fusing has to happen on the loud spans instead.
+        """
+        segments = [
+            {"text": f"w{i}", "offsets": {"from": i * 500, "to": i * 500 + 400}}
+            for i in range(40)
+        ]
+        self.assertEqual(asr.missing_spans(segments, [(0.0, 20.0)], 20.0, 0.0), [])
+
+    def test_the_words_come_back(self):
+        recorder = self._Recorder()
+        loud = [(0.0, 120.0)]
+        parsed = asr.transcribe(
+            recorder, self._wav(), "host", loud=loud, chunk_seconds=0,
+            speech_pad=0.25,
+        )
+        # The first request covered the whole track and dropped 40-62s.
+        self.assertGreater(recorder.requests[0][0], 100.0)
+        self.assertGreater(len(recorder.requests), 1)
+        # A recovery request is short, which is the entire point.
+        for length, _ in recorder.requests[1:]:
+            self.assertLess(length, asr.RECOVERY_CHUNK_SECONDS + 5.0)
+        covered = tr.speech_from_words(parsed["words"], 120.0, pad=0.25)
+        hole = iv.intersect(covered, [(40.0, 62.0)])
+        self.assertGreater(iv.total(hole), 20.0, "the hole was not filled")
+        self.assertEqual(parsed["recovery"]["recovered_spans"], 1)
+        self.assertGreater(parsed["recovery"]["recovered_segments"], 30)
+
+    def test_recovery_asks_for_vad_too(self):
+        """Otherwise a retry over a cough invents speech where there was none."""
+        recorder = self._Recorder()
+        asr.transcribe(
+            recorder, self._wav(), "host", loud=[(0.0, 120.0)],
+            chunk_seconds=0, speech_pad=0.25, vad=True,
+        )
+        for _, fields in recorder.requests[1:]:
+            self.assertEqual(fields["vad"], "true")
+
+    def test_a_span_that_stays_empty_is_left_to_the_plan_stage(self):
+        recorder = self._Recorder(recover=False)
+        parsed = asr.transcribe(
+            recorder, self._wav(), "host", loud=[(0.0, 120.0)],
+            chunk_seconds=0, speech_pad=0.25,
+        )
+        self.assertEqual(parsed["recovery"]["recovered_spans"], 0)
+        self.assertGreaterEqual(parsed["recovery"]["attempted"], 1)
+        # And the words that did arrive are untouched.
+        self.assertTrue(parsed["words"])
+
+    def test_no_level_scan_means_no_recovery(self):
+        recorder = self._Recorder()
+        asr.transcribe(
+            recorder, self._wav(), "host", loud=None, chunk_seconds=0,
+            speech_pad=0.25,
+        )
+        self.assertEqual(len(recorder.requests), 1)
+
+    def test_recovery_can_be_turned_off(self):
+        recorder = self._Recorder()
+        asr.transcribe(
+            recorder, self._wav(), "host", loud=[(0.0, 120.0)],
+            chunk_seconds=0, speech_pad=0.25, recover=False,
+        )
+        self.assertEqual(len(recorder.requests), 1)
+
+    def test_recovered_words_are_not_duplicated(self):
+        """The retry is padded, so it re-transcribes what borders the span."""
+        recorder = self._Recorder()
+        parsed = asr.transcribe(
+            recorder, self._wav(), "host", loud=[(0.0, 120.0)],
+            chunk_seconds=0, speech_pad=0.25,
+        )
+        starts = [w["start"] for w in parsed["words"]]
+        self.assertEqual(len(starts), len(set(starts)), "a word was added twice")
+        self.assertEqual(starts, sorted(starts), "words are out of order")
+
+
 class _StubLlamaServer:
     """A stand-in for llama-server, to exercise the real HTTP client.
 

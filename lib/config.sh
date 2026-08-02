@@ -103,6 +103,13 @@ config_defaults() {
     : "${WHISPER_VAD_SPEECH_PAD_MS:=300}"
     : "${WHISPER_VAD_SAMPLES_OVERLAP:=0.1}"
 
+    # Re-ask about any loud stretch the first pass returned no words for, one span
+    # at a time. This is the only thing that recovers a decode window Whisper threw
+    # away: re-sending the span on its own changes the window alignment, so the
+    # audio that fell in a discarded window no longer does. Costs one extra request
+    # per missing stretch, and nothing at all on a track with none.
+    : "${WHISPER_RECOVER:=1}"
+
     # llama.cpp -------------------------------------------------------------
     # LLAMA_ENDPOINT: if set, an already-running server is used as-is and this
     # script never spawns or stops one.

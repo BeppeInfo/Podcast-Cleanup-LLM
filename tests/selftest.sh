@@ -1206,6 +1206,104 @@ else
 fi
 
 # ============================================================================
+printf '\n%sCase 13: a skipped decode window is recovered by re-asking%s\n' \
+    "$BOLD" "$RESET"
+# ============================================================================
+#
+# Case 12 with the other half of the answer. The same audio and the same hole in
+# the first reply, but now the stub also answers the follow-up request for the
+# missing span — which is what a real server does, because re-sending a span on
+# its own puts it at a different offset in Whisper's 30-second windows.
+#
+# The recovery slice is keyed by the filename asr.py gives it, and its timings are
+# local to that slice: the span is 20-30s, padded outwards to start at 19s, so
+# words at 1-11s in the slice land at 20-30s on the timeline.
+
+CASE13="$SANDBOX/case13"
+A13_AUDIO='0,10 20,30'
+A13_WORDS='0,10'
+B13_SPEECH='10,20'
+build_episode ep013 "$CASE13/incoming" \
+    "$(windows_expr "$A13_AUDIO")" "$(windows_expr "$B13_SPEECH")" 30
+whisper_responses "$SANDBOX/case13.words.json" \
+    "alice=$A13_WORDS" "bob=$B13_SPEECH" "recover000_00=1,11"
+start_whisper_stub "$SANDBOX/case13.words.json" "$SANDBOX/case13.requests.jsonl"
+
+if run_pipeline "$CASE13/incoming" "$CASE13/output" "$CASE13/work" \
+    --config "$CONF" --keep-work >"$SANDBOX/case13.stdout" 2>&1
+then
+    check "the run completes once the words are recovered" true
+else
+    check "the run completes once the words are recovered" false
+    fail_note "$(tail -n 25 "$SANDBOX/case13.stdout")"
+fi
+
+# --quiet keeps per-track notes out of stdout, so look where they are kept.
+check "the recovery was reported in the run log" \
+    grep -qi "recovered" "$CASE13/work/ep013/logs/run.log"
+
+check "a second request really was sent for the missing span" python3 -c '
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+names = [r.get("filename", "") for r in rows]
+retries = [n for n in names if n.startswith("recover")]
+if not retries:
+    print("no recovery request was sent; uploads were:", names)
+    sys.exit(1)
+print("recovery requests:", retries)
+' "$SANDBOX/case13.requests.jsonl"
+
+WORDS13="$CASE13/work/ep013/words/alice.words.json"
+if [[ -f "$WORDS13" ]]; then
+    check "the recovered words are in the transcript, in order" python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+words = data["words"]
+late = [w for w in words if w["start"] >= 20.0]
+if not late:
+    print("nothing recovered past 20s; words end at", words[-1]["end"])
+    sys.exit(1)
+starts = [w["start"] for w in words]
+if starts != sorted(starts):
+    print("words are out of order after the merge")
+    sys.exit(1)
+if len(starts) != len(set(starts)):
+    print("a word was merged twice")
+    sys.exit(1)
+print(len(late), "recovered word(s), transcript spans",
+      round(words[0]["start"], 2), "-", round(words[-1]["end"], 2))
+' "$WORDS13"
+    check "the recovery is recorded in the words file" python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))["recovery"]
+if r["recovered_spans"] != 1 or not r["recovered_segments"]:
+    print("recovery summary looks wrong:", r)
+    sys.exit(1)
+' "$WORDS13"
+fi
+
+PLAN13="$CASE13/work/ep013/plan.json"
+if [[ -f "$PLAN13" ]]; then
+    # The point of the whole exercise: nothing left to refuse over, and the audio
+    # that case 12 would have cut is now protected by words.
+    check "no untranscribed audio remains" python3 -c '
+import json, sys
+plan = json.load(open(sys.argv[1]))
+if plan["untranscribed_audio"] or plan["blocking"]:
+    print("still unhappy:", plan["untranscribed_audio"], plan["blocking"])
+    sys.exit(1)
+' "$PLAN13"
+    check "the 20-30s audio is no longer cut" python3 -c '
+import json, sys
+plan = json.load(open(sys.argv[1]))
+for cut in plan["cuts"]:
+    if cut["end"] > 21.0 and cut["start"] < 29.0:
+        print("a cut still lands in the recovered speech:", cut)
+        sys.exit(1)
+' "$PLAN13"
+fi
+
+# ============================================================================
 
 printf '\n'
 if (( FAILURES == 0 )); then

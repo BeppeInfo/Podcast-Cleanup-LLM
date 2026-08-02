@@ -43,6 +43,52 @@ from .llm import AuthRejected
 MIN_CHUNK_SECONDS = 20.0
 
 
+# --- recovering a skipped decode window ---------------------------------------
+#
+# Whisper works in 30-second windows and throws away a window whose decode ends
+# on a lone timestamp token ("single timestamp ending - skip entire chunk").
+# Nothing in the response says so. Which window a passage lands in depends on how
+# much speech precedes it, so no request length prevents this — but *re-asking*
+# about the missing span on its own does, because the alignment is then different
+# and the span starts the request rather than sitting mid-stream. On the episode
+# this was written for, the 33 seconds lost from a 600s request came back intact
+# when the same audio was sent as a short request of its own.
+#
+# The level scan says where to look: loud audio the first pass returned no words
+# for. That is the same signal `plan.untranscribed_audio` refuses over, and this
+# runs first so the refusal is about what could not be recovered.
+
+# Worth re-asking about. Kept equal to plan.UNTRANSCRIBED_MIN_SPAN: chasing
+# anything the plan stage would not have mentioned only spends requests.
+RECOVERY_MIN_SPAN = 3.0
+
+# Context added either side, so the retry does not begin mid-word and Whisper has
+# something to condition on. Trimmed back out afterwards.
+RECOVERY_PAD = 1.0
+
+# One retry is sent per span, each no longer than this. Short is the whole point:
+# a long retry would land in the same trap it is escaping.
+RECOVERY_CHUNK_SECONDS = 60.0
+
+# A retry is only worth accepting where the first pass had nothing. Recovered
+# words overlapping what is already known by more than this are the padding
+# transcribing a neighbour again, and are dropped rather than duplicated.
+RECOVERY_OVERLAP_FRACTION = 0.5
+
+# Bound on how much chasing one track can provoke. A track needing more than this
+# is not suffering the occasional skipped window; something else is wrong, and
+# spending a hundred requests to confirm it helps nobody.
+RECOVERY_MAX_SPANS = 20
+
+# Missing stretches this close together are asked about as one. A brief dip below
+# the level threshold splits what is really a single skipped window into
+# neighbours, and asking separately then loses the words on the seam between them:
+# each retry re-transcribes the other's edge, and the overlap filter drops it as
+# already known. Observed doing exactly that — "This time, as" fell between spans
+# ending and starting at 47s.
+RECOVERY_MERGE_GAP = 3.0
+
+
 # --- chunk planning -----------------------------------------------------------
 
 
@@ -348,6 +394,142 @@ class WhisperClient:
             raise
 
 
+def missing_spans(segments, loud, duration: float, pad: float) -> list[tuple]:
+    """Loud stretches no segment accounts for, longest first.
+
+    `pad` is the same margin the plan stage will widen words by, so this asks the
+    question the plan stage would ask rather than a stricter one — a span that
+    would not have been reported is not worth a request.
+    """
+    covered = iv.normalize(
+        [
+            (
+                max(0.0, segment["offsets"]["from"] / 1000.0 - pad),
+                min(duration, segment["offsets"]["to"] / 1000.0 + pad),
+            )
+            for segment in segments
+        ]
+    )
+    # The fusing happens on the *loud* spans, before anything is subtracted. A
+    # brief dip below the level threshold splits one skipped window into
+    # neighbours, and asking about those separately loses the words where they
+    # meet. Fusing the gaps afterwards instead would be wrong in a way that is
+    # easy to miss: it would also bridge stretches separated by audio that *was*
+    # transcribed, and a track with ordinary inter-word gaps would then look
+    # missing from end to end.
+    gaps = [
+        (start, end)
+        for start, end in iv.subtract(
+            iv.normalize(loud or [], gap=RECOVERY_MERGE_GAP), covered
+        )
+        if end - start >= RECOVERY_MIN_SPAN
+    ]
+    return sorted(gaps, key=lambda span: span[0] - span[1])
+
+
+def recover_missing(
+    client: WhisperClient,
+    wav_path: str,
+    duration: float,
+    fields: dict,
+    segments: list,
+    loud,
+    pad: float,
+    workdir: str,
+    on_note=None,
+) -> tuple[list, dict]:
+    """Re-ask about each loud stretch the first pass returned no words for.
+
+    Returns the recovered segments and a summary. Failures here are not fatal:
+    the first pass already succeeded, and a span that cannot be recovered is
+    exactly what `plan.untranscribed_audio` exists to refuse over.
+    """
+    spans = missing_spans(segments, loud, duration, pad)
+    summary = {
+        "spans": len(spans),
+        "attempted": 0,
+        "recovered_spans": 0,
+        "recovered_segments": 0,
+        "skipped": max(0, len(spans) - RECOVERY_MAX_SPANS),
+    }
+    if not spans:
+        return [], summary
+
+    known = iv.normalize(
+        [
+            (segment["offsets"]["from"] / 1000.0, segment["offsets"]["to"] / 1000.0)
+            for segment in segments
+        ]
+    )
+    recovered: list[dict] = []
+
+    for index, (start, end) in enumerate(spans[:RECOVERY_MAX_SPANS]):
+        # Padded outwards for context, then split if the span is long enough that
+        # one request would be back in the situation this is escaping.
+        lo = max(0.0, start - RECOVERY_PAD)
+        hi = min(duration, end + RECOVERY_PAD)
+        pieces = [
+            (lo + a, lo + b)
+            for a, b in plan_audio_chunks(hi - lo, RECOVERY_CHUNK_SECONDS)
+        ]
+        summary["attempted"] += 1
+        found: list[dict] = []
+        for number, (piece_start, piece_end) in enumerate(pieces):
+            target = os.path.join(workdir, f"recover{index:03d}_{number:02d}.wav")
+            try:
+                slice_wav(wav_path, piece_start, piece_end, target)
+                payload = client.transcribe_file(target, fields)
+                found.extend(normalize_response(payload, offset=piece_start))
+            except AuthRejected:
+                raise
+            except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+                # The first pass stands; this span simply stays missing.
+                found = []
+                break
+            finally:
+                if os.path.exists(target):
+                    os.unlink(target)
+
+        # Only what the first pass genuinely lacked. The padding re-transcribes
+        # whatever borders the span, and that is already known.
+        fresh = []
+        for segment in found:
+            span = (
+                segment["offsets"]["from"] / 1000.0,
+                segment["offsets"]["to"] / 1000.0,
+            )
+            length = span[1] - span[0]
+            if length <= iv.EPS:
+                continue
+            if iv.overlap_amount(span, known) >= RECOVERY_OVERLAP_FRACTION * length:
+                continue
+            fresh.append(segment)
+
+        if fresh:
+            summary["recovered_spans"] += 1
+            summary["recovered_segments"] += len(fresh)
+            recovered.extend(fresh)
+            known = iv.normalize(
+                known
+                + [
+                    (s["offsets"]["from"] / 1000.0, s["offsets"]["to"] / 1000.0)
+                    for s in fresh
+                ]
+            )
+            if on_note:
+                on_note(
+                    f"recovered {len(fresh)} word(s) from {start:.0f}-{end:.0f}s, "
+                    "which the first pass returned nothing for"
+                )
+        elif on_note:
+            on_note(
+                f"nothing came back for {start:.0f}-{end:.0f}s on a second ask "
+                "either; if that is speech, the plan stage will refuse to cut it"
+            )
+
+    return recovered, summary
+
+
 def transcribe(
     client: WhisperClient,
     wav_path: str,
@@ -359,8 +541,11 @@ def transcribe(
     temperature: float = 0.0,
     retries: int = 1,
     on_progress=None,
+    on_note=None,
     vad: bool = True,
     vad_options: dict | None = None,
+    recover: bool = True,
+    speech_pad: float = 0.25,
 ) -> dict:
     """Transcribe one prepared track, returning the parsed words structure.
 
@@ -369,8 +554,11 @@ def transcribe(
     because everything downstream reads the returned words as this track's
     speech map, so silence reaching the model would become speech in the plan.
 
-    `loud` is ffmpeg's non-silent stretches, used only to place chunk
-    boundaries.
+    `loud` is ffmpeg's non-silent stretches. It places chunk boundaries in quiet
+    spots, and — when `recover` is on — says where to look for a decode window
+    Whisper threw away, which is the one thing that can find those. `speech_pad`
+    should match the plan stage's, so this asks the same question of the coverage
+    that the plan stage will.
     """
     from . import transcript as tr
 
@@ -398,6 +586,8 @@ def transcribe(
 
     segments: list[dict] = []
     silent_chunks = 0
+    recovery = {"spans": 0, "attempted": 0, "recovered_spans": 0,
+                "recovered_segments": 0, "skipped": 0}
     workdir = tempfile.mkdtemp(prefix="podcast-asr-")
     try:
         for index, (start, end) in enumerate(chunks):
@@ -432,6 +622,17 @@ def transcribe(
                 )
             if piece != wav_path:
                 os.unlink(piece)
+
+        # Whatever the first pass missed, asked again one span at a time. Done
+        # here rather than in the plan stage because that stage has no endpoint
+        # and touches no audio; done before the words are written so nothing
+        # downstream ever sees the damaged transcript.
+        if recover and loud:
+            extra, recovery = recover_missing(
+                client, wav_path, duration, fields, segments, loud,
+                speech_pad, workdir, on_note=on_note,
+            )
+            segments.extend(extra)
     finally:
         try:
             os.rmdir(workdir)
@@ -441,6 +642,7 @@ def transcribe(
     segments.sort(key=lambda segment: segment["offsets"]["from"])
     parsed = tr.build_from_segments(segments, participant)
     parsed["chunks"] = len(chunks)
+    parsed["recovery"] = recovery
     # The whole track went to the server; what it chose to transcribe is the
     # server's VAD decision, and the plan stage measures it by deriving the
     # speech map from these words.

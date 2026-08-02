@@ -479,10 +479,12 @@ stage_transcribe_remote() {
             --endpoint "$WHISPER_ENDPOINT" --path "$WHISPER_ENDPOINT_PATH"
             --duration "${TRACK_DURATION[$participant]}"
             --chunk-seconds "$WHISPER_CHUNK_SECONDS"
+            --speech-pad "$SPEECH_PAD"
             --language "$WHISPER_LANG"
             --request-timeout "$WHISPER_REQUEST_TIMEOUT"
         )
         [[ -n "$loud_spans" ]] && args+=(--loud "$loud_spans")
+        [[ "$WHISPER_RECOVER" == 1 ]] || args+=(--no-recover)
         if [[ "$WHISPER_VAD" == 1 ]]; then
             args+=(
                 --vad-threshold "$WHISPER_VAD_THRESHOLD"

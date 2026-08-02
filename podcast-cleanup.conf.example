@@ -162,6 +162,18 @@ WHISPER_VAD_MIN_SILENCE_MS="1000"
 WHISPER_VAD_SPEECH_PAD_MS="300"
 WHISPER_VAD_SAMPLES_OVERLAP="0.1"
 
+# Re-ask about any loud stretch the first pass returned no words for, one span at
+# a time. This is the only thing that recovers a decode window Whisper discarded:
+# re-sending the span on its own puts it at a different offset in the 30-second
+# windows, so the audio no longer falls in a thrown-away one. On the episode this
+# was written for, 33 seconds lost from a 600s request came back intact.
+#
+# Costs one extra request per missing stretch and nothing at all on a clean track.
+# The retry asks for VAD too, so a stretch that is loud but not speech comes back
+# empty rather than hallucinated — and a stretch that stays empty is left for the
+# plan stage to refuse over.
+WHISPER_RECOVER="1"
+
 # Local Whisper never runs at the same time as a locally managed llama-server:
 # every track is transcribed and the process exits before the LLM stage begins.
 # Raise this only if there is RAM for several Whisper instances at once.

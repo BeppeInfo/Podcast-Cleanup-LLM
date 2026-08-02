@@ -515,8 +515,19 @@ much speech precedes it, so length only reshuffles the alignment: the same passa
 survived a 100s request and vanished from a 300s and a 600s one. `120` is chosen
 to keep any single loss small, not because it is safe.
 
-What catches it is the level scan, which is why that scan now runs for every track
-rather than only the ones long enough to split. It is the only input in the whole
+Two things follow from it. The first is that the loss is *recoverable*: re-sending
+the missing span as a short request of its own puts it at a different offset in the
+windows, so it no longer falls in a discarded one. `asr.recover_missing` does that
+after the first pass — one request per stretch, VAD still on so a loud stretch that
+is not speech comes back empty rather than invented, and recovered words dropped
+where they overlap what is already known, since the retry is padded and
+re-transcribes its neighbours. It runs in `asr.py` rather than in the plan stage
+because the plan stage has no endpoint and touches no audio, and it runs before the
+words are written so nothing downstream ever sees the damaged transcript.
+
+The second is that recovery cannot be trusted to succeed, so something still has to
+refuse. That is the level scan, which is why it now runs for every track rather than
+only the ones long enough to split. It is the only input in the whole
 pipeline that Whisper had no hand in. It cannot tell speech from a cough — that is
 precisely why it is not the speech map — but it can tell loud from silent, and
 `plan.untranscribed_audio` compares each transcript against its own track's loud
@@ -913,7 +924,8 @@ authority. The ones whose meaning is easy to get wrong:
 | `WHISPER_VAD` | the only speech detection there is; off means silence gets transcribed and whatever is invented there becomes speech in the plan |
 | `WHISPER_VAD_MODEL` | local `whisper-cli` runs only — a server takes its own `-vm` at launch, which no request can override |
 | `SPEECH_PAD` | how far each word is widened before the union that makes the speech map; a gap needs `SILENCE_MIN_DURATION` **plus twice this** to be silence |
-| `SPLIT_SILENCE_THRESHOLD` | picks chunk boundaries for a long upload, nothing else; being wrong costs one word, not an edit |
+| `SPLIT_SILENCE_THRESHOLD` | picks chunk boundaries, and sets how much loud-but-untranscribed audio gets reported; it never decides what is cut |
+| `WHISPER_RECOVER` | re-asks about stretches the first pass returned nothing for — the only thing that recovers a discarded decode window |
 | `LLAMA_MODEL_NAME` | required by a router-mode server, ignored by a single-model one |
 | `SILENCE_MIN_DURATION` | how long a gap must be before it is worth shortening |
 | `SILENCE_KEEP` | quiet left behind in place of a shortened gap |

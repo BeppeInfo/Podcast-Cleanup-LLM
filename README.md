@@ -86,8 +86,9 @@ request length shuffles the alignment rather than curing anything — the same
 passage survived a 100s request and vanished from a 300s and a 600s one. Nothing
 in the response reports it, and since the speech map is derived from the
 transcript, the loss reads as silence and gets cut. `WHISPER_CHUNK_SECONDS=120`
-keeps any single loss small; the audio cross-check below is what actually stops
-the damage.
+keeps any single loss small, `WHISPER_RECOVER=1` re-asks about the missing span on
+its own — which recovers it, because the window alignment is then different — and
+the audio cross-check below refuses to cut whatever still cannot be recovered.
 
 **And one that matters more.** The words that come back are also the speech map —
 silence is where the transcript has none — so the server must be running Silero
@@ -444,6 +445,13 @@ word, so padding cannot eat into real speech.
 - Rendered durations are checked against a **frame-exact prediction** of what the
   filter graph will emit, not a rule of thumb. A mismatch fails the run and
   preserves the inputs.
+- **A skipped decode window is re-asked about, then refused over.** After the
+  first pass, any loud stretch over 3s that produced no words is re-sent as a
+  short request of its own; that changes where it falls in Whisper's 30-second
+  windows, which is what gets the words back. The retry asks for VAD too, so a
+  loud stretch that is not speech comes back empty rather than invented. What
+  cannot be recovered is what the next guarantee refuses over — so the refusal is
+  about genuine loss rather than about a transient.
 - **A cut over audio nothing transcribed is refused.** One ffmpeg level scan per
   track is the only input Whisper had no hand in. It cannot tell speech from a
   cough — which is why it is not the speech map — but it can tell loud from
@@ -506,7 +514,8 @@ python/cleanup/intervals.py   interval algebra and timeline remapping
 python/cleanup/silence.py     silencedetect parsing: chunk boundaries, and the
                               only opinion about the audio that is not Whisper's
 python/cleanup/transcript.py  Whisper tokens to words, and the speech map
-python/cleanup/asr.py         remote whisper-server client and chunking
+python/cleanup/asr.py         remote whisper-server client, chunking, and
+                              recovering a skipped decode window
 python/cleanup/llm.py         chunking, prompting, response validation
 python/cleanup/plan.py        the cut-versus-mute decision
 python/cleanup/render.py      ffmpeg expressions, duration prediction, transcript
