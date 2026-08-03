@@ -192,6 +192,20 @@ WHISPER_RECOVER="1"
 # silence, and since the speech map is derived from these words, an invented
 # filler becomes speech in the plan. Keep the Silero pass on (WHISPER_VAD) and the
 # invented ones have no silence to appear in.
+# Bound each word's span by the level scan when building the speech map.
+#
+# Whisper's word timings run past the audio as a matter of course — a word
+# routinely spans the silence between phrases, and one arrived spanning nineteen
+# seconds. A map built from those spans reads as wall-to-wall speech, and then two
+# things go wrong: no gap is ever long enough for SILENCE_MIN_DURATION to fire,
+# and one participant's stretched word covers whatever the other says underneath
+# it, so their disfluencies are muted as crosstalk instead of cut.
+#
+# This trims and never extends. The scan is not asked whether something is speech
+# — it cannot tell speech from a cough — only when the audio actually happened. A
+# track with no scan keeps its timings as they are.
+SPEECH_MAP_CLIP="1"
+
 WHISPER_PROMPT="Um, uh, so, like, you know, I mean — um, that's, that's the thing."
 
 # A prompt does not reach everything. Where one word still sits on seconds of

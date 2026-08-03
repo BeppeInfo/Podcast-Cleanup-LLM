@@ -110,6 +110,13 @@ config_defaults() {
     # per missing stretch, and nothing at all on a track with none.
     : "${WHISPER_RECOVER:=1}"
 
+    # Bound each word's span by the level scan when building the speech map.
+    # Whisper's word timings run far past the audio — a word routinely spans the
+    # silence between phrases — and an unbounded map reads as wall-to-wall speech:
+    # no gap is ever long enough to shorten, and one participant's stretched word
+    # makes the other's disfluencies look like crosstalk. Trims, never extends.
+    : "${SPEECH_MAP_CLIP:=1}"
+
     # Whisper's initial prompt: conditioning text, not an instruction — the decode
     # continues in the register it is handed. Left empty, Whisper returns fluent
     # prose and drops the fillers and stutters this pipeline exists to cut, and
@@ -575,7 +582,7 @@ config_dump() {
              WHISPER_VAD_MIN_SPEECH_MS WHISPER_VAD_MIN_SILENCE_MS \
              WHISPER_VAD_SPEECH_PAD_MS WHISPER_VAD_SAMPLES_OVERLAP \
              WHISPER_RECOVER WHISPER_PROMPT WHISPER_REASK \
-             WHISPER_REASK_WORD_SECONDS WHISPER_REASK_WINDOW \
+             WHISPER_REASK_WORD_SECONDS WHISPER_REASK_WINDOW SPEECH_MAP_CLIP \
              LLAMA_ENDPOINT LLAMA_SERVER_BIN LLAMA_MODEL LLAMA_HOST LLAMA_PORT \
              LLAMA_CTX LLAMA_NGL LLAMA_MODEL_NAME LLM_API LLM_MAX_REPLY_TOKENS \
              LLM_CHECK_SCHEMA LLM_CONCURRENCY \

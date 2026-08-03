@@ -530,10 +530,6 @@ def cmd_plan(args):
 
     words = {p: word_files[p]["words"] for p in participants}
     durations = {t["participant"]: float(t["duration"]) for t in meta["tracks"]}
-    speech = {
-        p: tr.speech_from_words(words[p], durations[p], pad=params["speech_pad"])
-        for p in participants
-    }
 
     # Absent when the level scan could not be run. The cross-check then cannot
     # happen, which is worth saying rather than passing over in silence.
@@ -545,6 +541,36 @@ def cmd_plan(args):
             f"note: no level scan for {', '.join(unscanned)}, so nothing checks "
             "their transcripts against their own audio"
         )
+
+    # Read before the map is built as well as after: the scan bounds when each
+    # word was said, and a track without one falls back to trusting its timings.
+    speech = {
+        p: tr.speech_from_words(
+            words[p], durations[p], pad=params["speech_pad"],
+            loud=loud.get(p) if args.clip_speech else None,
+        )
+        for p in participants
+    }
+    if args.clip_speech and loud:
+        trimmed = {
+            p: round(
+                iv.total(
+                    tr.speech_from_words(
+                        words[p], durations[p], pad=params["speech_pad"]
+                    )
+                )
+                - iv.total(speech[p]),
+                1,
+            )
+            for p in loud
+        }
+        busy = {p: amount for p, amount in trimmed.items() if amount >= 1.0}
+        if busy:
+            print(
+                "note: word timings ran past the audio by "
+                + ", ".join(f"{p} {amount}s" for p, amount in sorted(busy.items()))
+                + "; the speech map is the overlap with the level scan"
+            )
 
     result = planner.build_plan(
         meta,
@@ -835,6 +861,11 @@ def build_parser():
         help="loud-spans output, to cross-check each transcript against its audio",
     )
     p.add_argument("--edits-dir")
+    p.add_argument(
+        "--no-clip-speech", dest="clip_speech", action="store_false",
+        help="build the speech map from the word timings alone, however far "
+             "past the audio they run",
+    )
     p.add_argument("--out", required=True)
     p.add_argument("--report")
     p.add_argument("--force", action="store_true")

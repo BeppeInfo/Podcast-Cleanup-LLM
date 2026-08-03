@@ -186,7 +186,7 @@ def build_from_segments(raw_segments, participant: str, language: str = "") -> d
 SPEECH_PAD = 0.25
 
 
-def speech_from_words(words, duration: float, pad: float = SPEECH_PAD):
+def speech_from_words(words, duration: float, pad: float = SPEECH_PAD, loud=None):
     """Where this track has speech, according to its own transcript.
 
     Whisper does its own Silero VAD pass and only transcribes what that pass
@@ -198,6 +198,21 @@ def speech_from_words(words, duration: float, pad: float = SPEECH_PAD):
     for — a laugh, a cough, a mumble, a filler it dropped — reads as silence
     here and is eligible for a silence cut. That is a deliberate trade, and
     `plan.looping_words` is what catches the failure it can no longer see.
+
+    `loud` bounds *when* a word was said, never whether it was. Whisper's word
+    timings are stretched across the silence between phrases — a single word
+    routinely spans seconds of it, and one arrived spanning nineteen — and a map
+    built from those spans reads as wall-to-wall speech, which has two effects
+    and both are wrong. No gap is ever long enough to shorten, and one
+    participant's stretched word makes every disfluency the other says during it
+    look like crosstalk, to be muted rather than cut.
+
+    So a word claims only the parts of its span the level scan measured sound in.
+    This trims, never extends: it cannot make speech out of silence, and what
+    Whisper never transcribed stays invisible here exactly as before. A word with
+    no measured sound anywhere in it claims nothing — there is no audio there to
+    protect, and after a filler-biased decode (see WHISPER_PROMPT) that is the
+    shape an invented word takes.
     """
     spans: list[tuple[float, float]] = []
     for word in words or []:
@@ -208,7 +223,17 @@ def speech_from_words(words, duration: float, pad: float = SPEECH_PAD):
             continue
         if end < start:
             continue
-        spans.append((max(0.0, start - pad), min(duration, end + pad)))
+        # Clipped before padding, so the margin is measured from the audible
+        # part rather than from a boundary the level scan just disowned.
+        pieces = (
+            intervals.intersect([(start, end)], loud)
+            if loud is not None
+            else [(start, end)]
+        )
+        for piece_start, piece_end in pieces:
+            spans.append(
+                (max(0.0, piece_start - pad), min(duration, piece_end + pad))
+            )
     return intervals.normalize(spans)
 
 

@@ -792,6 +792,7 @@ stage_plan() {
         --report "$WORK/edit-report.txt"
     )
     [[ "$LLM_ENABLE" == 1 ]] && plan_args+=(--edits-dir "$WORK/llm")
+    [[ "$SPEECH_MAP_CLIP" == 1 ]] || plan_args+=(--no-clip-speech)
     [[ "${FORCE:-0}" == 1 ]] && plan_args+=(--force)
 
     # The report is the one piece of stage output worth showing in full.

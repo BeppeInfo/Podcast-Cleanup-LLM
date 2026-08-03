@@ -553,6 +553,40 @@ And where a segment arrives without usable token timings,
 that segment tiles continuously and silence inside it is invisible — which loses a
 cut rather than inventing one, and is the direction to err in.
 
+#### The second of those risks turned out to be the larger one
+
+It is not confined to segments without usable timings, and losing a cut is not
+all it does. Whisper's word timings run past the audio as a matter of course: on
+the sample fixture a single word spanned 19.0 seconds of one track's silence, and
+across the two tracks 41 seconds of word-time sat over measured silence. A map
+built from those spans reads as wall-to-wall speech — 57s of a 57.7s track — with
+two effects, and the second is not "losing a cut" at all:
+
+- No gap is ever long enough to shorten, so `SILENCE_MIN_DURATION` never fires.
+- One participant's stretched word covers everything the other says underneath
+  it, so their disfluencies are classified as crosstalk and *muted rather than
+  cut* — the timeline preserved to protect a speaker who was not talking.
+
+`SPEECH_MAP_CLIP` bounds each word by the level scan: a word claims only the parts
+of its own span that measurably had sound in them. This is narrower than the `vad`
+stage that was deleted, and does not bring it back. The scan is not consulted
+about *whether* something is speech — it cannot tell speech from a cough, which is
+why it is not the map — only about *when* the audio it was attributed to actually
+occurred. It trims and never extends, so it cannot make speech out of silence, and
+material Whisper wrote nothing for stays invisible here exactly as before. The
+trade above is unchanged.
+
+Where a track has no level scan, its timings are trusted as before. A word with no
+measured sound anywhere in it claims nothing: there is no audio there to protect,
+and after a filler-biased decode (see §6) that is the shape an invented word
+takes — so the same clip is what keeps `WHISPER_PROMPT` from turning a
+hallucinated filler into protected speech.
+
+Measured on the fixture, against an edit cut by hand: cuts went from 3 to 6, the
+share of the episode removed from 6.6% to 16.1% against the 20.4% removed by
+hand, and mutes from 4 spans to 1 — the two the plan had been muting were the two
+the hand edit cut.
+
 ### Whisper throws away decode windows, and that is why the level scan survived
 
 The first real episode run under this design lost 33 seconds of clear speech from
@@ -985,6 +1019,7 @@ authority. The ones whose meaning is easy to get wrong:
 | `WHISPER_PROMPT` | conditioning text, not an instruction; empty means Whisper returns fluent prose and the disfluencies never reach the LLM stage at all |
 | `WHISPER_REASK` | questions a word carrying more *measured* speech than `WHISPER_REASK_WORD_SECONDS`; a word merely stretched across silence is not questioned |
 | `WHISPER_REASK_WINDOW` | short is the mechanism — a long window returns the same fluent reading that hid the disfluency |
+| `SPEECH_MAP_CLIP` | bounds each word by the level scan when building the speech map; off means a word stretched across silence protects all of it, from both cutting and the other track's disfluencies |
 | `LLAMA_MODEL_NAME` | required by a router-mode server, ignored by a single-model one |
 | `SILENCE_MIN_DURATION` | how long a gap must be before it is worth shortening |
 | `SILENCE_KEEP` | quiet left behind in place of a shortened gap |
