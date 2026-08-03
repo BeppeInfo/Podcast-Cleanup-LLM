@@ -40,11 +40,14 @@ KIND_GUIDANCE = {
     ),
     "repetition": (
         "the same word or short phrase accidentally said twice in a row — "
-        '"the the plan", "we we should"'
+        '"the the plan", "we we should". Report only the accidental copies: '
+        "the sentence still needs one of them, and it is the last"
     ),
     "false_start": (
-        "an abandoned phrase the speaker immediately replaces — "
-        '"I went to- actually we drove"'
+        "an abandoned attempt the speaker immediately replaces — "
+        '"I went to- actually we drove". A word said wrong and then said '
+        'right counts: in "the Byzntine- the Byzantine Empire" the second '
+        "attempt is the one the sentence keeps"
     ),
     "filler": 'a hesitation sound carrying no meaning — "um", "uh", "er"',
 }
@@ -70,14 +73,23 @@ EXAMPLE (its own numbering, unrelated to the transcript below)
  15 very
  16 very
  17 early
+ 18 to
+ 19 the
+ 20 Bizantine
+ 21 the
+ 22 Byzantine
+ 23 quarter
 
 Correct answer for that example:
 
 {"edits": [{"first": 1, "last": 2, "kind": "stutter", "confidence": 0.95},
-           {"first": 10, "last": 11, "kind": "false_start", "confidence": 0.8}]}
+           {"first": 10, "last": 11, "kind": "false_start", "confidence": 0.8},
+           {"first": 19, "last": 20, "kind": "false_start", "confidence": 0.85}]}
 
-Note what was *not* removed: word 3 is the attempt that succeeded, and 15-16
-("very very") is deliberate emphasis, not an accident.
+Note what was *not* removed. Word 3 is the attempt that succeeded. 15-16
+("very very") is deliberate emphasis, not an accident. And 21-22 is the
+corrected pronunciation, so the span before it stops at 20: cutting through 22
+as well would leave "to quarter".
 """
 
 
@@ -129,6 +141,11 @@ Never remove:
 Rules:
 - Report spans of consecutive word indices, using the numbering given below.
 - Keep every span minimal: cut the broken attempt, keep the completed one.
+- Where something was said more than once, the *later* version is the one that
+  survives. Cut the earlier attempts and stop before the good one — a span
+  covering every copy leaves the sentence without the word at all, which is
+  worse than leaving the whole stumble in. This applies whether the earlier
+  attempt was identical, cut short, or simply said wrong.
 - A span may cover at most {max_edit_words} words.
 - Spans must not overlap each other.
 - "confidence" is 0.0-1.0: how sure you are that this was accidental.
@@ -577,6 +594,19 @@ def _validate(raw_edits, words, first, last, limits, accepted):
             reject(edit, f"confidence {confidence:.2f} below threshold")
             continue
 
+        # The plan stage enforces this too, for edits that never came through
+        # here. Done at both ends so the model's actual mistake stays visible in
+        # the audit rather than only its consequence.
+        spared_note = ""
+        if kind in tr.SURVIVOR_KINDS:
+            spared = tr.spare_the_survivor(words, lo, hi)
+            if spared < lo:
+                reject(edit, "would remove every copy of a repeated word")
+                continue
+            if spared != hi:
+                spared_note = tr.word_text(words, spared + 1, hi)
+                hi = spared
+
         start, end = tr.word_span(words, lo, hi)
         if end - start > limits["max_seconds"]:
             reject(edit, f"span {end - start:.2f}s exceeds max_seconds")
@@ -585,17 +615,20 @@ def _validate(raw_edits, words, first, last, limits, accepted):
             reject(edit, "empty time span")
             continue
 
-        kept.append(
-            {
-                "first": lo,
-                "last": hi,
-                "kind": kind,
-                "confidence": round(confidence, 3),
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "text": tr.word_text(words, lo, hi),
-            }
-        )
+        entry = {
+            "first": lo,
+            "last": hi,
+            "kind": kind,
+            "confidence": round(confidence, 3),
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": tr.word_text(words, lo, hi),
+        }
+        if spared_note:
+            # Kept on the edit rather than counted as a rejection: the edit
+            # survived, and what the model got wrong is worth reading back.
+            entry["spared"] = spared_note
+        kept.append(entry)
     return kept, rejected
 
 

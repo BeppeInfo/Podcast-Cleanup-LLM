@@ -63,7 +63,26 @@ tools/sweep_params.py /tmp/eval/work/EPISODE host=ref-host.json \
     --vary silence_keep=0.4,0.25,0.15
 ```
 
+**5. Read the output.** Transcribe the rendered track and compare it to the
+hand edit as text. This is not optional politeness — it is the step that catches
+what the score cannot.
+
+```
+ffmpeg -i output/EPISODE/host.flac -ar 16000 -ac 1 -y /tmp/out.wav
+curl -s -F file=@/tmp/out.wav -F temperature=0 -F response_format=json \
+    http://whisper-host:8081/inference
+```
+
 ## Reading the numbers honestly
+
+**The score can improve while the episode gets worse.** This happened. The LLM
+was returning spans covering *every* copy of a repeated word — "pancakes,
+pancakes" as one span — so the rendered episode said "we're talking about those
+things that you eat", subject deleted. Precision and recall are over removed
+*time*, and a span that takes the right region plus one word more still overlaps
+the reference well, so the damage scored as ordinary boundary slop. Fixing it
+moved F1 *down* from 63.3% to 62.9% and the output from missing three words to
+matching the hand edit verbatim. Step 5 is what caught it.
 
 **Precision and recall are over removed *time*, not cuts.** A plan that removes
 the right seconds in differently placed spans scores well, which is the intent:

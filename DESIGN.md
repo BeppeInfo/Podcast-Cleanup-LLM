@@ -293,6 +293,38 @@ the raw reply per chunk, so a new kind can be run against a transcript that
 already exists and read as text — no re-transcription, no render, and no audio
 touched until the model has shown it is any good at this on real material.
 
+### A repetition has a survivor, and the model will take it
+
+"pancakes, pancakes" is two words in the transcript and one word in the
+sentence. The edit is to remove *a* copy, not the span — and the model does not
+reliably see the difference. Asked about that pair it returned both indices;
+about "would, would, would" all three; about "and, and" both. Rendered, that is
+an episode saying "we're talking about those things that you eat" with the
+subject deleted, which is worse than leaving the stumble in.
+
+The prompt already said to keep the completed attempt and showed it in the
+example. That was not enough, so the rule is now stated for the repeated case
+specifically — *the later version is the one that survives* — and enforced
+regardless. `transcript.spare_the_survivor` hands back the last copy of a span
+that is one word repeated. It fires only in that unambiguous case: a repeated
+*phrase* is left alone, because which copy survives cannot be read off safely,
+and a filler is left alone because it has no survivor — both halves of "um, um"
+should go.
+
+Enforced in the plan stage rather than only where the reply is validated. An
+edits file can be resumed from an earlier run or written by hand, and a span
+that takes every copy damages the episode however it arrived. The LLM stage
+applies it too, so the audit records what the model actually asked for; the
+operation is idempotent, so doing it twice changes nothing.
+
+**What this cost to find, and the lesson for measuring.** The over-wide spans
+were invisible in the scoring: precision and recall are computed over removed
+*time*, and a span that removes a correct region plus one word more still
+overlaps the reference well. Fixing it moved the F1 on the fixture from 63.3%
+*down* to 62.9% while the rendered episode went from missing three words to
+matching the hand edit verbatim. A transcript of the output is the check that
+catches this; the score is not.
+
 ### The transcript has already removed some of them
 
 Whisper's decoder normalises. Speech synthesised as *"So I I I think … the the

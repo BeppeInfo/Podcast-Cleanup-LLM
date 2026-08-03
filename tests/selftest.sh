@@ -587,10 +587,13 @@ if mutes["bob"]:
     sys.exit(1)
 mutes = mutes["alice"]
 start, end = mutes[0]["start"], mutes[0]["end"]
-# 5.0-5.5 widened by 0.1 s of padding on each side, the neighbouring words
-# being far enough away to allow the full amount.
-if abs(start - 4.9) > 0.001 or abs(end - 5.6) > 0.001:
-    print(f"mute is {start}-{end}, expected 4.9-5.6")
+# The model asked for both copies of "eu" (5.0-5.25 and 5.25-5.5). Only the
+# first is taken: a repetition span that swallows the last copy would leave the
+# sentence without the word, so llm._spare_the_survivor trims it. That leaves
+# 5.0-5.25, widened by 0.1 s of padding at the front — the back gets none,
+# the surviving "eu" beginning exactly where the cut ends.
+if abs(start - 4.9) > 0.001 or abs(end - 5.25) > 0.001:
+    print(f"mute is {start}-{end}, expected 4.9-5.25")
     sys.exit(1)
 ' "$PLAN6"
 fi
@@ -602,22 +605,31 @@ if [[ -s "$OUT6/alice.flac" && -s "$OUT6/bob.flac" ]]; then
     check "bob keeps his original length"   approx "$D6B" 20 0.05
     fail_note "alice=${D6A}s bob=${D6B}s (input was 20s)"
 
-    ALICE_MUTED=$(peak_db "$OUT6/alice.flac" 4.95 5.55)
+    ALICE_MUTED=$(peak_db "$OUT6/alice.flac" 4.95 5.20)
     ALICE_BEFORE=$(peak_db "$OUT6/alice.flac" 1.0 3.0)
     BOB_SAME_SPOT=$(peak_db "$OUT6/bob.flac" 5.0 5.5)
 
+    # The second "eu" runs 5.25-5.5 and is the copy the sentence keeps. The
+    # model asked for both; taking both would leave the sentence without the
+    # word, which is a worse outcome than not editing at all.
+    ALICE_SURVIVOR=$(peak_db "$OUT6/alice.flac" 5.30 5.45)
+
     check "alice is silent across the muted span" quieter_than "$ALICE_MUTED" -60
+    check "the repeated word itself survives"     louder_than  "$ALICE_SURVIVOR" -20
     check "alice is untouched either side of it"  louder_than  "$ALICE_BEFORE" -20
     # The decisive check: Bob's audio at that instant survives intact.
     check "bob is unaffected at the same instant" louder_than "$BOB_SAME_SPOT" -20
     fail_note "alice muted=${ALICE_MUTED}dB elsewhere=${ALICE_BEFORE}dB bob=${BOB_SAME_SPOT}dB"
 
-    check "the muted words left the transcript" python3 -c '
+    check "the muted word left the transcript, once" python3 -c '
 import json, sys
 data = json.load(open(sys.argv[1]))
 alice = " ".join(s["text"] for s in data["segments"] if s["participant"] == "alice")
-if "eu" in alice.split():
-    print(f"muted words are still in the transcript: {alice!r}")
+# One "eu" of the two, not none: the muted copy goes and the copy the sentence
+# keeps stays, so the transcript matches what the track now says.
+spoken = alice.split().count("eu")
+if spoken != 1:
+    print(f"expected exactly one surviving \"eu\", got {spoken}: {alice!r}")
     sys.exit(1)
 if "w0" not in alice.split():
     print(f"surviving words went missing: {alice!r}")
@@ -829,8 +841,10 @@ if len(plan["mutes"]["alice"]) != 1 or plan["mutes"]["bob"]:
     print("mutes are wrong:", plan["mutes"])
     sys.exit(1)
 mute = plan["mutes"]["alice"][0]
-if abs(mute["start"] - 4.9) > 0.001 or abs(mute["end"] - 5.6) > 0.001:
-    print("mute is", mute["start"], "-", mute["end"], "expected 4.9-5.6")
+# 4.9-5.25, not 4.9-5.6: the second "eu" is the copy the sentence keeps. See
+# the same assertion in case 6.
+if abs(mute["start"] - 4.9) > 0.001 or abs(mute["end"] - 5.25) > 0.001:
+    print("mute is", mute["start"], "-", mute["end"], "expected 4.9-5.25")
     sys.exit(1)
 ' "$WORK7/plan.json"
 fi
@@ -840,7 +854,7 @@ if [[ -s "$OUT7/alice.flac" && -s "$OUT7/bob.flac" ]]; then
     D7B=$(duration_of "$OUT7/bob.flac")
     check "both tracks keep their original length" approx "$D7A" "$D7B" 0.0005
     check "length is unchanged at 20 s" approx "$D7A" 20 0.05
-    A7_MUTED=$(peak_db "$OUT7/alice.flac" 4.95 5.55)
+    A7_MUTED=$(peak_db "$OUT7/alice.flac" 4.95 5.20)
     B7_SAME=$(peak_db "$OUT7/bob.flac" 5.0 5.5)
     check "alice is silent across the muted span" quieter_than "$A7_MUTED" -60
     check "bob is unaffected at the same instant"  louder_than  "$B7_SAME" -20

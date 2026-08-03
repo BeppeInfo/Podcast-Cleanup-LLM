@@ -237,6 +237,49 @@ def speech_from_words(words, duration: float, pad: float = SPEECH_PAD, loud=None
     return intervals.normalize(spans)
 
 
+# Kinds whose span is defined against a survivor: something was said more than
+# once, and one of them is the copy the sentence keeps. A filler has no
+# survivor — both halves of "um, um" go — so the guard below must leave it be.
+SURVIVOR_KINDS = ("stutter", "repetition")
+
+
+def same_word(one: str, other: str) -> bool:
+    """Whether two transcript tokens are the same word, punctuation aside."""
+    def bare(text):
+        return "".join(c for c in str(text).lower() if c.isalnum())
+    reduced = bare(one)
+    return bool(reduced) and reduced == bare(other)
+
+
+def spare_the_survivor(words, first: int, last: int) -> int:
+    """The last index a repetition span may take, keeping one copy of the word.
+
+    The LLM is told to keep the completed attempt and does not reliably do it:
+    asked about "pancakes, pancakes" it returned both indices, and about
+    "would, would, would" all three. Rendered, that is a sentence missing the
+    word altogether — a worse outcome than not editing, and the reason this is
+    enforced rather than requested.
+
+    Only fires where the whole span is one word repeated, so it cannot shorten a
+    span that was doing something else — a repeated *phrase* is left alone,
+    since which copy survives cannot be read off as safely. If the word after
+    the span is that word again, a survivor already stands outside it and the
+    span is returned unchanged.
+
+    Returns a last-index below `first` when the span cannot be salvaged, which
+    is the caller's cue to drop the edit.
+    """
+    tokens = [words[index]["text"] for index in range(first, last + 1)]
+    # same_word is false for a token with no letters in it, so punctuation-only
+    # entries fall out here rather than counting as every word at once.
+    if not all(same_word(tokens[0], token) for token in tokens):
+        return last
+    following = words[last + 1]["text"] if last + 1 < len(words) else ""
+    if same_word(tokens[0], following):
+        return last
+    return last - 1
+
+
 def word_span(words, first: int, last: int) -> tuple[float, float]:
     return words[first]["start"], words[last]["end"]
 
