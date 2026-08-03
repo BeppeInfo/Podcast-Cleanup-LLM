@@ -174,6 +174,43 @@ WHISPER_VAD_SAMPLES_OVERLAP="0.1"
 # plan stage to refuse over.
 WHISPER_RECOVER="1"
 
+# Whisper's initial prompt. This is conditioning text, not an instruction: it is
+# seeded into the decoder as though it were the transcript preceding the audio,
+# and the decode carries on in whatever register it was handed. Nothing in it is
+# obeyed, so wording it as a request achieves nothing — the fillers themselves are
+# what does the work.
+#
+# It matters more than it looks. Left empty, Whisper returns *fluent prose*: it
+# drops the fillers, stutters and false starts this pipeline exists to cut, and
+# absorbs the time they occupied into the neighbouring word. Nothing downstream
+# can then find them — the LLM stage only sees the transcript, and the plan stage
+# sees one long word where there was a pause, so the silence is not a gap either.
+# Measured on a two-track sample: of six disfluencies removed by hand, an empty
+# prompt left five of them absent from the transcript entirely.
+#
+# The cost is the mirror image: a decode biased towards fillers can invent one in
+# silence, and since the speech map is derived from these words, an invented
+# filler becomes speech in the plan. Keep the Silero pass on (WHISPER_VAD) and the
+# invented ones have no silence to appear in.
+WHISPER_PROMPT="Um, uh, so, like, you know, I mean — um, that's, that's the thing."
+
+# A prompt does not reach everything. Where one word still sits on seconds of
+# continuous speech, Whisper read a whole passage fluently and hung it on that
+# word; asked again in a short window it comes back verbatim, because there is no
+# fluent context left to smooth into. Sending the same span as a long request does
+# not work — the *length of the window* is the mechanism, not the re-asking.
+#
+# Costs one request per collapsed word, and nothing on a track with none. Turn it
+# off to have the transcript be exactly what the first pass said.
+WHISPER_REASK="1"
+# A word carrying more speech than this had something else inside it. Measured
+# against the level scan, so the pause around a word is not counted: no ordinary
+# word reaches a second of speech. Lower it to question more, at one request each.
+WHISPER_REASK_WORD_SECONDS="1.2"
+# How long those windows are. Five seconds was enough to recover a repetition that
+# nineteen seconds of the same audio did not; there is no gain in raising it.
+WHISPER_REASK_WINDOW="5.0"
+
 # Local Whisper never runs at the same time as a locally managed llama-server:
 # every track is transcribed and the process exits before the LLM stage begins.
 # Raise this only if there is RAM for several Whisper instances at once.

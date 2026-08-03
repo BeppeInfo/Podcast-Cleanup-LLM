@@ -322,6 +322,10 @@ def cmd_transcribe_remote(args):
         vad_options=options,
         recover=args.recover,
         speech_pad=args.speech_pad,
+        prompt=args.prompt,
+        reask=args.reask,
+        reask_word_seconds=args.reask_word_seconds,
+        reask_window=args.reask_window,
     )
     _write_json(args.out, parsed)
 
@@ -347,6 +351,23 @@ def cmd_transcribe_remote(args):
             print(
                 f"WARN {recovery['skipped']} further stretch(es) were left "
                 "unasked; that many is not the occasional skipped window",
+                flush=True,
+            )
+    collapsed = parsed.get("collapsed") or {}
+    if collapsed.get("spans"):
+        print(
+            f"note: {collapsed['spans']} word(s) sat on more than "
+            f"{args.reask_word_seconds}s of speech; asked again in "
+            f"{args.reask_window}s windows and replaced "
+            f"{collapsed['replaced_spans']}, turning "
+            f"{collapsed['words_before']} word(s) into "
+            f"{collapsed['words_after']}",
+            flush=True,
+        )
+        if collapsed.get("skipped"):
+            print(
+                f"WARN {collapsed['skipped']} further collapsed word(s) were left "
+                "unasked; that many is not the occasional fluent reading",
                 flush=True,
             )
     empty = parsed.get("chunks_without_speech") or 0
@@ -743,6 +764,22 @@ def build_parser():
     p.add_argument(
         "--speech-pad", type=float, default=0.25,
         help="match the plan stage's SPEECH_PAD, so both ask the same question",
+    )
+    p.add_argument(
+        "--prompt", default="",
+        help="whisper's initial prompt; conditioning text, not an instruction",
+    )
+    p.add_argument(
+        "--no-reask", dest="reask", action="store_false",
+        help="do not re-ask in short windows where one word swallowed the audio",
+    )
+    p.add_argument(
+        "--reask-word-seconds", type=float, default=asr.COLLAPSED_WORD_LOUD,
+        help="a word carrying more speech than this is asked about again",
+    )
+    p.add_argument(
+        "--reask-window", type=float, default=asr.COLLAPSED_WINDOW,
+        help="length of those windows; short is what makes the reading verbatim",
     )
     p.add_argument("--language", default="auto")
     p.add_argument("--temperature", type=float, default=0.0)

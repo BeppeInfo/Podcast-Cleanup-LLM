@@ -388,6 +388,10 @@ stage_transcribe() {
             --output-json-full --print-progress -t "$WHISPER_THREADS"
         )
         [[ "$WHISPER_LANG" != "auto" ]] && whisper_args+=(-l "$WHISPER_LANG")
+        # Same conditioning as the remote path. The re-asking has no equivalent
+        # here: this branch hands the whole track to whisper-cli in one call and
+        # never sees a response it could question.
+        [[ -n "$WHISPER_PROMPT" ]] && whisper_args+=(--prompt "$WHISPER_PROMPT")
         # Same Silero pass the remote path asks the server for. Without it this
         # track's silence gets transcribed, and whatever Whisper invents there
         # becomes speech in the plan.
@@ -485,6 +489,15 @@ stage_transcribe_remote() {
         )
         [[ -n "$loud_spans" ]] && args+=(--loud "$loud_spans")
         [[ "$WHISPER_RECOVER" == 1 ]] || args+=(--no-recover)
+        [[ -n "$WHISPER_PROMPT" ]] && args+=(--prompt "$WHISPER_PROMPT")
+        if [[ "$WHISPER_REASK" == 1 ]]; then
+            args+=(
+                --reask-word-seconds "$WHISPER_REASK_WORD_SECONDS"
+                --reask-window "$WHISPER_REASK_WINDOW"
+            )
+        else
+            args+=(--no-reask)
+        fi
         if [[ "$WHISPER_VAD" == 1 ]]; then
             args+=(
                 --vad-threshold "$WHISPER_VAD_THRESHOLD"

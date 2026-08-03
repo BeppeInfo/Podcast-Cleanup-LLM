@@ -89,6 +89,52 @@ RECOVERY_MAX_SPANS = 20
 RECOVERY_MERGE_GAP = 3.0
 
 
+# --- re-asking where one word swallowed the audio -----------------------------
+#
+# The recovery above answers "loud audio, no words at all". This answers the
+# graded version of the same question: loud audio with implausibly *few* words on
+# it.
+#
+# Whisper returns fluent prose rather than what was said. Fillers, stutters and
+# false starts are quietly dropped, and the time they occupied is absorbed into a
+# neighbouring word, so one word ends up spanning seconds of continuous speech.
+# Nothing in the response marks it, and both stages downstream are then blind in
+# the same place: the LLM stage cannot cut a disfluency that is not in the
+# transcript, and the plan stage sees one long word where there was a pause, so
+# the silence never becomes a gap either.
+#
+# Asked again in a short window the same audio comes back verbatim, because the
+# model has no fluent context to smooth into. Measured on the sample fixture:
+# "Yeah, I wonder what Fairpunk would talk about this" from the whole-file pass
+# became "Yeah, I wonder what Fairpunk, uh, would, would, would talk about this"
+# from a five-second window. Sending the same span as a nineteen-second request
+# was not enough — the length of the window is the mechanism.
+
+# A word carrying more loud audio than this had something else inside it. No
+# ordinary word does: even a long one, said slowly, is well under a second of
+# speech, and the level scan does not count the pause around it.
+COLLAPSED_WORD_LOUD = 1.2
+
+# Short is the point, not an optimisation. A long window brings back the fluent
+# reading that hid the disfluency in the first place.
+COLLAPSED_WINDOW = 5.0
+
+# Context either side so a window does not begin mid-word. Never accepted back:
+# the padding re-transcribes a neighbour that is already known.
+COLLAPSED_PAD = 1.0
+
+# Replaced only where the second pass found at least this many more words than
+# the first. Equal counts are the same reading spelled differently — proper nouns
+# come back unstable from a short window ("Shwereponk", "SharePunk", "Fairpunk")
+# — and swapping one spelling for another is churn, not recovery.
+COLLAPSED_MIN_GAIN = 1
+
+# Same reasoning as RECOVERY_MAX_SPANS: a track needing more than this is not
+# suffering the occasional collapsed word, and spending the requests to prove it
+# helps nobody.
+COLLAPSED_MAX_SPANS = 30
+
+
 # --- chunk planning -----------------------------------------------------------
 
 
@@ -530,6 +576,122 @@ def recover_missing(
     return recovered, summary
 
 
+def _split_window(start: float, end: float, target: float):
+    """Even windows of at most `target`, covering start..end."""
+    span = end - start
+    count = 1
+    while span / count > target:
+        count += 1
+    step = span / count
+    return [(start + i * step, start + (i + 1) * step) for i in range(count)]
+
+
+def _centre_inside(segment: dict, start: float, end: float) -> bool:
+    """Whether a segment belongs to a span, judged by its midpoint.
+
+    Midpoints rather than containment, so the same test decides what leaves and
+    what arrives: a word straddling the edge must not be dropped from the first
+    pass and then rejected from the second as well.
+    """
+    lo = segment["offsets"]["from"] / 1000.0
+    hi = segment["offsets"]["to"] / 1000.0
+    return start <= (lo + hi) / 2.0 < end
+
+
+def collapsed_spans(segments: list, loud, word_loud: float = COLLAPSED_WORD_LOUD):
+    """Words sitting on more loud audio than a word can account for."""
+    loud_spans = iv.normalize(loud or [])
+    suspicious = []
+    for segment in segments:
+        start = segment["offsets"]["from"] / 1000.0
+        end = segment["offsets"]["to"] / 1000.0
+        if end - start <= word_loud:
+            continue
+        if iv.overlap_amount((start, end), loud_spans) >= word_loud:
+            suspicious.append((start, end))
+    # Neighbouring collapsed words are one passage read fluently, not two
+    # independent findings; asking once keeps the window's context intact.
+    return iv.normalize(suspicious, gap=0.5)
+
+
+def reask_collapsed(
+    client: WhisperClient,
+    wav_path: str,
+    duration: float,
+    fields: dict,
+    segments: list,
+    loud,
+    workdir: str,
+    word_loud: float = COLLAPSED_WORD_LOUD,
+    window: float = COLLAPSED_WINDOW,
+    on_note=None,
+) -> tuple[list, dict]:
+    """Re-ask in short windows wherever one word swallowed seconds of speech.
+
+    Returns the segment list with those passages replaced, and a summary. Like
+    the recovery above, failure is not fatal: the first pass stands.
+    """
+    spans = collapsed_spans(segments, loud, word_loud)
+    summary = {
+        "spans": len(spans),
+        "attempted": 0,
+        "replaced_spans": 0,
+        "words_before": 0,
+        "words_after": 0,
+        "skipped": max(0, len(spans) - COLLAPSED_MAX_SPANS),
+    }
+    if not spans:
+        return segments, summary
+
+    result = list(segments)
+    for index, (start, end) in enumerate(spans[:COLLAPSED_MAX_SPANS]):
+        summary["attempted"] += 1
+        found: list[dict] = []
+        failed = False
+        for number, (lo, hi) in enumerate(_split_window(start, end, window)):
+            piece_start = max(0.0, lo - COLLAPSED_PAD)
+            piece_end = min(duration, hi + COLLAPSED_PAD)
+            target = os.path.join(workdir, f"verbatim{index:03d}_{number:02d}.wav")
+            try:
+                slice_wav(wav_path, piece_start, piece_end, target)
+                payload = client.transcribe_file(target, fields)
+                found.extend(normalize_response(payload, offset=piece_start))
+            except AuthRejected:
+                raise
+            except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+                failed = True
+                break
+            finally:
+                if os.path.exists(target):
+                    os.unlink(target)
+        if failed:
+            continue
+
+        fresh = [s for s in found if _centre_inside(s, start, end)]
+        stale = [s for s in result if _centre_inside(s, start, end)]
+        summary["words_before"] += len(stale)
+        # More words for the same audio is the evidence: the first pass was
+        # smoothing something over. Fewer or the same is a worse reading of audio
+        # already transcribed, and is discarded.
+        if len(fresh) - len(stale) < COLLAPSED_MIN_GAIN:
+            summary["words_after"] += len(stale)
+            continue
+
+        summary["words_after"] += len(fresh)
+        summary["replaced_spans"] += 1
+        result = [s for s in result if not _centre_inside(s, start, end)]
+        result.extend(fresh)
+        if on_note:
+            said = " ".join(str(s.get("text", "")).strip() for s in fresh)
+            on_note(
+                f"{start:.1f}-{end:.1f}s came back as {len(fresh)} words rather "
+                f"than {len(stale)} when asked in short windows: {said.strip()!r}"
+            )
+
+    result.sort(key=lambda segment: segment["offsets"]["from"])
+    return result, summary
+
+
 def transcribe(
     client: WhisperClient,
     wav_path: str,
@@ -546,6 +708,10 @@ def transcribe(
     vad_options: dict | None = None,
     recover: bool = True,
     speech_pad: float = 0.25,
+    prompt: str = "",
+    reask: bool = True,
+    reask_word_seconds: float = COLLAPSED_WORD_LOUD,
+    reask_window: float = COLLAPSED_WINDOW,
 ) -> dict:
     """Transcribe one prepared track, returning the parsed words structure.
 
@@ -559,6 +725,12 @@ def transcribe(
     Whisper threw away, which is the one thing that can find those. `speech_pad`
     should match the plan stage's, so this asks the same question of the coverage
     that the plan stage will.
+
+    `prompt` is whisper's initial prompt: conditioning text, not an instruction.
+    A filler-laden one biases the decode towards what was actually said, which is
+    the only setting that stops fillers being dropped from the transcript.
+    `reask` then chases what a prompt alone does not reach — see the notes above
+    COLLAPSED_WORD_LOUD. Both need `loud` to have anything to work from.
     """
     from . import transcript as tr
 
@@ -574,6 +746,8 @@ def transcribe(
         "max_len": "1",
         "split_on_word": "true",
     }
+    if prompt:
+        fields["prompt"] = prompt
     if language and language != "auto":
         fields["language"] = language
     if vad:
@@ -588,6 +762,8 @@ def transcribe(
     silent_chunks = 0
     recovery = {"spans": 0, "attempted": 0, "recovered_spans": 0,
                 "recovered_segments": 0, "skipped": 0}
+    collapsed = {"spans": 0, "attempted": 0, "replaced_spans": 0,
+                 "words_before": 0, "words_after": 0, "skipped": 0}
     workdir = tempfile.mkdtemp(prefix="podcast-asr-")
     try:
         for index, (start, end) in enumerate(chunks):
@@ -633,6 +809,16 @@ def transcribe(
                 speech_pad, workdir, on_note=on_note,
             )
             segments.extend(extra)
+
+        # After the recovery, not before: a span the first pass returned nothing
+        # for has no word on it to look collapsed, and re-asking about it here
+        # would duplicate what the recovery just brought back.
+        if reask and loud:
+            segments, collapsed = reask_collapsed(
+                client, wav_path, duration, fields, segments, loud, workdir,
+                word_loud=reask_word_seconds, window=reask_window,
+                on_note=on_note,
+            )
     finally:
         try:
             os.rmdir(workdir)
@@ -643,6 +829,7 @@ def transcribe(
     parsed = tr.build_from_segments(segments, participant)
     parsed["chunks"] = len(chunks)
     parsed["recovery"] = recovery
+    parsed["collapsed"] = collapsed
     # The whole track went to the server; what it chose to transcribe is the
     # server's VAD decision, and the plan stage measures it by deriving the
     # speech map from these words.

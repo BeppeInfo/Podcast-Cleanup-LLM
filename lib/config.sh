@@ -110,6 +110,22 @@ config_defaults() {
     # per missing stretch, and nothing at all on a track with none.
     : "${WHISPER_RECOVER:=1}"
 
+    # Whisper's initial prompt: conditioning text, not an instruction — the decode
+    # continues in the register it is handed. Left empty, Whisper returns fluent
+    # prose and drops the fillers and stutters this pipeline exists to cut, and
+    # nothing downstream can cut what is not in the transcript.
+    : "${WHISPER_PROMPT:=}"
+
+    # A prompt does not reach everything. Where one word still sits on seconds of
+    # speech, Whisper absorbed something into it; asked again in a short window the
+    # same audio comes back verbatim. Costs one request per collapsed word.
+    : "${WHISPER_REASK:=1}"
+    # A word carrying more speech than this had something else in it.
+    : "${WHISPER_REASK_WORD_SECONDS:=1.2}"
+    # Length of the re-ask window. Short is the mechanism: a long window brings
+    # back the same fluent reading that hid the disfluency.
+    : "${WHISPER_REASK_WINDOW:=5.0}"
+
     # llama.cpp -------------------------------------------------------------
     # LLAMA_ENDPOINT: if set, an already-running server is used as-is and this
     # script never spawns or stops one.
@@ -558,6 +574,8 @@ config_dump() {
              WHISPER_VAD WHISPER_VAD_MODEL WHISPER_VAD_THRESHOLD \
              WHISPER_VAD_MIN_SPEECH_MS WHISPER_VAD_MIN_SILENCE_MS \
              WHISPER_VAD_SPEECH_PAD_MS WHISPER_VAD_SAMPLES_OVERLAP \
+             WHISPER_RECOVER WHISPER_PROMPT WHISPER_REASK \
+             WHISPER_REASK_WORD_SECONDS WHISPER_REASK_WINDOW \
              LLAMA_ENDPOINT LLAMA_SERVER_BIN LLAMA_MODEL LLAMA_HOST LLAMA_PORT \
              LLAMA_CTX LLAMA_NGL LLAMA_MODEL_NAME LLM_API LLM_MAX_REPLY_TOKENS \
              LLM_CHECK_SCHEMA LLM_CONCURRENCY \

@@ -308,9 +308,65 @@ Two consequences, and the second is easy to miss:
   disfluencies are planted, they are gone by the time the words arrive. That is
   why a real recording is kept in `tests/samples/` — see §10.
 
-Nothing is done about the first. Reconstructing what Whisper discarded would mean
-distrusting the transcript the rest of the pipeline is built on, and the timings
-would be guesswork.
+Reconstructing what Whisper discarded after the fact would mean distrusting the
+transcript the rest of the pipeline is built on, and the timings would be
+guesswork. So nothing is reconstructed. What is done instead is to stop it being
+discarded in the first place, which costs nothing downstream because the words
+arrive through the ordinary path with the server's own timings.
+
+**The prompt is what does it.** `WHISPER_PROMPT` is whisper's initial prompt:
+conditioning text seeded into the decoder as though it were the transcript
+preceding the audio. It is not an instruction and nothing in it is obeyed — the
+decode simply carries on in the register it was handed, so a prompt full of
+fillers biases it towards the fillers that were actually said. Wording it as a
+request does nothing; the fillers themselves are the mechanism.
+
+Measured on the two-track sample fixture, against an edit cut by hand. Six
+disfluencies were removed by hand; with no prompt, five of them were absent from
+the transcript altogether, and the LLM stage returned `{"edits": []}` for both
+tracks — not caution, blindness. With a prompt, five of the six came back
+(*"and, um, um"*, *"pancakes, pancakes"*, *"Uh,"*, *"would, would, would"*,
+*"and, and"*), and the stage found eight edits. Nothing else moved the needle:
+VAD on and off, `max_len=1` on and off, `no_context`, and temperature 0 through
+0.4 all returned byte-identical text.
+
+The cost is the mirror image of the gain, and it is real: a decode biased towards
+fillers can invent one in silence, and §7 derives the speech map from these
+words, so an invented filler becomes speech in the plan. The Silero pass is what
+keeps that in check — with VAD on there is no silence for an invented filler to
+appear in. A prompt is a bias, not a switch, and it comes with no guarantees in
+either direction.
+
+### Re-asking where one word swallowed the audio
+
+The recovery in §7 answers *"loud audio, no words at all"*. `WHISPER_REASK`
+answers the graded version: loud audio with implausibly *few* words on it. When
+Whisper reads a passage fluently it hangs the whole passage on one word, and that
+word ends up carrying seconds of continuous speech. Nothing in the response marks
+it, and both stages downstream go blind in the same spot — the LLM stage cannot
+cut what is not in the transcript, and the plan stage sees one long word where
+there was a pause, so the silence never becomes a gap either.
+
+The trigger is the level scan, not the clock: a word is only questioned when more
+than `WHISPER_REASK_WORD_SECONDS` of *measured loud audio* sits inside it. A word
+stretched across silence is badly timestamped, not hiding anything, and asking
+about it would spend a request to be told the same thing.
+
+Asked again in a short window the same audio comes back verbatim, because there
+is no fluent context left to smooth into. The window length is the mechanism, not
+the re-asking: re-sending one span as a nineteen-second request returned the same
+cleaned-up reading, while five-second windows over the same audio returned
+*"Yeah, I wonder what Fairpunk, uh, would, would, would talk about this"*.
+
+A replacement is only accepted where the second pass found strictly more words
+than the first. Equal counts are the same reading spelled differently — proper
+nouns come back unstable from a short window, the same name arriving as
+*Shwereponk*, *SharePunk* and *Fairpunk* — and trading one spelling for another
+is churn, not recovery.
+
+On the sample fixture this fired once and correctly declined to replace anything:
+with the prompt in place there was nothing left for it to find. It is kept for
+the case the prompt does not reach, which is the one it was written for.
 
 ### Nothing here knows which model it is talking to
 
@@ -926,6 +982,9 @@ authority. The ones whose meaning is easy to get wrong:
 | `SPEECH_PAD` | how far each word is widened before the union that makes the speech map; a gap needs `SILENCE_MIN_DURATION` **plus twice this** to be silence |
 | `SPLIT_SILENCE_THRESHOLD` | picks chunk boundaries, and sets how much loud-but-untranscribed audio gets reported; it never decides what is cut |
 | `WHISPER_RECOVER` | re-asks about stretches the first pass returned nothing for — the only thing that recovers a discarded decode window |
+| `WHISPER_PROMPT` | conditioning text, not an instruction; empty means Whisper returns fluent prose and the disfluencies never reach the LLM stage at all |
+| `WHISPER_REASK` | questions a word carrying more *measured* speech than `WHISPER_REASK_WORD_SECONDS`; a word merely stretched across silence is not questioned |
+| `WHISPER_REASK_WINDOW` | short is the mechanism — a long window returns the same fluent reading that hid the disfluency |
 | `LLAMA_MODEL_NAME` | required by a router-mode server, ignored by a single-model one |
 | `SILENCE_MIN_DURATION` | how long a gap must be before it is worth shortening |
 | `SILENCE_KEEP` | quiet left behind in place of a shortened gap |
