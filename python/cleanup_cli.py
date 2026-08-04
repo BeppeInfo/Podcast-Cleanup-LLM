@@ -408,6 +408,18 @@ def cmd_stage_detect(args):
         raise SystemExit(1) from None
 
 
+def cmd_stage_render(args):
+    """The render stage: one ffmpeg pass per track, then verify the lengths."""
+    log = runlog.Log.from_env()
+    settings = cfg.from_environment()
+    try:
+        pipeline.stage_render(args.work, args.staging, settings, log,
+                              ffmpeg=args.ffmpeg, ffprobe=args.ffprobe)
+    except pipeline.StageError as exc:
+        log.error(str(exc))
+        raise SystemExit(1) from None
+
+
 # --- plan ---------------------------------------------------------------------
 
 
@@ -621,6 +633,14 @@ def build_parser():
     p.add_argument("--work", required=True)
     p.add_argument("--ffmpeg", default="ffmpeg")
     p.set_defaults(func=cmd_stage_transcribe)
+
+    p = sub.add_parser("stage-render", help="run the render stage")
+    p.add_argument("--work", required=True)
+    p.add_argument("--staging", required=True,
+                   help="where finished tracks are written before publishing")
+    p.add_argument("--ffmpeg", default="ffmpeg")
+    p.add_argument("--ffprobe", default="ffprobe")
+    p.set_defaults(func=cmd_stage_render)
 
     p = sub.add_parser("stage-detect", help="run the detect stage")
     p.add_argument("--work", required=True)

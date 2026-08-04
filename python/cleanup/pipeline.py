@@ -16,6 +16,8 @@ import concurrent.futures
 import glob
 import json
 import os
+import shutil
+import subprocess
 
 from . import intervals as iv
 from . import plan as planner
@@ -482,6 +484,166 @@ def stage_detect(work: str, settings, log, api_key=None, resume_hint: str = "",
     if total > 0 and failed == total:
         raise StageError("edit detection failed for every track")
     log.raw(f"{total - failed}/{total} tracks analysed")
+
+
+# Encoders with a bit depth worth preserving. For anything else the source's
+# sample format is not a property the output can carry.
+DEPTH_AWARE_CODECS = ("flac", "alac", "wavpack")
+
+
+def encode_args(settings, track) -> list[str]:
+    """The codec half of an ffmpeg command line, for one track."""
+    codec = settings["OUTPUT_CODEC"]
+    args = ["-c:a", codec]
+    if codec == "flac":
+        args += ["-compression_level", str(settings["OUTPUT_COMPRESSION"])]
+    # Deliberately split rather than quoted: a user-supplied argument string.
+    if settings["OUTPUT_EXTRA_ARGS"].strip():
+        args += settings["OUTPUT_EXTRA_ARGS"].split()
+    fmt = track.get("sample_fmt") or ""
+    if (codec in DEPTH_AWARE_CODECS or codec.startswith("pcm_")) \
+            and fmt in ("s16", "s32"):
+        args += ["-sample_fmt", fmt]
+    return args
+
+
+def probe_duration(ffprobe: str, path: str) -> float:
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", path],
+        capture_output=True, text=True, check=False,
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        raise StageError(f"could not measure the rendered file: {path}") from None
+
+
+def verify_durations(work: str, actual, tolerance: float, log) -> None:
+    """Compare what was rendered against the frame-exact prediction.
+
+    Not a rule of thumb: expected.json says how many samples each track should
+    contain, computed from the same frame size the filtergraph used. A mismatch
+    means the cuts that were rendered are not the cuts that were planned, so the
+    run stops with everything kept.
+    """
+    expectations = read_json(os.path.join(work, "expected.json"))["tracks"]
+    problems = []
+    for participant, measured in sorted(actual.items()):
+        if participant not in expectations:
+            problems.append(f"{participant}: rendered but not in the plan")
+            continue
+        expected = expectations[participant]["expected_duration"]
+        allowed = max(tolerance * expected, 0.05)
+        delta = abs(measured - expected)
+        ok = delta <= allowed
+        log.report(f"{participant:<16} expected {expected:9.3f}s  "
+                   f"actual {measured:9.3f}s  delta {delta:6.3f}s  "
+                   f"{'ok' if ok else 'MISMATCH'}")
+        if not ok:
+            problems.append(
+                f"{participant}: expected {expected:.3f}s but rendered "
+                f"{measured:.3f}s (delta {delta:.3f}s, allowed {allowed:.3f}s)")
+
+    for participant in expectations:
+        if participant not in actual:
+            problems.append(f"{participant}: planned but never rendered")
+
+    if problems:
+        for problem in problems:
+            log.error(problem)
+        raise StageError("rendered durations do not match the plan; inputs and "
+                         "work directory kept")
+    log.report("all tracks verified")
+
+
+def stage_render(work: str, staging: str, settings, log, ffmpeg: str = "ffmpeg",
+                 ffprobe: str = "ffprobe") -> None:
+    """Render every track through its filtergraph, then check the lengths."""
+    plan_path = os.path.join(work, "plan.json")
+    if not (os.path.isfile(plan_path) and os.path.getsize(plan_path) > 0):
+        raise StageError("no plan.json; run the plan stage first")
+
+    meta = read_json(os.path.join(work, "meta.json"))
+    state = os.path.join(work, "state")
+    os.makedirs(staging, exist_ok=True)
+    jobs = max(1, int(settings["FFMPEG_JOBS"]))
+    suffix, extension = settings["OUTPUT_SUFFIX"], settings["OUTPUT_EXT"]
+
+    jobs_to_run = []
+    for track in meta["tracks"]:
+        participant = track["participant"]
+        target = os.path.join(staging, f"{participant}{suffix}.{extension}")
+        marker = os.path.join(state, f"render-{participant}.ok")
+        filter_path = os.path.join(work, "render", f"{participant}.filter")
+        if os.path.exists(marker):
+            os.remove(marker)
+        jobs_to_run.append((track, target, marker, filter_path))
+
+    def render_one(item) -> tuple[str, int]:
+        track, target, marker, filter_path = item
+        participant = track["participant"]
+        source = track["source"]
+        encode = encode_args(settings, track)
+
+        if not os.path.isfile(filter_path):
+            # No edits and no resampling. Copying beats re-encoding, but only
+            # when the file is already in the format being asked for.
+            same = (track.get("codec") == settings["OUTPUT_CODEC"]
+                    and source.rpartition(".")[2] == extension)
+            if same:
+                log.info(f"{participant} needs no edits and is already "
+                         f"{settings['OUTPUT_CODEC']}, copying it through")
+                try:
+                    shutil.copyfile(source, target)
+                except OSError as exc:
+                    log.error(f"could not copy {participant}: {exc}")
+                    return participant, 1
+                open(marker, "w").close()
+                return participant, 0
+
+            log.info(f"{participant} needs no edits, converting to "
+                     f"{settings['OUTPUT_CODEC']}")
+            argv = [ffmpeg, "-nostdin", "-y", "-v", "warning", "-i", source,
+                    "-map", "0:a:0", *encode, target]
+            status = proc.run(argv, log)
+            if status == 0:
+                open(marker, "w").close()
+            return participant, status
+
+        argv = [ffmpeg, "-nostdin", "-y", "-v", "warning", "-progress", "pipe:1",
+                "-nostats", "-i", source,
+                "-filter_complex_script", filter_path, "-map", "[out]",
+                *encode, target]
+        on_line = None
+        if jobs <= 1:
+            on_line = proc.ffmpeg_progress(
+                log, float(track["duration"]) * 1_000_000, f"rendering {participant}")
+        status = proc.run(argv, log, on_line=on_line)
+        if status == 0:
+            open(marker, "w").close()
+            log.ok(f"rendered {participant}")
+        return participant, status
+
+    if jobs <= 1 or len(jobs_to_run) <= 1:
+        results = [render_one(item) for item in jobs_to_run]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            results = list(pool.map(render_one, jobs_to_run))
+
+    failed = [name for name, status in results if status != 0]
+    if failed:
+        raise StageError(f"rendering failed for: {', '.join(sorted(failed))}")
+
+    actual = {}
+    for track in meta["tracks"]:
+        participant = track["participant"]
+        target = os.path.join(staging, f"{participant}{suffix}.{extension}")
+        if not (os.path.isfile(target) and os.path.getsize(target) > 0):
+            raise StageError(f"rendered file is missing or empty: {target}")
+        actual[participant] = probe_duration(ffprobe, target)
+
+    verify_durations(work, actual, float(settings["DURATION_TOLERANCE"]), log)
 
 
 def stage_plan(work: str, settings, log, force: bool = False) -> dict:

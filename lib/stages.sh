@@ -297,110 +297,19 @@ stage_plan() {
 stage_render() {
     stage_begin render "rendering cleaned tracks"
     config_need_ffmpeg
-    [[ -s "$WORK/plan.json" || "$DRY_RUN" == 1 ]] || die "no plan.json; run the plan stage first"
-
-    [[ "$DRY_RUN" == 1 ]] || mkdir -p "$STAGING_DIR"
-
-    local -a markers=()
-    local participant target marker filter fmt source
-    local -a fmt_args=() encode_args=()
-
-    for participant in "${PARTICIPANTS[@]}"; do
-        source="${TRACK_SOURCE[$participant]}"
-        target="$STAGING_DIR/${participant}${OUTPUT_SUFFIX}.${OUTPUT_EXT}"
-        marker="$STAGE_DIR/render-$participant.ok"
-        filter="$WORK/render/$participant.filter"
-        markers+=("$marker")
-        rm -f "$marker"
-
-        # Bit depth is only meaningful to encoders that have one to preserve.
-        fmt="${TRACK_SAMPLE_FMT[$participant]:-}"
-        fmt_args=()
-        case "$OUTPUT_CODEC" in
-            flac|alac|pcm_*|wavpack)
-                case "$fmt" in
-                    s16|s32) fmt_args=(-sample_fmt "$fmt") ;;
-                esac
-                ;;
-        esac
-
-        encode_args=(-c:a "$OUTPUT_CODEC")
-        [[ "$OUTPUT_CODEC" == flac ]] \
-            && encode_args+=(-compression_level "$OUTPUT_COMPRESSION")
-        # Deliberately unquoted: a user-supplied argument string.
-        # shellcheck disable=SC2206
-        [[ -n "$OUTPUT_EXTRA_ARGS" ]] && encode_args+=($OUTPUT_EXTRA_ARGS)
-        encode_args+=("${fmt_args[@]}")
-
-        if [[ ! -f "$filter" ]]; then
-            # No edits and no resampling. Copying beats re-encoding, but only
-            # when the file is already in the format being asked for —
-            # otherwise it still has to be converted.
-            if [[ "${TRACK_CODEC[$participant]:-}" == "$OUTPUT_CODEC" \
-                  && "${source##*.}" == "$OUTPUT_EXT" ]]; then
-                log_info "$participant needs no edits and is already $OUTPUT_CODEC, copying it through"
-                if [[ "$DRY_RUN" != 1 ]]; then
-                    cp -- "$source" "$target" || die "could not copy $participant"
-                    state_touch "$marker"
-                fi
-                continue
-            fi
-            log_info "$participant needs no edits, converting to $OUTPUT_CODEC"
-            if [[ "$DRY_RUN" != 1 ]]; then
-                run "$FFMPEG" -nostdin -y -v warning -i "$source" \
-                    -map 0:a:0 "${encode_args[@]}" "$target" \
-                    || die "could not convert $participant"
-                state_touch "$marker"
-            fi
-            continue
-        fi
-
-        local -a render_cmd=(
-            "$FFMPEG" -nostdin -y -v warning -progress pipe:1 -nostats
-            -i "$source"
-            -filter_complex_script "$filter" -map '[out]'
-            "${encode_args[@]}" "$target"
-        )
-
-        if (( FFMPEG_JOBS <= 1 )); then
-            FFMPEG_TOTAL_US=$(track_total_us "$participant") \
-                run_streaming parse_ffmpeg_progress "rendering $participant" \
-                "${render_cmd[@]}" || die "could not render $participant"
-            state_touch "$marker"
-        else
-            pool_slot "$FFMPEG_JOBS"
-            (
-                run "${render_cmd[@]}" \
-                    && state_touch "$marker" \
-                    && log_ok "rendered $participant"
-            ) &
-        fi
-    done
-
-    pool_wait "rendering" "${markers[@]}"
 
     if [[ "$DRY_RUN" == 1 ]]; then
+        log_info "would render ${#PARTICIPANTS[@]} tracks into $STAGING_DIR"
         state_mark render
         stage_end "dry run"
         return 0
     fi
 
-    # Verify against the frame-exact prediction, not a rule of thumb.
-    local -a actual=()
-    for participant in "${PARTICIPANTS[@]}"; do
-        target="$STAGING_DIR/${participant}${OUTPUT_SUFFIX}.${OUTPUT_EXT}"
-        [[ -s "$target" ]] || die "rendered file is missing or empty: $target"
-        actual+=("$participant=$(probe_duration "$target")")
-    done
-
-    local verdict
-    if ! verdict=$(py verify --expected "$WORK/expected.json" \
-        --tolerance "$DURATION_TOLERANCE" "${actual[@]}" 2>&1); then
-        log_raw "$verdict"
-        log_line "$verdict"
-        die "rendered durations do not match the plan; inputs and work directory kept"
-    fi
-    log_report "$verdict"
+    PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" PODCAST_LOG_STAGE=render \
+        "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" stage-render \
+        --work "$WORK" --staging "$STAGING_DIR" \
+        --ffmpeg "$FFMPEG" --ffprobe "$FFPROBE" \
+        || exit 1
 
     state_mark render
     stage_end "${#PARTICIPANTS[@]} tracks rendered and verified"

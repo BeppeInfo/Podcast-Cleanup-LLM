@@ -2254,6 +2254,125 @@ class TestPipelineDetectStage(unittest.TestCase):
         self.assertIn("banana", str(caught.exception))
 
 
+class TestPipelineRenderStage(unittest.TestCase):
+    """Rendering, the two no-edit shortcuts, and the length check."""
+
+    def _log(self):
+        path = os.path.join(tempfile.mkdtemp(), "run.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        buf = io.StringIO()
+        return runlog.Log(path=path, stream=buf, colour=False), buf
+
+    def _settings(self, **over):
+        values = cfg.defaults()
+        values.update(over)
+        return values
+
+    def _episode(self, source_ext="flac", codec="flac", cuts=(), seconds=2.0):
+        """A work directory with one track, optionally with a filtergraph."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for leaf in ("render", "state"):
+            os.makedirs(os.path.join(root, leaf), exist_ok=True)
+        staging = os.path.join(root, "staging")
+
+        raw = os.path.join(root, "alice.wav")
+        with wave.open(raw, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(48000)
+            handle.writeframes(b"\x00\x20" * int(48000 * seconds))
+        source = raw
+        if source_ext != "wav":
+            source = os.path.join(root, f"alice.{source_ext}")
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", raw, source],
+                           check=True)
+
+        track = {"participant": "alice", "source": source, "duration": seconds,
+                 "sample_rate": 48000, "render_rate": 48000, "sample_fmt": "s16",
+                 "codec": codec, "lossless": True}
+        with open(os.path.join(root, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump({"episode_id": "ep", "duration": seconds,
+                       "sample_rate": 48000, "tracks": [track]}, handle)
+        plan = {"duration": seconds, "cuts": list(cuts), "mutes": {"alice": []},
+                "keep": [], "stats": {}, "warnings": [], "blocking": []}
+        with open(os.path.join(root, "plan.json"), "w", encoding="utf-8") as handle:
+            json.dump(plan, handle)
+        # write_filters decides whether a graph is needed, exactly as the stage does.
+        pipeline.write_filters(root, {"tracks": [track]}, plan, self._settings())
+        return root, staging, track
+
+    def test_bit_depth_is_only_passed_to_encoders_that_have_one(self):
+        track = {"sample_fmt": "s16"}
+        self.assertIn("-sample_fmt", pipeline.encode_args(
+            self._settings(OUTPUT_CODEC="flac"), track))
+        self.assertIn("-sample_fmt", pipeline.encode_args(
+            self._settings(OUTPUT_CODEC="pcm_s16le"), track))
+        self.assertNotIn("-sample_fmt", pipeline.encode_args(
+            self._settings(OUTPUT_CODEC="libopus"), track))
+        # And not for a format the encoder could not carry anyway.
+        self.assertNotIn("-sample_fmt", pipeline.encode_args(
+            self._settings(OUTPUT_CODEC="flac"), {"sample_fmt": "fltp"}))
+
+    def test_flac_gets_its_compression_level_and_extra_args_are_split(self):
+        args = pipeline.encode_args(
+            self._settings(OUTPUT_CODEC="flac", OUTPUT_COMPRESSION="5",
+                           OUTPUT_EXTRA_ARGS="-b:a 192k"), {})
+        self.assertIn("-compression_level", args)
+        self.assertIn("5", args)
+        self.assertIn("-b:a", args)
+        self.assertIn("192k", args)
+
+    def test_no_edits_and_already_the_right_format_is_copied_through(self):
+        root, staging, _ = self._episode(source_ext="flac", codec="flac")
+        log, buf = self._log()
+        pipeline.stage_render(root, staging, self._settings(), log)
+        self.assertIn("copying it through", buf.getvalue())
+        target = os.path.join(staging, "alice.flac")
+        self.assertEqual(open(target, "rb").read(),
+                         open(os.path.join(root, "alice.flac"), "rb").read())
+
+    def test_no_edits_but_the_wrong_format_is_converted(self):
+        root, staging, _ = self._episode(source_ext="wav", codec="pcm_s16le")
+        log, buf = self._log()
+        pipeline.stage_render(root, staging, self._settings(OUTPUT_CODEC="flac",
+                                                           OUTPUT_EXT="flac"), log)
+        self.assertIn("converting to flac", buf.getvalue())
+        self.assertTrue(os.path.isfile(os.path.join(staging, "alice.flac")))
+
+    def test_a_cut_means_a_filtergraph_and_a_shorter_file(self):
+        root, staging, _ = self._episode(
+            source_ext="flac", codec="flac", cuts=[{"start": 0.5, "end": 1.0}])
+        log, buf = self._log()
+        pipeline.stage_render(root, staging, self._settings(FFMPEG_JOBS="1"), log)
+        self.assertIn("rendered alice", buf.getvalue())
+        self.assertIn("all tracks verified", buf.getvalue())
+        rendered = pipeline.probe_duration(
+            "ffprobe", os.path.join(staging, "alice.flac"))
+        self.assertAlmostEqual(rendered, 1.5, places=1)
+
+    def test_a_length_that_does_not_match_the_plan_stops_the_run(self):
+        root, staging, _ = self._episode(source_ext="flac", codec="flac")
+        log, _ = self._log()
+        # Claim the track should come out twice as long as it can.
+        path = os.path.join(root, "expected.json")
+        expected = json.load(open(path))
+        expected["tracks"]["alice"]["expected_duration"] = 99.0
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(expected, handle)
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_render(root, staging, self._settings(), log)
+        self.assertIn("do not match the plan", str(caught.exception))
+
+    def test_a_missing_plan_is_refused_before_anything_runs(self):
+        root, staging, _ = self._episode()
+        os.remove(os.path.join(root, "plan.json"))
+        log, _ = self._log()
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_render(root, staging, self._settings(), log)
+        self.assertIn("no plan.json", str(caught.exception))
+
+
 class TestPipelinePlanStage(unittest.TestCase):
     """The plan stage as one call, taking its numbers from the settings."""
 
