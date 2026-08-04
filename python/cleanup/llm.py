@@ -600,9 +600,6 @@ def _validate(raw_edits, words, first, last, limits, accepted):
         spared_note = ""
         if kind in tr.SURVIVOR_KINDS:
             spared = tr.spare_the_survivor(words, lo, hi)
-            if spared < lo:
-                reject(edit, "would remove every copy of a repeated word")
-                continue
             if spared != hi:
                 spared_note = tr.word_text(words, spared + 1, hi)
                 hi = spared

@@ -948,9 +948,13 @@ class TestAgainstStubServer(unittest.TestCase):
         )
         self.assertEqual(len(result["edits"]), 1)
         edit = result["edits"][0]
-        self.assertEqual(edit["text"], "eu eu")
+        # The model asked for both copies of "eu". Only the first is taken: the
+        # sentence still needs one, and it is the last. The trim is recorded on
+        # the edit so what the model actually asked for stays visible.
+        self.assertEqual(edit["text"], "eu")
+        self.assertEqual(edit["spared"], "eu")
         self.assertAlmostEqual(edit["start"], 0.0)
-        self.assertAlmostEqual(edit["end"], 0.9)
+        self.assertAlmostEqual(edit["end"], 0.4)
         self.assertEqual(result["chunk_failures"], 0)
 
     def test_request_payload_carries_the_schema(self):
@@ -2035,9 +2039,10 @@ class TestPlanBuilder(unittest.TestCase):
         stutter = next(c for c in result["cuts"] if "stutter" in c["reasons"])
         self.assertEqual(stutter["sources"], ["llm:a"])
         self.assertEqual(result["mutes"]["a"], [])
-        # The gap to the next word is 0.3s, half of which is 0.15s, so the full
-        # 0.1s of cut_padding is available and is what gets claimed.
-        self.assertAlmostEqual(stutter["end"], 10.8, places=3)
+        # "I I" was reported as both words; the second is given back, so the cut
+        # covers only word 0 (10.0-10.3). The gap to the surviving "I" is 0.1s,
+        # half of which caps the padding at 0.05s.
+        self.assertAlmostEqual(stutter["end"], 10.35, places=3)
         self.assertAlmostEqual(stutter["start"], 10.0, places=3)  # nothing before it
 
     def test_stutter_over_crosstalk_becomes_a_mute(self):
@@ -2069,7 +2074,9 @@ class TestPlanBuilder(unittest.TestCase):
         self.assertEqual(result["mutes"]["b"], [])
         mute = result["mutes"]["a"][0]
         self.assertAlmostEqual(mute["start"], 10.0)
-        self.assertAlmostEqual(mute["end"], 10.8, places=3)
+        # Trimmed to the first "I" for the same reason as the cut case above:
+        # muting both would leave the sentence without the word either way.
+        self.assertAlmostEqual(mute["end"], 10.35, places=3)
         self.assertAlmostEqual(result["stats"]["output_duration"], 20.0)
 
     def test_mutes_inside_a_cut_are_dropped(self):

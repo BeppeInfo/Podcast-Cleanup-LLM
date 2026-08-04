@@ -266,9 +266,14 @@ def spare_the_survivor(words, first: int, last: int) -> int:
     the span is that word again, a survivor already stands outside it and the
     span is returned unchanged.
 
-    Returns a last-index below `first` when the span cannot be salvaged, which
-    is the caller's cue to drop the edit.
+    A single-word span is never trimmed. One word is not a repetition of itself,
+    and the model asking for it is asking to delete that word — which is what
+    removing a filler *is*, and is legitimate whether or not a copy stands next
+    to it. Only a span holding two or more copies can swallow the last one, so
+    the returned index is always >= `first`.
     """
+    if last <= first:
+        return last
     tokens = [words[index]["text"] for index in range(first, last + 1)]
     # same_word is false for a token with no letters in it, so punctuation-only
     # entries fall out here rather than counting as every word at once.

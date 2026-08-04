@@ -75,10 +75,10 @@ def _silence_cuts(gaps, duration, params) -> list[dict]:
 def _spare_repeated_word(words, edit):
     """Trim an edit that would take every copy of a repeated word.
 
-    Returns the edit unchanged when it is fine, a shortened one when the last
-    copy has to be given back, or None when nothing is left to cut. See
-    `transcript.spare_the_survivor` for why this is enforced rather than asked
-    for.
+    Returns the edit unchanged when it is fine, or a shortened one when the last
+    copy has to be given back. Never empties a span: see
+    `transcript.spare_the_survivor` for why, and for why this is enforced rather
+    than asked for.
     """
     if edit.get("kind") not in tr.SURVIVOR_KINDS:
         return edit
@@ -93,8 +93,6 @@ def _spare_repeated_word(words, edit):
     spared = tr.spare_the_survivor(words, first, last)
     if spared == last:
         return edit
-    if spared < first:
-        return None
     start, end = tr.word_span(words, first, spared)
     return {
         **edit,
@@ -273,12 +271,6 @@ def build_plan(meta, speech, edits, words, params, loud=None) -> dict:
             # hand, and a span that takes every copy of a word damages the
             # episode whichever way it arrived.
             edit = _spare_repeated_word(track_words, edit)
-            if edit is None:
-                warnings.append(
-                    "dropped an edit that would have removed every copy of a "
-                    f"repeated word from {participant}"
-                )
-                continue
             start, end = _pad_edit(track_words, edit, duration, params["cut_padding"])
             if end - start < iv.EPS:
                 continue
