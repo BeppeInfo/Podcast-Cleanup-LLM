@@ -145,6 +145,21 @@ def defaults() -> dict[str, str]:
     return out
 
 
+def from_environment(environ=None) -> dict[str, str]:
+    """Defaults overlaid with whatever the environment carries.
+
+    For a stage the launcher invokes: it has already resolved everything —
+    file, environment, command line — and exported the answers, so re-reading
+    the config file here could only disagree with it. No file is consulted.
+    """
+    environ = os.environ if environ is None else environ
+    settings = defaults()
+    for name in SETTINGS:
+        if environ.get(name) is not None:
+            settings[name] = environ[name]
+    return settings
+
+
 def find_config_file(environ=None) -> str:
     environ = os.environ if environ is None else environ
     explicit = environ.get("PODCAST_CLEANUP_CONF") or ""

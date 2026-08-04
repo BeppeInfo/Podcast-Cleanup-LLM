@@ -224,6 +224,7 @@ main() {
     # One call: defaults, config file, environment and the options above are
     # resolved and checked on the Python side, and come back as assignments.
     config_load "$CONFIG_FILE"
+    config_export
     config_dump
     config_make_tree
 

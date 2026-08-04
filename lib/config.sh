@@ -45,6 +45,17 @@ config_load() {
     eval "$resolved"
 }
 
+# Hand every resolved setting to the Python stages through the environment.
+# They have to see exactly what this run resolved — file, environment and command
+# line together — and re-reading the config file on their side could only
+# disagree with it. config.from_environment is the other half.
+config_export() {
+    local name
+    for name in $("$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" config-names); do
+        export "$name"
+    done
+}
+
 # Creating the tree up front is what lets a missing input directory mean *empty*
 # rather than *misconfigured*.
 config_make_tree() {

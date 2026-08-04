@@ -27,7 +27,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from cleanup import intervals as iv
 from cleanup import runlog
-from cleanup import asr, config as cfg, discover, llm, plan as planner, render, silence, transcript as tr
+from cleanup import asr, config as cfg, discover, llm, pipeline  # noqa: E501
+from cleanup import plan as planner, render, silence, transcript as tr
 # The CLI itself, for the exit codes the shell branches on. Importing is safe:
 # it only runs main() under __main__.
 import cleanup_cli as cli
@@ -1983,6 +1984,96 @@ class TestUntranscribedAudio(unittest.TestCase):
         # The scan starts 0.2s earlier and ends 0.2s later than the word.
         result = self._plan(words, {"a": [(9.8, 12.2)]})
         self.assertEqual(result["untranscribed_audio"], {})
+
+
+class TestPipelinePlanStage(unittest.TestCase):
+    """The plan stage as one call, taking its numbers from the settings."""
+
+    def _work(self, **files):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for leaf in ("words", "asr", "llm", "render"):
+            os.makedirs(os.path.join(root, leaf), exist_ok=True)
+        for name, payload in files.items():
+            path = os.path.join(root, name.replace("__", os.sep))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+        return root
+
+    def _settings(self, **over):
+        values = cfg.defaults()
+        values.update(over)
+        return values
+
+    def test_params_come_from_the_settings(self):
+        values = self._settings(SILENCE_KEEP="0.15", SPEECH_PAD="0.15")
+        params = pipeline.plan_params(values)
+        self.assertEqual(params["silence_keep"], 0.15)
+        self.assertEqual(params["speech_pad"], 0.15)
+        # Exactly the keys plan.build_plan reads, no more and no fewer.
+        self.assertEqual(set(params), set(pipeline.PLAN_PARAMS))
+
+    def test_collect_keys_by_participant(self):
+        root = self._work(**{"words__alice.words.json": {"words": []},
+                             "words__bob.words.json": {"words": []}})
+        found = pipeline.collect(os.path.join(root, "words"), ".words.json")
+        self.assertEqual(sorted(found), ["alice", "bob"])
+
+    def test_a_missing_transcript_is_refused_by_name(self):
+        root = self._work(**{
+            "meta.json": {"episode_id": "ep", "duration": 10.0,
+                          "sample_rate": 48000,
+                          "tracks": [{"participant": "alice", "duration": 10.0,
+                                      "sample_rate": 48000, "sample_fmt": "s16"},
+                                     {"participant": "bob", "duration": 10.0,
+                                      "sample_rate": 48000, "sample_fmt": "s16"}]},
+            "words__alice.words.json": {"words": []},
+        })
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_plan(root, self._settings(),
+                                runlog.Log(stream=io.StringIO(), colour=False))
+        self.assertIn("bob", str(caught.exception))
+
+    def test_it_writes_everything_the_render_stage_reads(self):
+        # Speech either side of one long gap. Dense enough that the plan removes
+        # a plausible slice rather than tripping MAX_CUT_FRACTION, which is what
+        # a sparser fixture does — correctly, and unhelpfully for this test.
+        moments = [n / 2 for n in range(1, 16)] + [n / 2 for n in range(26, 39)]
+        words = [{"i": i, "text": f"w{i}", "start": at, "end": at + 0.4,
+                  "segment": 0} for i, at in enumerate(moments)]
+        loud = [[at - 0.05, at + 0.45] for at in moments]
+        root = self._work(**{
+            "meta.json": {"episode_id": "ep", "duration": 20.0,
+                          "sample_rate": 48000,
+                          "tracks": [{"participant": "alice", "duration": 20.0,
+                                      "sample_rate": 48000, "render_rate": 48000,
+                                      "sample_fmt": "s16", "lossless": True}]},
+            "words__alice.words.json": {"words": words},
+            "asr__alice.loud.json": {"loud": loud},
+        })
+        plan = pipeline.stage_plan(
+            root, self._settings(), runlog.Log(stream=io.StringIO(), colour=False))
+        self.assertTrue(plan["cuts"])
+        for name in ("params.json", "plan.json", "edit-report.txt",
+                     "expected.json"):
+            self.assertTrue(os.path.isfile(os.path.join(root, name)), name)
+        expected = json.load(open(os.path.join(root, "expected.json")))
+        # The render stage reads these exact keys; a rename here breaks it.
+        entry = expected["tracks"]["alice"]
+        for key in ("passthrough", "mutes", "expected_samples",
+                    "expected_duration", "sample_rate", "sample_fmt"):
+            self.assertIn(key, entry)
+
+    def test_clipping_the_speech_map_is_reported(self):
+        buf = io.StringIO()
+        log = runlog.Log(stream=buf, colour=False)
+        # One word claiming twenty seconds, with sound for only half of one.
+        words = {"a": [{"i": 0, "text": "x", "start": 1.0, "end": 21.0}]}
+        pipeline.build_speech_map(
+            ["a"], words, {"a": 30.0}, {"a": [[1.0, 1.5]]},
+            pad=0.25, clip=True, log=log)
+        self.assertIn("word timings ran past the audio", buf.getvalue())
 
 
 class TestRunLog(unittest.TestCase):

@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cleanup import intervals as iv  # noqa: E402
 from cleanup import asr, config as cfg, discover, llm, plan as planner  # noqa: E402
-from cleanup import render, runlog, silence, transcript as tr  # noqa: E402
+from cleanup import pipeline, render, runlog, silence, transcript as tr  # noqa: E402
 
 
 def _read_json(path):
@@ -363,6 +363,12 @@ def cmd_discover(args):
         print(f"TRACK_SOURCE[{shlex.quote(name)}]={shlex.quote(path)}")
 
 
+def cmd_config_names(args):
+    """Every setting name, one per line, for the launcher to export."""
+    for name in cfg.SETTINGS:
+        print(name)
+
+
 # --- detection ----------------------------------------------------------------
 
 
@@ -675,6 +681,17 @@ def cmd_plan(args):
         )
 
 
+def cmd_stage_plan(args):
+    """The plan stage, end to end: params, plan, report, filtergraphs."""
+    log = runlog.Log.from_env()
+    settings = cfg.from_environment()
+    try:
+        pipeline.stage_plan(args.work, settings, log, force=args.force)
+    except pipeline.StageError as exc:
+        log.error(str(exc))
+        raise SystemExit(1) from None
+
+
 # --- filters ------------------------------------------------------------------
 
 
@@ -900,6 +917,10 @@ def build_parser():
                    help="skip reading the API key files")
     p.set_defaults(func=cmd_config)
 
+    p = sub.add_parser(
+        "config-names", help="the setting names, for the launcher to export")
+    p.set_defaults(func=cmd_config_names)
+
     p = sub.add_parser("discover", help="identify one episode's tracks")
     p.add_argument("--input-dir", default="")
     p.add_argument("--file", action="append", default=[],
@@ -913,6 +934,12 @@ def build_parser():
     p.add_argument("--resample-to", default="")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_discover)
+
+    p = sub.add_parser("stage-plan", help="run the plan stage")
+    p.add_argument("--work", required=True, help="the episode work directory")
+    p.add_argument("--force", action="store_true",
+                   help="proceed even when the plan trips a safety limit")
+    p.set_defaults(func=cmd_stage_plan)
 
     p = sub.add_parser("whisper-wait", help="check a whisper endpoint is reachable")
     p.add_argument("--endpoint", required=True)

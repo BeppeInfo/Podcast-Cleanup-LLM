@@ -79,21 +79,6 @@ load_meta() {
     log_debug "episode $EPISODE_ID: ${#PARTICIPANTS[@]} tracks, ${EPISODE_DURATION}s"
 }
 
-# The plan's numeric parameters, handed to Python as one file. Every value has
-# already been checked as numeric by config_validate.
-write_params() {
-    local target="$1"
-    printf '{\n' >"$target"
-    printf '  "silence_min_duration": %s,\n' "$SILENCE_MIN_DURATION" >>"$target"
-    printf '  "silence_keep": %s,\n'         "$SILENCE_KEEP"         >>"$target"
-    printf '  "edge_keep": %s,\n'            "$EDGE_KEEP"            >>"$target"
-    printf '  "cut_padding": %s,\n'          "$CUT_PADDING"          >>"$target"
-    printf '  "min_cut": %s,\n'              "$MIN_CUT"              >>"$target"
-    printf '  "mute_fade": %s,\n'            "$MUTE_FADE"            >>"$target"
-    printf '  "speech_pad": %s,\n'           "$SPEECH_PAD"           >>"$target"
-    printf '  "max_cut_fraction": %s\n'      "$MAX_CUT_FRACTION"     >>"$target"
-    printf '}\n' >>"$target"
-}
 
 probe_duration() {
     "$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$1"
@@ -121,8 +106,6 @@ stage_discover() {
         args+=(--file "$file")
     done
 
-    # Exit 2 is an empty inbox rather than a fault; the caller turns it into
-    # "nothing to do" and stops. Anything else has already explained itself.
     # Python writes its own notes and refusals into the same run log, in the
     # same format, so nothing here has to translate them. Exit 2 is an empty
     # inbox rather than a fault; anything else has already explained itself.
@@ -495,33 +478,14 @@ stage_plan() {
         return 0
     fi
 
-    write_params "$WORK/params.json"
-    local -a plan_args=(
-        plan
-        --meta "$WORK/meta.json"
-        --params "$WORK/params.json"
-        --words-dir "$WORK/words"
-        --loud-dir "$WORK/asr"
-        --out "$WORK/plan.json"
-        --report "$WORK/edit-report.txt"
-    )
-    [[ "$LLM_ENABLE" == 1 ]] && plan_args+=(--edits-dir "$WORK/llm")
-    [[ "$SPEECH_MAP_CLIP" == 1 ]] || plan_args+=(--no-clip-speech)
-    [[ "${FORCE:-0}" == 1 ]] && plan_args+=(--force)
+    local -a args=(stage-plan --work "$WORK")
+    [[ "${FORCE:-0}" == 1 ]] && args+=(--force)
 
-    # The report is the one piece of stage output worth showing in full.
-    local report
-    if ! report=$(py "${plan_args[@]}" 2>&1); then
-        log_raw "$report"
-        log_line "$report"
-        die "planning failed"
-    fi
-    log_report "$report"
-
-    run py filters --meta "$WORK/meta.json" --plan "$WORK/plan.json" \
-        --dir "$WORK/render" --out "$WORK/expected.json" \
-        --frame-samples "$RENDER_FRAME_SAMPLES" --fade "$MUTE_FADE" \
-        || die "could not build the render filters"
+    # The settings reach it through the environment (config_export), and it
+    # writes its own report and refusals into the run log.
+    PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" PODCAST_LOG_STAGE=plan \
+        "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}" \
+        || exit 1
 
     state_mark plan
     stage_end "plan written"
