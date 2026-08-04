@@ -2373,6 +2373,122 @@ class TestPipelineRenderStage(unittest.TestCase):
         self.assertIn("no plan.json", str(caught.exception))
 
 
+class TestPipelineFinalizeStage(unittest.TestCase):
+    """Publishing, and the order in which things are allowed to be deleted."""
+
+    def _log(self, path=None):
+        root = path or tempfile.mkdtemp()
+        if path is None:
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        log_path = os.path.join(root, "run.log")
+        open(log_path, "w", encoding="utf-8").close()
+        buf = io.StringIO()
+        return runlog.Log(path=log_path, stream=buf, colour=False), buf
+
+    def _settings(self, **over):
+        values = cfg.defaults()
+        values.update(over)
+        return values
+
+    def _episode(self, staged=True):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        work = os.path.join(root, "work", "ep")
+        out = os.path.join(root, "output", "ep")
+        staging = os.path.join(out, ".staging")
+        for path in (os.path.join(work, "words"), os.path.join(work, "llm"),
+                     os.path.join(work, "logs"), staging):
+            os.makedirs(path, exist_ok=True)
+
+        inputs = os.path.join(root, "incoming")
+        os.makedirs(inputs, exist_ok=True)
+        source = os.path.join(inputs, "ep_alice.flac")
+        with open(source, "wb") as handle:
+            handle.write(b"original audio")
+
+        if staged:
+            with open(os.path.join(staging, "alice.flac"), "wb") as handle:
+                handle.write(b"rendered audio")
+        for name, body in (
+            ("plan.json", json.dumps({
+                "episode_id": "ep", "participants": ["alice"], "duration": 1.0,
+                "cuts": [], "mutes": {"alice": []}, "keep": [[0.0, 1.0]]})),
+            ("edit-report.txt", "a report"),
+        ):
+            with open(os.path.join(work, name), "w", encoding="utf-8") as handle:
+                handle.write(body)
+        with open(os.path.join(work, "words", "alice.words.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"participant": "alice", "words": [], "segments": []}, handle)
+        with open(os.path.join(work, "llm", "alice.audit.jsonl"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("{}\n")
+        return work, out, staging, {"alice": source}
+
+    def test_publishes_audio_sidecars_and_logs(self):
+        work, out, staging, sources = self._episode()
+        log, buf = self._log(work)
+        pipeline.stage_finalize(work, out, staging, self._settings(KEEP_WORK="1"),
+                                log, "ep", sources)
+        self.assertEqual(open(os.path.join(out, "alice.flac"), "rb").read(),
+                         b"rendered audio")
+        for name in ("ep_plan.json", "ep_edit-report.txt", "ep_transcript.json",
+                     "ep_transcript.srt", "ep_transcript.txt"):
+            self.assertTrue(os.path.isfile(os.path.join(out, name)), name)
+        self.assertTrue(os.path.isfile(os.path.join(out, "logs", "run.log")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(out, "logs", "alice.audit.jsonl")))
+        # Staging was inside the output directory and is gone again.
+        self.assertFalse(os.path.exists(staging))
+
+    def test_keep_inputs_and_keep_work_are_honoured(self):
+        work, out, staging, sources = self._episode()
+        log, _ = self._log(work)
+        pipeline.stage_finalize(
+            work, out, staging,
+            self._settings(KEEP_INPUTS="1", KEEP_WORK="1"), log, "ep", sources)
+        self.assertTrue(os.path.isfile(sources["alice"]))
+        self.assertTrue(os.path.isdir(work))
+
+    def test_without_them_the_inputs_and_work_directory_go(self):
+        work, out, staging, sources = self._episode()
+        log, _ = self._log(work)
+        published = pipeline.stage_finalize(
+            work, out, staging,
+            self._settings(KEEP_INPUTS="0", KEEP_WORK="0"), log, "ep", sources)
+        self.assertFalse(os.path.exists(sources["alice"]))
+        self.assertFalse(os.path.exists(work))
+        # The log moved, and the caller is told where, because it keeps writing.
+        self.assertEqual(published, os.path.join(out, "logs", "run.log"))
+        self.assertEqual(log.path, published)
+        log.info("written after the work directory went")
+        self.assertIn("after the work directory went",
+                      open(published, encoding="utf-8").read())
+
+    def test_nothing_is_deleted_when_publishing_fails(self):
+        """The ordering guarantee: a failure leaves the originals alone."""
+        work, out, staging, sources = self._episode(staged=False)
+        log, _ = self._log(work)
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_finalize(
+                work, out, staging,
+                self._settings(KEEP_INPUTS="0", KEEP_WORK="0"), log, "ep", sources)
+        self.assertIn("could not publish", str(caught.exception))
+        self.assertTrue(os.path.isfile(sources["alice"]),
+                        "the original input must survive a failed publish")
+        self.assertTrue(os.path.isdir(work),
+                        "the work directory must survive a failed publish")
+
+    def test_human_size_reads_like_du(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        path = os.path.join(root, "f")
+        for size, want in ((512, "512"), (2048, "2K"), (3 * 1024 * 1024, "3.0M")):
+            with open(path, "wb") as handle:
+                handle.write(b"\0" * size)
+            self.assertEqual(pipeline.human_size(path), want)
+
+
 class TestPipelinePlanStage(unittest.TestCase):
     """The plan stage as one call, taking its numbers from the settings."""
 

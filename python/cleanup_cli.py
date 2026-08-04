@@ -420,6 +420,30 @@ def cmd_stage_render(args):
         raise SystemExit(1) from None
 
 
+def cmd_stage_finalize(args):
+    """The finalize stage: publish, then remove what is no longer needed.
+
+    Prints the run log's path as a shell assignment, because it moves when the
+    work directory goes and the launcher keeps logging after this returns.
+    """
+    import shlex
+
+    log = runlog.Log.from_env()
+    settings = cfg.from_environment()
+    sources = {}
+    for item in args.source or []:
+        participant, _, path = item.partition("=")
+        sources[participant] = path
+    try:
+        published = pipeline.stage_finalize(
+            args.work, args.output, args.staging, settings, log,
+            args.episode, sources)
+    except pipeline.StageError as exc:
+        log.error(str(exc))
+        raise SystemExit(1) from None
+    print(f"LOG_FILE={shlex.quote(published)}")
+
+
 # --- plan ---------------------------------------------------------------------
 
 
@@ -524,64 +548,24 @@ def cmd_stage_transcribe(args):
     except pipeline.StageError as exc:
         log.error(str(exc))
         raise SystemExit(1) from None
-
-
-# --- filters ------------------------------------------------------------------
-def cmd_transcript(args):
-    current = _read_json(args.plan)
-    words = _collect(args.words_dir, ".words.json")
-    result = render.build_transcript(current, words)
-    _write_json(args.out_json, result)
-    if args.out_srt:
-        with open(args.out_srt, "w", encoding="utf-8") as handle:
-            handle.write(render.transcript_to_srt(result))
-    if args.out_txt:
-        with open(args.out_txt, "w", encoding="utf-8") as handle:
-            handle.write(render.transcript_to_text(result))
-    print(
-        f"{len(result['segments'])} segments, {result['removed_words']} words removed "
-        f"by the edit"
-    )
-
-
-# --- verification -------------------------------------------------------------
-
-
 def cmd_verify(args):
-    expectations = _read_json(args.expected)["tracks"]
-    problems = []
+    """Check a finished directory's durations against the plan, by hand.
+
+    Shares the comparison with the render stage rather than repeating it; what
+    is different here is only where the durations come from.
+    """
+    log = runlog.Log.from_env()
+    actual = {}
     for item in args.actual:
         if "=" not in item:
             _fail(f"actual argument must be participant=duration, got '{item}'")
         participant, value = item.split("=", 1)
-        if participant not in expectations:
-            problems.append(f"{participant}: rendered but not in the plan")
-            continue
-        actual = float(value)
-        expected = expectations[participant]["expected_duration"]
-        allowed = max(args.tolerance * expected, 0.05)
-        delta = abs(actual - expected)
-        status = "ok" if delta <= allowed else "MISMATCH"
-        print(
-            f"{participant:<16} expected {expected:9.3f}s  actual {actual:9.3f}s  "
-            f"delta {delta:6.3f}s  {status}"
-        )
-        if delta > allowed:
-            problems.append(
-                f"{participant}: expected {expected:.3f}s but rendered {actual:.3f}s "
-                f"(delta {delta:.3f}s, allowed {allowed:.3f}s)"
-            )
-
-    rendered = {item.split("=", 1)[0] for item in args.actual}
-    for participant in expectations:
-        if participant not in rendered:
-            problems.append(f"{participant}: planned but never rendered")
-
-    if problems:
-        for problem in problems:
-            print(f"error: {problem}")
-        raise SystemExit(1)
-    print("all tracks verified")
+        actual[participant] = float(value)
+    try:
+        pipeline.verify_durations(
+            _read_json(args.expected)["tracks"], actual, args.tolerance, log)
+    except pipeline.StageError as exc:
+        _fail(str(exc))
 
 
 # --- argument parsing ---------------------------------------------------------
@@ -633,6 +617,15 @@ def build_parser():
     p.add_argument("--work", required=True)
     p.add_argument("--ffmpeg", default="ffmpeg")
     p.set_defaults(func=cmd_stage_transcribe)
+
+    p = sub.add_parser("stage-finalize", help="run the finalize stage")
+    p.add_argument("--work", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--staging", required=True)
+    p.add_argument("--episode", required=True)
+    p.add_argument("--source", action="append", metavar="NAME=PATH",
+                   help="the original input for a participant; repeatable")
+    p.set_defaults(func=cmd_stage_finalize)
 
     p = sub.add_parser("stage-render", help="run the render stage")
     p.add_argument("--work", required=True)
@@ -712,14 +705,6 @@ def build_parser():
     p.add_argument("--report")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_plan)
-
-    p = sub.add_parser("transcript", help="build the final speaker transcript")
-    p.add_argument("--plan", required=True)
-    p.add_argument("--words-dir", required=True)
-    p.add_argument("--out-json", required=True)
-    p.add_argument("--out-srt")
-    p.add_argument("--out-txt")
-    p.set_defaults(func=cmd_transcript)
 
     p = sub.add_parser("verify", help="compare rendered durations against the plan")
     p.add_argument("--expected", required=True)

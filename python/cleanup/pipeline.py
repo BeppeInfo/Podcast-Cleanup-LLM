@@ -519,15 +519,17 @@ def probe_duration(ffprobe: str, path: str) -> float:
         raise StageError(f"could not measure the rendered file: {path}") from None
 
 
-def verify_durations(work: str, actual, tolerance: float, log) -> None:
+def verify_durations(expectations, actual, tolerance: float, log) -> None:
     """Compare what was rendered against the frame-exact prediction.
 
     Not a rule of thumb: expected.json says how many samples each track should
     contain, computed from the same frame size the filtergraph used. A mismatch
     means the cuts that were rendered are not the cuts that were planned, so the
     run stops with everything kept.
+
+    Takes the expectations rather than a path, so the `verify` subcommand can
+    check a finished directory by hand against the same rules.
     """
-    expectations = read_json(os.path.join(work, "expected.json"))["tracks"]
     problems = []
     for participant, measured in sorted(actual.items()):
         if participant not in expectations:
@@ -643,7 +645,124 @@ def stage_render(work: str, staging: str, settings, log, ffmpeg: str = "ffmpeg",
             raise StageError(f"rendered file is missing or empty: {target}")
         actual[participant] = probe_duration(ffprobe, target)
 
-    verify_durations(work, actual, float(settings["DURATION_TOLERANCE"]), log)
+    verify_durations(read_json(os.path.join(work, "expected.json"))["tracks"],
+                     actual, float(settings["DURATION_TOLERANCE"]), log)
+
+
+def human_size(path: str) -> str:
+    """`du -h`-ish, for the one line that says what was published."""
+    size = float(os.path.getsize(path))
+    for unit in ("", "K", "M", "G"):
+        if size < 1024 or unit == "G":
+            return f"{size:.0f}{unit}" if unit in ("", "K") else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}G"
+
+
+def build_transcript(work: str, episode_id: str, log) -> None:
+    """The final speaker transcript, as JSON, SRT and plain text."""
+    current = read_json(os.path.join(work, "plan.json"))
+    words = collect(os.path.join(work, "words"), ".words.json")
+    result = render.build_transcript(current, words)
+    render.write_json(
+        os.path.join(work, f"{episode_id}_transcript.json"), result)
+    for name, body in (
+        (f"{episode_id}_transcript.srt", render.transcript_to_srt(result)),
+        (f"{episode_id}_transcript.txt", render.transcript_to_text(result)),
+    ):
+        with open(os.path.join(work, name), "w", encoding="utf-8") as handle:
+            handle.write(body)
+    log.raw(f"{len(result['segments'])} segments, {result['removed_words']} "
+            "words removed by the edit")
+
+
+# Sidecars copied beside the audio, each prefixed with the episode id so an
+# output directory stays readable when several episodes share a parent.
+SIDECARS = (
+    "{episode}_transcript.json",
+    "{episode}_transcript.srt",
+    "{episode}_transcript.txt",
+    ("plan.json", "{episode}_plan.json"),
+    ("edit-report.txt", "{episode}_edit-report.txt"),
+)
+
+
+def stage_finalize(work: str, out_dir: str, staging: str, settings, log,
+                   episode_id: str, sources) -> str:
+    """Publish the outputs, then remove what is no longer needed.
+
+    The order is the whole point and is not an accident of how it was written:
+    every output is on disk before anything is deleted, and the inputs go only
+    after the audio has been moved into place and the sidecars copied. A run that
+    dies halfway leaves the originals and the work directory alone, which is what
+    makes it safe to resume.
+
+    Returns the run log's path, which moves when the work directory goes.
+    """
+    build_transcript(work, episode_id, log)
+    os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
+
+    suffix, extension = settings["OUTPUT_SUFFIX"], settings["OUTPUT_EXT"]
+    for participant in sorted(sources):
+        name = f"{participant}{suffix}.{extension}"
+        staged = os.path.join(staging, name)
+        final = os.path.join(out_dir, name)
+        try:
+            # Staging sits inside the output directory, so this is a rename on
+            # one filesystem rather than a copy.
+            os.replace(staged, final)
+        except OSError as exc:
+            raise StageError(f"could not publish {final}: {exc}") from None
+        log.ok(f"{name} ({human_size(final)})")
+    try:
+        os.rmdir(staging)
+    except OSError:
+        pass
+
+    for entry in SIDECARS:
+        source_name, target_name = (
+            (entry, entry) if isinstance(entry, str) else entry)
+        source = os.path.join(work, source_name.format(episode=episode_id))
+        if not os.path.isfile(source):
+            continue
+        shutil.copyfile(source, os.path.join(
+            out_dir, target_name.format(episode=episode_id)))
+
+    # Logs outlive everything else, by design.
+    published_log = os.path.join(out_dir, "logs", "run.log")
+    if log.path and os.path.isfile(log.path):
+        shutil.copyfile(log.path, published_log)
+    for extra in ("llama-server.log",):
+        candidate = os.path.join(work, "logs", extra)
+        if os.path.isfile(candidate):
+            shutil.copyfile(candidate, os.path.join(out_dir, "logs", extra))
+    for audit in sorted(glob.glob(os.path.join(work, "llm", "*.audit.jsonl"))):
+        shutil.copyfile(audit, os.path.join(
+            out_dir, "logs", os.path.basename(audit)))
+
+    # Inputs go only once every output is on disk.
+    if settings["KEEP_INPUTS"] == "1":
+        log.info("keeping original inputs (KEEP_INPUTS=1)")
+    else:
+        for participant in sorted(sources):
+            source = sources[participant]
+            if os.path.isfile(source):
+                os.remove(source)
+                log.debug(f"removed input {os.path.basename(source)}")
+        log.ok("original inputs removed")
+
+    if settings["KEEP_WORK"] == "1":
+        log.info(f"keeping work directory (KEEP_WORK=1): {work}")
+        return log.path
+
+    # Everything logged since the copy above would go with the directory, so
+    # take the log again and keep writing to the published one from here.
+    if log.path and os.path.isfile(log.path):
+        shutil.copyfile(log.path, published_log)
+    log.path = published_log
+    shutil.rmtree(work, ignore_errors=True)
+    log.ok("work directory removed")
+    return published_log
 
 
 def stage_plan(work: str, settings, log, force: bool = False) -> dict:

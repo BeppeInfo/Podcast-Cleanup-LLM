@@ -322,75 +322,28 @@ stage_render() {
 stage_finalize() {
     stage_begin finalize "publishing outputs and cleaning up"
 
-    run py transcript --plan "$WORK/plan.json" --words-dir "$WORK/words" \
-        --out-json "$WORK/${EPISODE_ID}_transcript.json" \
-        --out-srt "$WORK/${EPISODE_ID}_transcript.srt" \
-        --out-txt "$WORK/${EPISODE_ID}_transcript.txt" \
-        || die "could not build the final transcript"
+    local -a args=(
+        stage-finalize --work "$WORK" --output "$OUT_DIR"
+        --staging "$STAGING_DIR" --episode "$EPISODE_ID"
+    )
+    local participant
+    for participant in "${PARTICIPANTS[@]}"; do
+        args+=(--source "$participant=${TRACK_SOURCE[$participant]}")
+    done
 
     if [[ "$DRY_RUN" == 1 ]]; then
+        log_info "would publish ${#PARTICIPANTS[@]} tracks into $OUT_DIR"
         stage_end "dry run"
         return 0
     fi
 
-    mkdir -p "$OUT_DIR/logs"
-
-    # Move the rendered audio into place. Staging sits inside the output
-    # directory so this is a rename on the same filesystem, not a copy.
-    local participant staged final
-    for participant in "${PARTICIPANTS[@]}"; do
-        staged="$STAGING_DIR/${participant}${OUTPUT_SUFFIX}.${OUTPUT_EXT}"
-        final="$OUT_DIR/${participant}${OUTPUT_SUFFIX}.${OUTPUT_EXT}"
-        mv -f -- "$staged" "$final" || die "could not publish $final"
-        log_ok "$(basename "$final") ($(du -h "$final" | cut -f1))"
-    done
-    rmdir "$STAGING_DIR" 2>/dev/null || true
-
-    # Sidecar artefacts, every one prefixed with the episode id.
-    local pair source_name target_name
-    for pair in \
-        "${EPISODE_ID}_transcript.json:${EPISODE_ID}_transcript.json" \
-        "${EPISODE_ID}_transcript.srt:${EPISODE_ID}_transcript.srt" \
-        "${EPISODE_ID}_transcript.txt:${EPISODE_ID}_transcript.txt" \
-        "plan.json:${EPISODE_ID}_plan.json" \
-        "edit-report.txt:${EPISODE_ID}_edit-report.txt"
-    do
-        source_name="${pair%%:*}"
-        target_name="${pair#*:}"
-        [[ -f "$WORK/$source_name" ]] || continue
-        cp -f -- "$WORK/$source_name" "$OUT_DIR/$target_name"
-    done
-
-    # Logs outlive everything else, by design.
-    cp -f -- "$LOG_FILE" "$OUT_DIR/logs/run.log"
-    [[ -f "$WORK/logs/llama-server.log" ]] \
-        && cp -f -- "$WORK/logs/llama-server.log" "$OUT_DIR/logs/"
-    local audit
-    for audit in "$WORK"/llm/*.audit.jsonl; do
-        [[ -f "$audit" ]] && cp -f -- "$audit" "$OUT_DIR/logs/"
-    done
-
-    # Inputs go only after every output is on disk and verified.
-    if [[ "$KEEP_INPUTS" == 1 ]]; then
-        log_info "keeping original inputs (KEEP_INPUTS=1)"
-    else
-        local source
-        for participant in "${PARTICIPANTS[@]}"; do
-            source="${TRACK_SOURCE[$participant]}"
-            [[ -f "$source" ]] || continue
-            rm -f -- "$source" && log_debug "removed input $(basename "$source")"
-        done
-        log_ok "original inputs removed"
-    fi
-
-    if [[ "$KEEP_WORK" == 1 ]]; then
-        log_info "keeping work directory (KEEP_WORK=1): $WORK"
-    else
-        cp -f -- "$LOG_FILE" "$OUT_DIR/logs/run.log"
-        LOG_FILE="$OUT_DIR/logs/run.log"
-        rm -rf -- "$WORK"
-        log_ok "work directory removed"
-    fi
+    # The run log moves when the work directory is removed, and this shell keeps
+    # logging afterwards — the stage says where it ended up.
+    local moved
+    moved=$(PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" \
+        PODCAST_LOG_STAGE=finalize \
+        "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}") || exit 1
+    eval "$moved"
 
     stage_end "outputs in $OUT_DIR"
 }
