@@ -19,7 +19,7 @@ import os
 
 from . import intervals as iv
 from . import plan as planner
-from . import asr, proc, render, silence, transcript as tr
+from . import asr, llm, proc, render, silence, transcript as tr
 
 
 class StageError(Exception):
@@ -339,6 +339,149 @@ def stage_transcribe(work: str, settings, log, ffmpeg: str = "ffmpeg",
             log.warn("server-side VAD is off, so silence was transcribed as well; "
                      "anything invented there becomes speech in the plan")
         open(marker, "w").close()
+
+
+def describe_edits(result, settings, log) -> None:
+    """What the detection accepted, and the two ways it can fail quietly."""
+    log.raw(f"{len(result['edits'])} edits accepted, {result['rejected_count']} "
+            f"rejected over {result['chunks']} chunks")
+
+    if result.get("chunks_truncated"):
+        log.warn(f"{result['chunks_truncated']} of {result['chunks']} chunks ran "
+                 "past LLM_MAX_REPLY_TOKENS; the edits they had already emitted "
+                 "were kept, but the tail of those windows went unjudged. Raise "
+                 "it, or lower LLM_CHUNK_WORDS so a window yields fewer edits.")
+
+    if result["chunk_failures"]:
+        failed, total = result["chunk_failures"], result["chunks"]
+        log.warn(f"{failed} of {total} chunks produced no usable response; "
+                 "those stretches were left untouched")
+
+
+def track_was_analysed(result, log) -> bool:
+    """Whether this track was analysed at all, rather than analysed and clean.
+
+    Every chunk failing is not per-item tolerance doing its job: it is the whole
+    track keeping its disfluencies while the report shows a clean-looking zero.
+    DESIGN.md §9 invariant 10 — a fault that hits every chunk identically must
+    not be able to pass for the survivable kind. Saying no here is what stops the
+    marker being written, so a resumed run retries the track instead of skipping
+    it as complete.
+    """
+    failed, total = result["chunk_failures"], result["chunks"]
+    if total > 0 and failed == total:
+        log.warn(f"every chunk failed for {result['participant']}: this track was "
+                 "not analysed at all. If they timed out, the endpoint is too "
+                 "slow for LLM_CONCURRENCY windows at once — lower it, or raise "
+                 "LLAMA_REQUEST_TIMEOUT.")
+        return False
+    return True
+
+
+def stage_detect(work: str, settings, log, api_key=None, resume_hint: str = "",
+                 ready_timeout: float = 60.0) -> None:
+    """Ask the model which stretches of each transcript are disfluencies.
+
+    Three faults end the run rather than the track, because each is a property
+    of the server: a refused key, a server that ignores the JSON schema, and a
+    server with no model loaded. Every remaining track would fail identically,
+    and an episode that quietly found no edits at all looks like clean speech.
+    """
+    meta = read_json(os.path.join(work, "meta.json"))
+    state = os.path.join(work, "state")
+    endpoint = settings["LLAMA_ENDPOINT"]
+
+    kinds = [k.strip() for k in settings["LLM_ACCEPT_KINDS"].split(",") if k.strip()]
+    unknown = [k for k in kinds if k not in llm.KINDS]
+    if unknown:
+        raise StageError(f"unknown edit kinds: {', '.join(unknown)} "
+                         f"(known: {', '.join(llm.KINDS)})")
+
+    client = llm.LlamaClient(
+        endpoint, timeout=float(settings["LLAMA_REQUEST_TIMEOUT"]),
+        temperature=float(settings["LLM_TEMP"]), api_key=api_key,
+        api=settings["LLM_API"],
+        max_reply_tokens=int(settings["LLM_MAX_REPLY_TOKENS"]),
+        model=settings["LLAMA_MODEL_NAME"],
+    )
+    if not client.wait_until_ready(ready_timeout):
+        raise StageError(f"the llama endpoint at {endpoint} is not usable")
+
+    resume = f" Then resume with: {resume_hint}" if resume_hint else ""
+    try:
+        # One tiny constrained request before the episode starts. A server that
+        # answers /health but ignores the schema would otherwise be discovered
+        # only after every chunk of every track had been dropped.
+        if settings["LLM_CHECK_SCHEMA"] == "1":
+            client.check_schema_support()
+    except llm.SchemaIgnored as exc:
+        raise StageError(f"{exc} Try LLM_API=completion.{resume}") from None
+    except llm.AuthRejected as exc:
+        raise StageError(f"{exc} Fix the key.{resume}") from None
+    except llm.ModelUnavailable as exc:
+        raise StageError(f"{exc}{resume}") from None
+
+    limits = {
+        "max_words": int(settings["LLM_MAX_EDIT_WORDS"]),
+        "max_seconds": float(settings["LLM_MAX_EDIT_SECONDS"]),
+        "min_confidence": float(settings["LLM_MIN_CONFIDENCE"]),
+    }
+    total = len(meta["tracks"])
+    failed = 0
+
+    for index, track in enumerate(meta["tracks"], start=1):
+        participant = track["participant"]
+        words_path = os.path.join(work, "words", f"{participant}.words.json")
+        target = os.path.join(work, "llm", f"{participant}.edits.json")
+        marker = os.path.join(state, f"llm-{participant}.ok")
+
+        if not (os.path.isfile(words_path) and os.path.getsize(words_path) > 0):
+            log.warn(f"no transcript for {participant}; skipping edit detection")
+            continue
+        if (os.path.isfile(marker) and os.path.isfile(target)
+                and os.path.getsize(target) > 0):
+            log.debug(f"{participant} already analysed by the LLM")
+            continue
+
+        log.info(f"llm: {participant} ({index}/{total})")
+        try:
+            result = llm.detect(
+                client, read_json(words_path),
+                chunk_words=int(settings["LLM_CHUNK_WORDS"]),
+                overlap=int(settings["LLM_CHUNK_OVERLAP"]),
+                limits=limits,
+                accepted=kinds,
+                audit_path=os.path.join(work, "llm", f"{participant}.audit.jsonl"),
+                on_progress=lambda done, count, name=participant: log.progress(
+                    done, count, name),
+                concurrency=int(settings["LLM_CONCURRENCY"]),
+            )
+        except llm.AuthRejected:
+            raise StageError("the LLM endpoint refused our credentials. Fix the "
+                             f"key.{resume}") from None
+        except llm.SchemaIgnored:
+            raise StageError("the LLM endpoint ignored the JSON schema. Try "
+                             f"LLM_API=completion.{resume}") from None
+        except llm.ModelUnavailable:
+            named = (f" for '{settings['LLAMA_MODEL_NAME']}'"
+                     if settings["LLAMA_MODEL_NAME"] else "")
+            raise StageError(f"the LLM endpoint has no model loaded{named}. "
+                             f"Load it.{resume}") from None
+        finally:
+            log.progress_done()
+
+        render.write_json(target, result)
+        describe_edits(result, settings, log)
+        if track_was_analysed(result, log):
+            open(marker, "w").close()
+        else:
+            failed += 1
+            log.warn(f"edit detection failed for {participant}; that track keeps "
+                     "its disfluencies")
+
+    if total > 0 and failed == total:
+        raise StageError("edit detection failed for every track")
+    log.raw(f"{total - failed}/{total} tracks analysed")
 
 
 def stage_plan(work: str, settings, log, force: bool = False) -> dict:

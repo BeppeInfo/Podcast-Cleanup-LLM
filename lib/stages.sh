@@ -234,11 +234,6 @@ stage_transcribe() {
 # detect — the LLM finds disfluencies; the server lives and dies in this stage
 # ============================================================================
 
-# Whether to spend one request confirming the server honours a JSON schema.
-llm_schema_check_flag() {
-    [[ "$LLM_CHECK_SCHEMA" == 1 ]] && printf '%s' "--check-schema"
-    return 0
-}
 
 stage_detect() {
     if [[ "$LLM_ENABLE" != 1 ]]; then
@@ -251,87 +246,22 @@ stage_detect() {
     config_need_llama
     state_done transcribe || log_warn "transcribe stage has not completed in this work dir"
 
-    if [[ "$DRY_RUN" != 1 ]]; then
-        # Unquoted on purpose: either one flag or nothing at all.
-        # shellcheck disable=SC2046
-        PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
-            py llm-wait --endpoint "$LLAMA_ENDPOINT" --timeout 60 \
-            --api "$LLM_API" --model-name "$LLAMA_MODEL_NAME" \
-            $(llm_schema_check_flag) \
-            || die "the llama endpoint at $LLAMA_ENDPOINT is not usable"
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log_info "would analyse ${#PARTICIPANTS[@]} transcripts via $LLAMA_ENDPOINT"
+        stage_end "dry run"
+        return 0
     fi
 
-    local participant words target index=0
-    local total="${#PARTICIPANTS[@]}"
-    local failed=0
+    PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
+        PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" \
+        PODCAST_LOG_STAGE=detect \
+        "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" stage-detect \
+        --work "$WORK" \
+        --resume-hint "$0 --episode $EPISODE_ID --from detect" \
+        || exit 1
 
-    for participant in "${PARTICIPANTS[@]}"; do
-        index=$(( index + 1 ))
-        words="$WORK/words/$participant.words.json"
-        target="$WORK/llm/$participant.edits.json"
-
-        if [[ ! -s "$words" ]]; then
-            if [[ "$DRY_RUN" == 1 ]]; then
-                continue
-            fi
-            log_warn "no transcript for $participant; skipping edit detection"
-            continue
-        fi
-        if [[ -s "$target" && -f "$STAGE_DIR/llm-$participant.ok" ]]; then
-            log_debug "$participant already analysed by the LLM"
-            continue
-        fi
-
-        log_info "llm: $participant ($index/$total)"
-        local rc=0
-        PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
-            run_streaming parse_python_progress "$participant" \
-            "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" detect \
-            --words "$words" --endpoint "$LLAMA_ENDPOINT" --out "$target" \
-            --audit "$WORK/llm/$participant.audit.jsonl" \
-            --chunk-words "$LLM_CHUNK_WORDS" --overlap "$LLM_CHUNK_OVERLAP" \
-            --max-words "$LLM_MAX_EDIT_WORDS" --max-seconds "$LLM_MAX_EDIT_SECONDS" \
-            --min-confidence "$LLM_MIN_CONFIDENCE" --temperature "$LLM_TEMP" \
-            --request-timeout "$LLAMA_REQUEST_TIMEOUT" --kinds "$LLM_ACCEPT_KINDS" \
-            --api "$LLM_API" --max-reply-tokens "$LLM_MAX_REPLY_TOKENS" \
-            --model-name "$LLAMA_MODEL_NAME" \
-            --concurrency "$LLM_CONCURRENCY" \
-            || rc=$?
-
-        if (( rc == 0 )); then
-            touch "$STAGE_DIR/llm-$participant.ok"
-        elif (( rc == 2 )); then
-            # Exit 2 is a refused API key. Every remaining track would fail the
-            # same way, and carrying on would deliver an episode that quietly
-            # found no edits at all — so this one stops the run.
-            die "the LLM endpoint refused our credentials. Fix the key, then resume with: $0 --episode $EPISODE_ID --from detect"
-        elif (( rc == 3 )); then
-            # Exit 3 is a server that will not constrain its output. Same
-            # reasoning: every track would fail identically and silently.
-            die "the LLM endpoint ignored the JSON schema. Try LLM_API=completion, then resume with: $0 --episode $EPISODE_ID --from detect"
-        elif (( rc == 5 )); then
-            # Exit 5 is a server that is up but has no model to serve. Same
-            # reasoning as 2 and 3: it is a property of the server, so every
-            # remaining track would fail identically. A router can drop the
-            # model *during* the run — transcribe takes minutes, and nothing
-            # reloads it with --no-models-autoload — so this is worth its own
-            # message rather than one wasted track after another.
-            die "the LLM endpoint has no model loaded${LLAMA_MODEL_NAME:+ for '$LLAMA_MODEL_NAME'}. Load it, then resume with: $0 --episode $EPISODE_ID --from detect"
-        else
-            # Exit 4 is every chunk of this track failing — the track was not
-            # analysed at all, rather than analysed and found clean. It lands
-            # here with the other per-track failures on purpose: one bad track
-            # is survivable, and the run should still deliver the rest.
-            failed=$(( failed + 1 ))
-            log_warn "edit detection failed for $participant; that track keeps its disfluencies"
-        fi
-    done
-
-    if (( failed == total )) && (( total > 0 )); then
-        die "edit detection failed for every track"
-    fi
     state_mark detect
-    stage_end "$(( total - failed ))/$total tracks analysed"
+    stage_end "${#PARTICIPANTS[@]} tracks analysed"
 }
 
 # ============================================================================

@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import wave
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
@@ -2127,6 +2128,130 @@ class TestPipelineTranscribeStage(unittest.TestCase):
         with self.assertRaises(pipeline.StageError) as caught:
             pipeline.stage_transcribe(root, settings, log, ready_timeout=0.1)
         self.assertIn("not usable", str(caught.exception))
+
+
+class TestPipelineDetectStage(unittest.TestCase):
+    """The three faults that end the run, and the one that ends a track.
+
+    This is what the shell's exit codes 2, 3, 5 and 4 carried. They are
+    exceptions now, so what is worth pinning is that each still stops what it
+    used to stop, and still says what to do about it.
+    """
+
+    HINT = "clean-podcast.sh --episode ep --from detect"
+
+    def _work(self, participants=("alice",), words=True):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for leaf in ("words", "llm", "state"):
+            os.makedirs(os.path.join(root, leaf), exist_ok=True)
+        with open(os.path.join(root, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump({"episode_id": "ep", "duration": 10.0, "sample_rate": 48000,
+                       "tracks": [{"participant": p, "duration": 10.0,
+                                   "sample_rate": 48000, "sample_fmt": "s16"}
+                                  for p in participants]}, handle)
+        if words:
+            for name in participants:
+                with open(os.path.join(root, "words", f"{name}.words.json"),
+                          "w", encoding="utf-8") as handle:
+                    json.dump({"participant": name, "words": [
+                        {"i": 0, "text": "hi", "start": 0.0, "end": 0.4,
+                         "segment": 0}], "segments": []}, handle)
+        return root
+
+    def _log(self):
+        path = os.path.join(tempfile.mkdtemp(), "run.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        buf = io.StringIO()
+        return runlog.Log(path=path, stream=buf, colour=False), buf
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def wait_until_ready(self, *a, **k):
+            return True
+
+        def check_schema_support(self):
+            return None
+
+    def _run(self, root, log, detect, settings=None):
+        values = cfg.defaults()
+        values.update(settings or {})
+        values["LLAMA_ENDPOINT"] = "http://stub"
+        with unittest.mock.patch.object(llm, "LlamaClient", self._Client), \
+                unittest.mock.patch.object(llm, "detect", detect):
+            pipeline.stage_detect(root, values, log, resume_hint=self.HINT)
+
+    def test_a_refused_key_ends_the_run_and_says_so(self):
+        root, (log, _) = self._work(), self._log()
+        def detect(*a, **k):
+            raise llm.AuthRejected("nope")
+        with self.assertRaises(pipeline.StageError) as caught:
+            self._run(root, log, detect)
+        message = str(caught.exception)
+        self.assertIn("refused our credentials", message)
+        self.assertIn(self.HINT, message)
+
+    def test_an_ignored_schema_suggests_the_other_api(self):
+        root, (log, _) = self._work(), self._log()
+        def detect(*a, **k):
+            raise llm.SchemaIgnored("prose")
+        with self.assertRaises(pipeline.StageError) as caught:
+            self._run(root, log, detect)
+        self.assertIn("LLM_API=completion", str(caught.exception))
+
+    def test_no_model_loaded_names_the_model_when_one_was_asked_for(self):
+        root, (log, _) = self._work(), self._log()
+        def detect(*a, **k):
+            raise llm.ModelUnavailable("gone")
+        with self.assertRaises(pipeline.StageError) as caught:
+            self._run(root, log, detect, {"LLAMA_MODEL_NAME": "qwen-podcast"})
+        self.assertIn("qwen-podcast", str(caught.exception))
+
+    def test_every_chunk_failing_leaves_the_track_unmarked(self):
+        root = self._work()
+        log, buf = self._log()
+        def detect(*a, **k):
+            return {"participant": "alice", "edits": [], "rejected_count": 0,
+                    "chunks": 3, "chunk_failures": 3}
+        # One track, and it failed, so the stage refuses the episode.
+        with self.assertRaises(pipeline.StageError) as caught:
+            self._run(root, log, detect)
+        self.assertIn("every track", str(caught.exception))
+        self.assertIn("not analysed at all", buf.getvalue())
+        self.assertFalse(
+            os.path.exists(os.path.join(root, "state", "llm-alice.ok")))
+
+    def test_one_bad_track_of_two_is_survivable(self):
+        root = self._work(("alice", "bob"))
+        log, buf = self._log()
+        def detect(client, parsed, **k):
+            if parsed["participant"] == "alice":
+                return {"participant": "alice", "edits": [], "rejected_count": 0,
+                        "chunks": 2, "chunk_failures": 2}
+            return {"participant": "bob", "edits": [], "rejected_count": 0,
+                    "chunks": 2, "chunk_failures": 0}
+        self._run(root, log, detect)
+        self.assertFalse(os.path.exists(os.path.join(root, "state", "llm-alice.ok")))
+        self.assertTrue(os.path.exists(os.path.join(root, "state", "llm-bob.ok")))
+        self.assertIn("keeps its disfluencies", buf.getvalue())
+
+    def test_a_track_without_a_transcript_is_skipped_not_fatal(self):
+        root = self._work(("alice",), words=False)
+        log, buf = self._log()
+        def detect(*a, **k):
+            raise AssertionError("should not be called")
+        self._run(root, log, detect)
+        self.assertIn("no transcript for alice", buf.getvalue())
+
+    def test_an_unknown_edit_kind_is_refused_by_name(self):
+        root, (log, _) = self._work(), self._log()
+        def detect(*a, **k):
+            raise AssertionError("should not be called")
+        with self.assertRaises(pipeline.StageError) as caught:
+            self._run(root, log, detect, {"LLM_ACCEPT_KINDS": "stutter,banana"})
+        self.assertIn("banana", str(caught.exception))
 
 
 class TestPipelinePlanStage(unittest.TestCase):

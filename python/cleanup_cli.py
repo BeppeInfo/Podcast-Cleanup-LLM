@@ -394,6 +394,20 @@ def cmd_detect(args):
             raise SystemExit(4)
 
 
+def cmd_stage_detect(args):
+    """The detect stage: one pass over each track's transcript."""
+    log = runlog.Log.from_env()
+    settings = cfg.from_environment()
+    try:
+        pipeline.stage_detect(
+            args.work, settings, log, api_key=_api_key(LLAMA_KEY_ENV),
+            resume_hint=args.resume_hint,
+        )
+    except pipeline.StageError as exc:
+        log.error(str(exc))
+        raise SystemExit(1) from None
+
+
 # --- plan ---------------------------------------------------------------------
 
 
@@ -607,6 +621,13 @@ def build_parser():
     p.add_argument("--work", required=True)
     p.add_argument("--ffmpeg", default="ffmpeg")
     p.set_defaults(func=cmd_stage_transcribe)
+
+    p = sub.add_parser("stage-detect", help="run the detect stage")
+    p.add_argument("--work", required=True)
+    p.add_argument("--resume-hint", default="",
+                   help="the command that would resume this run, for the "
+                        "messages about faults that end it")
+    p.set_defaults(func=cmd_stage_detect)
 
     p = sub.add_parser("stage-plan", help="run the plan stage")
     p.add_argument("--work", required=True, help="the episode work directory")
