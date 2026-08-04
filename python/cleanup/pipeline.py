@@ -19,7 +19,7 @@ import os
 
 from . import intervals as iv
 from . import plan as planner
-from . import proc, render, silence, transcript as tr
+from . import asr, proc, render, silence, transcript as tr
 
 
 class StageError(Exception):
@@ -183,6 +183,162 @@ def stage_prepare(work: str, settings, log, ffmpeg: str = "ffmpeg") -> None:
     # so a run resumed at this stage would otherwise carry those forward into a
     # render prediction that is supposed to be frame-exact.
     refresh_durations(work, log)
+
+
+VAD_REQUEST_FIELDS = (
+    ("vad_threshold", "WHISPER_VAD_THRESHOLD"),
+    ("vad_min_speech_duration_ms", "WHISPER_VAD_MIN_SPEECH_MS"),
+    ("vad_min_silence_duration_ms", "WHISPER_VAD_MIN_SILENCE_MS"),
+    ("vad_speech_pad_ms", "WHISPER_VAD_SPEECH_PAD_MS"),
+    ("vad_samples_overlap", "WHISPER_VAD_SAMPLES_OVERLAP"),
+)
+
+
+def scan_levels(work: str, participant: str, wav: str, duration: float,
+                settings, log, ffmpeg: str):
+    """ffmpeg's silencedetect for one track, parsed into non-silent stretches.
+
+    Every track, not only the ones long enough to split into chunks: the plan
+    stage uses this as the one opinion about the audio Whisper had no hand in.
+    Returns None when it could not be done, which is a warning rather than a
+    failure — the run continues with less to cross-check against.
+    """
+    scan_log = os.path.join(work, "asr", f"{participant}.silence.log")
+    target = os.path.join(work, "asr", f"{participant}.loud.json")
+    threshold = settings["SPLIT_SILENCE_THRESHOLD"]
+    argv = [
+        ffmpeg, "-nostdin", "-v", "info", "-i", wav,
+        "-af", f"silencedetect=noise={threshold}:d={settings['SPLIT_MIN_SILENCE']}",
+        "-f", "null", "-",
+    ]
+    if proc.run_to_file(argv, log, scan_log) != 0:
+        log.warn(f"could not scan {participant} for quiet spots: chunk boundaries "
+                 "may land mid-word, and nothing will cross-check its transcript "
+                 "against its audio")
+        return None
+
+    with open(scan_log, encoding="utf-8", errors="replace") as handle:
+        loud = silence.parse_silencedetect(handle.read(), duration)
+    render.write_json(target, {
+        "participant": participant,
+        "duration": round(duration, 3),
+        "threshold": threshold,
+        "loud": [[round(s, 4), round(e, 4)] for s, e in loud],
+    })
+    log.raw(f"{len(loud)} non-silent stretches, {iv.total(loud):.1f}s of "
+            f"{duration:.1f}s above the threshold")
+    return [tuple(span) for span in loud]
+
+
+def describe_transcript(parsed, settings, log) -> None:
+    """What the transcription found, and what it had to work around.
+
+    The `note:` lines go to the run log only, which is where they went when the
+    shell was reading this off a pipe — its parser matched PROGRESS and WARN and
+    let everything else fall through to the log. Worth knowing that the comment
+    in the old code calling one of these "worth saying out loud" was not actually
+    achieved; changing that is a decision, not part of a port.
+    """
+    log.raw(f"{len(parsed['words'])} words in {len(parsed['segments'])} segments "
+            f"over {parsed['chunks']} chunk(s)")
+
+    recovery = parsed.get("recovery") or {}
+    if recovery.get("spans"):
+        detail = (f"{recovery['spans']} stretch(es) of loud audio came back with "
+                  f"no words; re-asked about {recovery['attempted']} and recovered "
+                  f"{recovery['recovered_segments']} word(s) from "
+                  f"{recovery['recovered_spans']}")
+        log.raw("note: " + detail
+                + ("" if recovery["recovered_spans"] else " — probably not speech, then"))
+        if recovery.get("skipped"):
+            log.warn(f"{recovery['skipped']} further stretch(es) were left unasked; "
+                     "that many is not the occasional skipped window")
+
+    collapsed = parsed.get("collapsed") or {}
+    if collapsed.get("spans"):
+        log.raw(f"note: {collapsed['spans']} word(s) sat on more than "
+                f"{settings['WHISPER_REASK_WORD_SECONDS']}s of speech; asked again "
+                f"in {settings['WHISPER_REASK_WINDOW']}s windows and replaced "
+                f"{collapsed['replaced_spans']}, turning "
+                f"{collapsed['words_before']} word(s) into "
+                f"{collapsed['words_after']}")
+        if collapsed.get("skipped"):
+            log.warn(f"{collapsed['skipped']} further collapsed word(s) were left "
+                     "unasked; that many is not the occasional fluent reading")
+
+    empty = parsed.get("chunks_without_speech") or 0
+    if empty:
+        # Normal on a two-mic recording; total silence is not.
+        detail = f"{empty}/{parsed['chunks']} chunk(s) held no speech at all"
+        if empty == parsed["chunks"]:
+            log.warn(f"{detail}, so this track has no transcript. If it really was "
+                     "talking, the server is dropping it — check that vad_* is "
+                     "honoured and lower WHISPER_CHUNK_SECONDS")
+        else:
+            log.raw(f"note: {detail}")
+
+
+def stage_transcribe(work: str, settings, log, ffmpeg: str = "ffmpeg",
+                     api_key=None, ready_timeout: float = 60.0) -> None:
+    """Transcribe every track, and scan each one's levels while we are here."""
+    meta = read_json(os.path.join(work, "meta.json"))
+    state = os.path.join(work, "state")
+    endpoint = settings["WHISPER_ENDPOINT"]
+
+    client = asr.WhisperClient(
+        endpoint, timeout=float(settings["WHISPER_REQUEST_TIMEOUT"]),
+        path=settings["WHISPER_ENDPOINT_PATH"], api_key=api_key,
+    )
+    if not client.wait_until_ready(ready_timeout):
+        raise StageError(f"the whisper endpoint at {endpoint} is not usable")
+
+    vad = settings["WHISPER_VAD"] == "1"
+    vad_options = {field: settings[name] for field, name in VAD_REQUEST_FIELDS}
+
+    total = len(meta["tracks"])
+    for index, track in enumerate(meta["tracks"], start=1):
+        participant = track["participant"]
+        target = os.path.join(work, "words", f"{participant}.words.json")
+        marker = os.path.join(state, f"asr-{participant}.ok")
+        wav = os.path.join(work, "prep", f"{participant}.wav")
+
+        if (os.path.isfile(marker) and os.path.isfile(target)
+                and os.path.getsize(target) > 0):
+            log.debug(f"{participant} already transcribed")
+            continue
+        if not (os.path.isfile(wav) and os.path.getsize(wav) > 0):
+            raise StageError(f"missing prepared track: {wav}")
+
+        log.info(f"whisper (remote): {participant} ({index}/{total})")
+        duration = float(track["duration"])
+        loud = scan_levels(work, participant, wav, duration, settings, log, ffmpeg)
+
+        parsed = asr.transcribe(
+            client, wav, participant,
+            language=settings["WHISPER_LANG"],
+            chunk_seconds=float(settings["WHISPER_CHUNK_SECONDS"]),
+            loud=loud,
+            temperature=0.0,
+            on_progress=lambda done, count, name=participant: log.progress(
+                done, count, name),
+            on_note=lambda message: log.raw(f"note: {message}"),
+            vad=vad,
+            vad_options=vad_options,
+            recover=settings["WHISPER_RECOVER"] == "1",
+            speech_pad=float(settings["SPEECH_PAD"]),
+            prompt=settings["WHISPER_PROMPT"],
+            reask=settings["WHISPER_REASK"] == "1",
+            reask_word_seconds=float(settings["WHISPER_REASK_WORD_SECONDS"]),
+            reask_window=float(settings["WHISPER_REASK_WINDOW"]),
+        )
+        log.progress_done()
+        render.write_json(target, parsed)
+        describe_transcript(parsed, settings, log)
+
+        if not vad:
+            log.warn("server-side VAD is off, so silence was transcribed as well; "
+                     "anything invented there becomes speech in the plan")
+        open(marker, "w").close()
 
 
 def stage_plan(work: str, settings, log, force: bool = False) -> dict:

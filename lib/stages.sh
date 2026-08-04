@@ -199,34 +199,6 @@ stage_prepare() {
     stage_end "${#PARTICIPANTS[@]} tracks decoded"
 }
 
-# One level scan per track, serving two purposes that are worth keeping distinct.
-#
-# It says where a long track may be split, which is a small question: is this
-# spot quiet enough that a boundary here will not cut a word in half.
-#
-# And it is the only opinion about the audio that does not come from Whisper. It
-# cannot tell speech from a cough — that is why it is not the speech map — but it
-# can tell loud from silent, and loud audio that produced no words at all is
-# something the plan stage should refuse to cut blindly. That check exists
-# because a 600s request silently dropped 22 seconds of clear speech, and nothing
-# downstream could see it: the transcript was internally consistent, so the map
-# derived from it was too.
-write_loud_spans() {
-    local participant="$1" wav="$2" log="$3" target="$4"
-
-    if ! run_to_file "$log" \
-        "$FFMPEG" -nostdin -v info -i "$wav" \
-        -af "silencedetect=noise=${SPLIT_SILENCE_THRESHOLD}:d=${SPLIT_MIN_SILENCE}" \
-        -f null -
-    then
-        log_warn "could not scan $participant for quiet spots: chunk boundaries may land mid-word, and nothing will cross-check its transcript against its audio"
-        return 1
-    fi
-
-    run py loud-spans --log "$log" --participant "$participant" \
-        --duration "${TRACK_DURATION[$participant]:-0}" --out "$target" \
-        || { log_warn "could not parse the level scan for $participant"; return 1; }
-}
 
 # ============================================================================
 # transcribe — Whisper per track, all of it finished before any LLM work
@@ -238,86 +210,24 @@ write_loud_spans() {
 
 stage_transcribe() {
     stage_begin transcribe "transcribing via $WHISPER_ENDPOINT"
-    config_need_python
+    config_need_whisper
+    config_need_ffmpeg
 
-    if [[ "$DRY_RUN" != 1 ]]; then
-        PODCAST_WHISPER_API_KEY="$WHISPER_API_KEY" \
-            py whisper-wait --endpoint "$WHISPER_ENDPOINT" \
-            --path "$WHISPER_ENDPOINT_PATH" --timeout 60 \
-            || die "the whisper endpoint at $WHISPER_ENDPOINT is not usable"
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log_info "would transcribe ${#PARTICIPANTS[@]} tracks via $WHISPER_ENDPOINT"
+        stage_end "dry run"
+        return 0
     fi
 
-    local participant target wav index=0
-    local total="${#PARTICIPANTS[@]}"
-
-    for participant in "${PARTICIPANTS[@]}"; do
-        index=$(( index + 1 ))
-        target="$WORK/words/$participant.words.json"
-        wav="$WORK/prep/$participant.wav"
-
-        if [[ -s "$target" && -f "$STAGE_DIR/asr-$participant.ok" ]]; then
-            log_debug "$participant already transcribed"
-            continue
-        fi
-        [[ -s "$wav" || "$DRY_RUN" == 1 ]] || die "missing prepared track: $wav"
-
-        log_info "whisper (remote): $participant ($index/$total)"
-
-        # Every track, not only the ones long enough to split: the plan stage
-        # needs this to cross-check each transcript against its own audio.
-        local loud_spans=""
-        if [[ "$DRY_RUN" != 1 ]]; then
-            loud_spans="$WORK/asr/$participant.loud.json"
-            write_loud_spans "$participant" "$wav" \
-                "$WORK/asr/$participant.silence.log" "$loud_spans" \
-                || loud_spans=""
-        fi
-
-        local -a args=(
-            transcribe-remote
-            --wav "$wav" --participant "$participant" --out "$target"
-            --endpoint "$WHISPER_ENDPOINT" --path "$WHISPER_ENDPOINT_PATH"
-            --duration "${TRACK_DURATION[$participant]:-0}"
-            --chunk-seconds "$WHISPER_CHUNK_SECONDS"
-            --speech-pad "$SPEECH_PAD"
-            --language "$WHISPER_LANG"
-            --request-timeout "$WHISPER_REQUEST_TIMEOUT"
-        )
-        [[ -n "$loud_spans" ]] && args+=(--loud "$loud_spans")
-        [[ "$WHISPER_RECOVER" == 1 ]] || args+=(--no-recover)
-        [[ -n "$WHISPER_PROMPT" ]] && args+=(--prompt "$WHISPER_PROMPT")
-        if [[ "$WHISPER_REASK" == 1 ]]; then
-            args+=(
-                --reask-word-seconds "$WHISPER_REASK_WORD_SECONDS"
-                --reask-window "$WHISPER_REASK_WINDOW"
-            )
-        else
-            args+=(--no-reask)
-        fi
-        if [[ "$WHISPER_VAD" == 1 ]]; then
-            args+=(
-                --vad-threshold "$WHISPER_VAD_THRESHOLD"
-                --vad-min-speech-ms "$WHISPER_VAD_MIN_SPEECH_MS"
-                --vad-min-silence-ms "$WHISPER_VAD_MIN_SILENCE_MS"
-                --vad-speech-pad-ms "$WHISPER_VAD_SPEECH_PAD_MS"
-                --vad-samples-overlap "$WHISPER_VAD_SAMPLES_OVERLAP"
-            )
-        else
-            args+=(--no-vad)
-        fi
-        if [[ "$DRY_RUN" == 1 ]]; then
-            run py "${args[@]}"
-        else
-            PODCAST_WHISPER_API_KEY="$WHISPER_API_KEY" \
-                run_streaming parse_python_progress "$participant" \
-                "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}" \
-                || die "remote transcription failed for $participant"
-            state_touch "$STAGE_DIR/asr-$participant.ok"
-        fi
-    done
+    PODCAST_WHISPER_API_KEY="$WHISPER_API_KEY" \
+        PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" \
+        PODCAST_LOG_STAGE=transcribe \
+        "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" stage-transcribe \
+        --work "$WORK" --ffmpeg "$FFMPEG" \
+        || exit 1
 
     state_mark transcribe
-    stage_end "$total tracks transcribed remotely"
+    stage_end "${#PARTICIPANTS[@]} tracks transcribed remotely"
 }
 
 # ============================================================================

@@ -185,50 +185,6 @@ def build_meta(track_pairs, episode, ffprobe, resample_to, say=print):
             "aligned at sample 0 the cleanup will drift"
         )
     return meta
-
-
-def cmd_meta(args):
-    meta = build_meta(args.track, args.episode, args.ffprobe, args.resample_to)
-    _write_json(args.out, meta)
-
-
-def cmd_meta_refresh(args):
-    """Replace container durations with the length of the decoded audio.
-
-    A container's header is not always right: AAC decodes longer than it claims,
-    Opus shorter, and a truncated file of any format can claim anything. The
-    prepare stage has already decoded every track, so its output is the
-    authority — and the frame-exact render prediction depends on it.
-    """
-    meta = _read_json(args.meta)
-    changes = []
-    for track in meta["tracks"]:
-        prepared = os.path.join(args.prep_dir, f"{track['participant']}.wav")
-        if not os.path.isfile(prepared):
-            _fail(f"prepared track missing, cannot measure: {prepared}")
-        measured = round(silence.wav_duration(prepared), 4)
-        before = track["duration"]
-        track["duration"] = measured
-        if abs(measured - before) > 0.002:
-            changes.append((track["participant"], before, measured))
-
-    meta["duration"] = max(t["duration"] for t in meta["tracks"])
-    durations = [t["duration"] for t in meta["tracks"]]
-    meta["duration_spread"] = round(max(durations) - min(durations), 3)
-    meta["durations_measured"] = True
-    _write_json(args.meta, meta)
-
-    print(f"measured length of {len(meta['tracks'])} tracks: {meta['duration']:.3f}s")
-    for participant, before, after in changes:
-        print(
-            f"  {participant}: container said {before:.3f}s, decodes to "
-            f"{after:.3f}s ({(after - before) * 1000:+.0f} ms)"
-        )
-
-
-# --- meta ----------------------------------------------------------------------
-
-
 def cmd_meta_shell(args):
     """Emit meta.json as shell assignments, for `eval` by a resumed stage.
 
@@ -255,37 +211,6 @@ def cmd_meta_shell(args):
             for t in tracks
         )
         print(f"{key}=({pairs})")
-
-
-def cmd_loud_spans(args):
-    """Parse a silencedetect log into the stretches that are not silent.
-
-    Two consumers, and the distinction matters. The transcribe stage uses these
-    to place chunk boundaries in quiet places. The plan stage uses them as the one
-    opinion about the audio that Whisper had no hand in, to refuse a cut over loud
-    audio no transcript accounts for. Neither treats this as a speech map: a level
-    scan cannot tell a cough from a word.
-    """
-    with open(args.log, encoding="utf-8", errors="replace") as handle:
-        loud = silence.parse_silencedetect(handle.read(), args.duration)
-    _write_json(
-        args.out,
-        {
-            "participant": args.participant,
-            "duration": round(args.duration, 3),
-            "threshold": args.threshold or "",
-            "loud": [[round(s, 4), round(e, 4)] for s, e in loud],
-        },
-    )
-    print(
-        f"{len(loud)} non-silent stretches, {iv.total(loud):.1f}s of "
-        f"{args.duration:.1f}s above the threshold"
-    )
-
-
-# --- transcript ---------------------------------------------------------------
-
-
 def cmd_config(args):
     """Resolve every setting and emit it as shell assignments.
 
@@ -379,123 +304,6 @@ VAD_REQUEST_FIELDS = (
     ("vad_speech_pad_ms", "vad_speech_pad_ms"),
     ("vad_samples_overlap", "vad_samples_overlap"),
 )
-
-
-def cmd_transcribe_remote(args):
-    loud = None
-    if args.loud and os.path.isfile(args.loud):
-        loud = [tuple(span) for span in _read_json(args.loud)["loud"]]
-
-    client = asr.WhisperClient(
-        args.endpoint, timeout=args.request_timeout, path=args.path,
-        api_key=_api_key(WHISPER_KEY_ENV),
-    )
-    options = {
-        field: getattr(args, attribute)
-        for field, attribute in VAD_REQUEST_FIELDS
-        if getattr(args, attribute) is not None
-    }
-    parsed = asr.transcribe(
-        client,
-        args.wav,
-        args.participant,
-        language=args.language,
-        chunk_seconds=args.chunk_seconds,
-        loud=loud,
-        temperature=args.temperature,
-        on_progress=_progress,
-        on_note=lambda message: print(f"note: {message}", flush=True),
-        vad=args.vad,
-        vad_options=options,
-        recover=args.recover,
-        speech_pad=args.speech_pad,
-        prompt=args.prompt,
-        reask=args.reask,
-        reask_word_seconds=args.reask_word_seconds,
-        reask_window=args.reask_window,
-    )
-    _write_json(args.out, parsed)
-
-    words, segments = len(parsed["words"]), len(parsed["segments"])
-    print(
-        f"{words} words in {segments} segments over {parsed['chunks']} chunk(s)"
-    )
-    recovery = parsed.get("recovery") or {}
-    if recovery.get("spans"):
-        detail = (
-            f"{recovery['spans']} stretch(es) of loud audio came back with no "
-            f"words; re-asked about {recovery['attempted']} and recovered "
-            f"{recovery['recovered_segments']} word(s) from "
-            f"{recovery['recovered_spans']}"
-        )
-        if recovery["recovered_spans"]:
-            # Worth saying out loud rather than burying: this is Whisper having
-            # dropped a decode window, and the recovery having worked.
-            print(f"note: {detail}", flush=True)
-        else:
-            print(f"note: {detail} — probably not speech, then")
-        if recovery.get("skipped"):
-            print(
-                f"WARN {recovery['skipped']} further stretch(es) were left "
-                "unasked; that many is not the occasional skipped window",
-                flush=True,
-            )
-    collapsed = parsed.get("collapsed") or {}
-    if collapsed.get("spans"):
-        print(
-            f"note: {collapsed['spans']} word(s) sat on more than "
-            f"{args.reask_word_seconds}s of speech; asked again in "
-            f"{args.reask_window}s windows and replaced "
-            f"{collapsed['replaced_spans']}, turning "
-            f"{collapsed['words_before']} word(s) into "
-            f"{collapsed['words_after']}",
-            flush=True,
-        )
-        if collapsed.get("skipped"):
-            print(
-                f"WARN {collapsed['skipped']} further collapsed word(s) were left "
-                "unasked; that many is not the occasional fluent reading",
-                flush=True,
-            )
-    empty = parsed.get("chunks_without_speech") or 0
-    if empty:
-        # Normal on a two-mic recording; total silence is not.
-        detail = f"{empty}/{parsed['chunks']} chunk(s) held no speech at all"
-        if empty == parsed["chunks"]:
-            print(
-                f"WARN {detail}, so this track has no transcript. If it really was "
-                "talking, the server is dropping it — check that vad_* is honoured "
-                "and lower WHISPER_CHUNK_SECONDS",
-                flush=True,
-            )
-        else:
-            print(f"note: {detail}")
-    if not args.vad:
-        # Worth one line every run: with the server transcribing silence too,
-        # anything it invents there becomes speech in the plan, because the plan
-        # has nothing else to go on.
-        print(
-            "note: server-side VAD is off, so silence was transcribed as well; "
-            "hallucinated words there will read as speech downstream"
-        )
-    if parsed["approximated_segments"]:
-        # Worth saying plainly: it decides how tightly a stutter can be cut.
-        share = parsed["approximated_segments"] / max(segments, 1)
-        detail = (
-            f"{parsed['approximated_segments']}/{segments} segments arrived without "
-            "per-token timings"
-        )
-        if words and words / max(segments, 1) < 1.5:
-            print(f"note: {detail}, but they are one word each, so timings are exact")
-        else:
-            print(
-                f"warning: {detail} ({share * 100:.0f}%), so word positions inside "
-                "them are interpolated and cuts will be less tight. A local "
-                "whisper-cli run, or a server build that honours max_len, gives "
-                "better boundaries."
-            )
-
-
 def cmd_whisper_wait(args):
     client = asr.WhisperClient(
         args.endpoint, path=args.path, api_key=_api_key(WHISPER_KEY_ENV)
@@ -629,35 +437,10 @@ def cmd_plan(args):
             "their transcripts against their own audio"
         )
 
-    # Read before the map is built as well as after: the scan bounds when each
-    # word was said, and a track without one falls back to trusting its timings.
-    speech = {
-        p: tr.speech_from_words(
-            words[p], durations[p], pad=params["speech_pad"],
-            loud=loud.get(p) if args.clip_speech else None,
-        )
-        for p in participants
-    }
-    if args.clip_speech and loud:
-        trimmed = {
-            p: round(
-                iv.total(
-                    tr.speech_from_words(
-                        words[p], durations[p], pad=params["speech_pad"]
-                    )
-                )
-                - iv.total(speech[p]),
-                1,
-            )
-            for p in loud
-        }
-        busy = {p: amount for p, amount in trimmed.items() if amount >= 1.0}
-        if busy:
-            print(
-                "note: word timings ran past the audio by "
-                + ", ".join(f"{p} {amount}s" for p, amount in sorted(busy.items()))
-                + "; the speech map is the overlap with the level scan"
-            )
+    # The same construction the stage uses, so the two cannot drift.
+    speech = pipeline.build_speech_map(
+        participants, words, durations, loud, params["speech_pad"],
+        args.clip_speech, runlog.Log.from_env())
 
     result = planner.build_plan(
         meta,
@@ -703,70 +486,21 @@ def cmd_stage_prepare(args):
         raise SystemExit(1) from None
 
 
+def cmd_stage_transcribe(args):
+    """The transcribe stage: level scan and transcription, per track."""
+    log = runlog.Log.from_env()
+    settings = cfg.from_environment()
+    try:
+        pipeline.stage_transcribe(
+            args.work, settings, log, ffmpeg=args.ffmpeg,
+            api_key=_api_key(WHISPER_KEY_ENV),
+        )
+    except pipeline.StageError as exc:
+        log.error(str(exc))
+        raise SystemExit(1) from None
+
+
 # --- filters ------------------------------------------------------------------
-
-
-def cmd_filters(args):
-    meta = _read_json(args.meta)
-    current = _read_json(args.plan)
-    os.makedirs(args.dir, exist_ok=True)
-
-    expectations = {}
-    for track in meta["tracks"]:
-        participant = track["participant"]
-        mutes = current["mutes"].get(participant, [])
-        # The rate the filter graph works at, which is the output rate too.
-        render_rate = int(track.get("render_rate") or track["sample_rate"])
-        resample = render_rate if render_rate != track["sample_rate"] else None
-
-        graph = render.build_filter(
-            current["cuts"], mutes, args.frame_samples, args.fade, resample=resample
-        )
-        path = os.path.join(args.dir, f"{participant}.filter")
-        if graph is None:
-            if os.path.exists(path):
-                os.remove(path)
-        else:
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(graph)
-
-        # The track may be shorter than the episode; cuts past its end are moot.
-        samples = render.expected_output_samples(
-            min(track["duration"], current["duration"]),
-            render_rate,
-            args.frame_samples,
-            current["cuts"],
-        )
-        expectations[participant] = {
-            "filter": path if graph is not None else None,
-            "passthrough": graph is None,
-            "mutes": len(mutes),
-            "resampled_from": track["sample_rate"] if resample else None,
-            "expected_samples": samples,
-            "expected_duration": round(samples / float(render_rate), 3),
-            "sample_rate": render_rate,
-            "sample_fmt": track["sample_fmt"],
-            "source_lossless": track.get("lossless", True),
-        }
-
-    _write_json(args.out, {"frame_samples": args.frame_samples, "tracks": expectations})
-    for participant, values in expectations.items():
-        notes = []
-        if values["passthrough"]:
-            notes.append("nothing to change")
-        else:
-            notes.append(f"{values['mutes']} mutes")
-        if values["resampled_from"]:
-            notes.append(f"resampled from {values['resampled_from']} Hz")
-        print(
-            f"{participant}: {values['expected_duration']:.3f}s expected "
-            f"({', '.join(notes)})"
-        )
-
-
-# --- final transcript ---------------------------------------------------------
-
-
 def cmd_transcript(args):
     current = _read_json(args.plan)
     words = _collect(args.words_dir, ".words.json")
@@ -831,91 +565,9 @@ def build_parser():
     parser = argparse.ArgumentParser(prog="cleanup_cli", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("meta", help="probe tracks and write meta.json")
-    p.add_argument("--episode", required=True)
-    p.add_argument("--ffprobe", default="ffprobe")
-    p.add_argument("--out", required=True)
-    p.add_argument(
-        "--resample-to", default="",
-        help="'auto' for the highest rate present, or an explicit rate; "
-             "empty makes a rate mismatch an error",
-    )
-    p.add_argument("track", nargs="+", help="participant=path")
-    p.set_defaults(func=cmd_meta)
-
-    p = sub.add_parser(
-        "meta-refresh", help="replace container durations with measured ones"
-    )
-    p.add_argument("--meta", required=True)
-    p.add_argument("--prep-dir", required=True)
-    p.set_defaults(func=cmd_meta_refresh)
-
     p = sub.add_parser("meta-shell", help="meta.json as shell assignments")
     p.add_argument("--meta", required=True)
     p.set_defaults(func=cmd_meta_shell)
-
-    p = sub.add_parser(
-        "loud-spans", help="silencedetect log -> the stretches that are not silent"
-    )
-    p.add_argument("--log", required=True)
-    p.add_argument("--duration", type=float, required=True)
-    p.add_argument("--participant", required=True)
-    p.add_argument("--threshold", help="recorded for the audit; not used here")
-    p.add_argument("--out", required=True)
-    p.set_defaults(func=cmd_loud_spans)
-
-
-    p = sub.add_parser(
-        "transcribe-remote", help="transcribe a track via a whisper-server endpoint"
-    )
-    p.add_argument("--wav", required=True)
-    p.add_argument("--participant", required=True)
-    p.add_argument("--endpoint", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument(
-        "--loud",
-        help="loud-spans output, used only to place chunk boundaries in quiet",
-    )
-    p.add_argument("--duration", type=float, default=0.0)
-    p.add_argument("--chunk-seconds", type=float, default=600.0)
-    p.add_argument(
-        "--no-vad", dest="vad", action="store_false",
-        help="do not ask the server to run Silero first; silence is transcribed too",
-    )
-    p.add_argument("--vad-threshold", type=float)
-    p.add_argument("--vad-min-speech-ms", type=int)
-    p.add_argument("--vad-min-silence-ms", type=int)
-    p.add_argument("--vad-speech-pad-ms", type=int)
-    p.add_argument("--vad-samples-overlap", type=float)
-    p.add_argument(
-        "--no-recover", dest="recover", action="store_false",
-        help="do not re-ask about loud stretches the first pass returned no words for",
-    )
-    p.add_argument(
-        "--speech-pad", type=float, default=0.25,
-        help="match the plan stage's SPEECH_PAD, so both ask the same question",
-    )
-    p.add_argument(
-        "--prompt", default="",
-        help="whisper's initial prompt; conditioning text, not an instruction",
-    )
-    p.add_argument(
-        "--no-reask", dest="reask", action="store_false",
-        help="do not re-ask in short windows where one word swallowed the audio",
-    )
-    p.add_argument(
-        "--reask-word-seconds", type=float, default=asr.COLLAPSED_WORD_LOUD,
-        help="a word carrying more speech than this is asked about again",
-    )
-    p.add_argument(
-        "--reask-window", type=float, default=asr.COLLAPSED_WINDOW,
-        help="length of those windows; short is what makes the reading verbatim",
-    )
-    p.add_argument("--language", default="auto")
-    p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--request-timeout", type=float, default=1800.0)
-    p.add_argument("--path", default="/inference")
-    p.set_defaults(func=cmd_transcribe_remote)
 
     p = sub.add_parser(
         "config", help="resolve settings and print them as shell assignments")
@@ -950,6 +602,11 @@ def build_parser():
     p.add_argument("--work", required=True)
     p.add_argument("--ffmpeg", default="ffmpeg")
     p.set_defaults(func=cmd_stage_prepare)
+
+    p = sub.add_parser("stage-transcribe", help="run the transcribe stage")
+    p.add_argument("--work", required=True)
+    p.add_argument("--ffmpeg", default="ffmpeg")
+    p.set_defaults(func=cmd_stage_transcribe)
 
     p = sub.add_parser("stage-plan", help="run the plan stage")
     p.add_argument("--work", required=True, help="the episode work directory")
@@ -1014,15 +671,6 @@ def build_parser():
     p.add_argument("--report")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_plan)
-
-    p = sub.add_parser("filters", help="write per-track ffmpeg filter graphs")
-    p.add_argument("--meta", required=True)
-    p.add_argument("--plan", required=True)
-    p.add_argument("--dir", required=True)
-    p.add_argument("--out", required=True)
-    p.add_argument("--frame-samples", type=int, default=512)
-    p.add_argument("--fade", type=float, default=0.030)
-    p.set_defaults(func=cmd_filters)
 
     p = sub.add_parser("transcript", help="build the final speaker transcript")
     p.add_argument("--plan", required=True)

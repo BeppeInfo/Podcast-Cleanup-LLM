@@ -2039,6 +2039,96 @@ class TestProc(unittest.TestCase):
         self.assertEqual(buf.getvalue(), "")
 
 
+class TestPipelineTranscribeStage(unittest.TestCase):
+    """The level scan, and what the transcript summary reports."""
+
+    def _log(self, level="info"):
+        path = os.path.join(tempfile.mkdtemp(), "run.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        buf = io.StringIO()
+        return runlog.Log(path=path, level=level, stream=buf, colour=False), buf
+
+    def _work(self, seconds=1.0):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for leaf in ("prep", "asr", "words", "state"):
+            os.makedirs(os.path.join(root, leaf), exist_ok=True)
+        wav = os.path.join(root, "prep", "alice.wav")
+        with wave.open(wav, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16000)
+            # Half silence, half a tone, so silencedetect has something to find.
+            quiet = b"\0\0" * int(16000 * seconds / 2)
+            loud = b"\x00\x40" * int(16000 * seconds / 2)
+            handle.writeframes(quiet + loud)
+        return root, wav
+
+    def _settings(self, **over):
+        values = cfg.defaults()
+        values.update(over)
+        return values
+
+    def test_the_level_scan_writes_a_json_and_a_log(self):
+        root, wav = self._work(2.0)
+        log, _ = self._log()
+        loud = pipeline.scan_levels(
+            root, "alice", wav, 2.0,
+            self._settings(SPLIT_SILENCE_THRESHOLD="-45dB",
+                           SPLIT_MIN_SILENCE="0.30"),
+            log, "ffmpeg")
+        self.assertIsNotNone(loud)
+        self.assertTrue(os.path.isfile(os.path.join(root, "asr", "alice.silence.log")))
+        written = json.load(open(os.path.join(root, "asr", "alice.loud.json")))
+        self.assertEqual(written["participant"], "alice")
+        # Records which threshold produced it, where the shell left it empty.
+        self.assertEqual(written["threshold"], "-45dB")
+        self.assertTrue(written["loud"])
+
+    def test_a_failed_scan_warns_and_yields_nothing(self):
+        root, _ = self._work()
+        log, buf = self._log()
+        loud = pipeline.scan_levels(
+            root, "alice", os.path.join(root, "prep", "absent.wav"), 1.0,
+            self._settings(), log, "ffmpeg")
+        self.assertIsNone(loud)
+        self.assertIn("could not scan alice", buf.getvalue())
+
+    def test_notes_reach_the_log_and_warnings_reach_the_console(self):
+        log, buf = self._log()
+        parsed = {
+            "words": [], "segments": [], "chunks": 4,
+            "recovery": {"spans": 2, "attempted": 2, "recovered_segments": 7,
+                         "recovered_spans": 1, "skipped": 3},
+            "collapsed": {"spans": 0},
+            "chunks_without_speech": 4,
+        }
+        pipeline.describe_transcript(parsed, self._settings(), log)
+        written = open(log.path, encoding="utf-8").read()
+        # The detail is a note: log only, as it was when bash read it off a pipe.
+        self.assertIn("recovered 7 word(s)", written)
+        self.assertNotIn("recovered 7 word(s)", buf.getvalue())
+        # The two "that many is not the occasional..." cases are warnings.
+        self.assertIn("left unasked", buf.getvalue())
+        self.assertIn("no speech at all", buf.getvalue())
+
+    def test_a_missing_prepared_track_is_refused_by_path(self):
+        root, _ = self._work()
+        os.remove(os.path.join(root, "prep", "alice.wav"))
+        with open(os.path.join(root, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump({"episode_id": "ep", "duration": 1.0, "sample_rate": 16000,
+                       "tracks": [{"participant": "alice", "duration": 1.0,
+                                   "sample_rate": 16000, "sample_fmt": "s16"}]},
+                      handle)
+        log, _ = self._log()
+        # Endpoint unreachable, so it stops before that — which is itself the
+        # first thing the stage checks.
+        settings = self._settings(WHISPER_ENDPOINT="http://127.0.0.1:1")
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_transcribe(root, settings, log, ready_timeout=0.1)
+        self.assertIn("not usable", str(caught.exception))
+
+
 class TestPipelinePlanStage(unittest.TestCase):
     """The plan stage as one call, taking its numbers from the settings."""
 

@@ -66,6 +66,36 @@ def tail_of_log(log, lines: int = TAIL_LINES) -> str:
         return ""
 
 
+def run_to_file(argv, log, destination: str, dry_run: bool = False) -> int:
+    """Run a command with its output captured to a file of its own.
+
+    For output that is voluminous and worth keeping separately — ffmpeg's
+    silencedetect scan is thousands of lines and stays in the work directory as
+    an artefact, rather than burying the run log.
+    """
+    log.raw("$ " + " ".join(shlex.quote(str(a)) for a in argv) + f" > {destination}")
+    if dry_run:
+        log.line(f"{log.c.dim}      would run:{log.c.reset} "
+                 + " ".join(shlex.quote(str(a)) for a in argv))
+        open(destination, "w").close()
+        return 0
+
+    with open(destination, "w", encoding="utf-8", errors="replace") as handle:
+        status = subprocess.run(
+            [str(a) for a in argv], stdout=handle, stderr=subprocess.STDOUT,
+            check=False,
+        ).returncode
+    if status != 0:
+        log.error(f"command failed (exit {status}): {argv[0]}")
+        try:
+            with open(destination, encoding="utf-8", errors="replace") as handle:
+                tail = "\n".join(handle.read().splitlines()[-25:])
+            log.line(f"{log.c.dim}{tail}{log.c.reset}")
+        except OSError:
+            pass
+    return status
+
+
 def ffmpeg_progress(log, total_us, label: str):
     """A line handler turning ffmpeg's -progress output into a counter.
 
