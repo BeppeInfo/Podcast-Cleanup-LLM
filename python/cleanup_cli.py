@@ -270,18 +270,6 @@ def cmd_loud_spans(args):
 # --- transcript ---------------------------------------------------------------
 
 
-def cmd_words(args):
-    parsed = tr.parse_whisper_json(args.whisper_json, args.participant)
-    _write_json(args.out, parsed)
-    note = ""
-    if parsed["approximated_segments"]:
-        note = (
-            f", {parsed['approximated_segments']} segments had unusable token "
-            "timings and were interpolated"
-        )
-    print(f"{len(parsed['words'])} words in {len(parsed['segments'])} segments{note}")
-
-
 # --- detection ----------------------------------------------------------------
 
 
@@ -755,11 +743,6 @@ def build_parser():
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_loud_spans)
 
-    p = sub.add_parser("words", help="whisper json -> words + segments")
-    p.add_argument("--whisper-json", required=True)
-    p.add_argument("--participant", required=True)
-    p.add_argument("--out", required=True)
-    p.set_defaults(func=cmd_words)
 
     p = sub.add_parser(
         "transcribe-remote", help="transcribe a track via a whisper-server endpoint"

@@ -7,10 +7,10 @@
 # later run can pick up where this one stopped. That is what makes --from and
 # --only work without special cases.
 #
-# Stage order is not arbitrary. Whisper and llama.cpp must never be resident at
-# the same time, so `transcribe` runs every track to completion and lets each
-# process exit before `detect` loads a model at all — and `detect` shuts its
-# server down before returning, so `render` gets the machine to itself.
+# Stage order still has one real constraint: `detect` reads the transcripts, so
+# `transcribe` must finish every track first. Keeping the two models out of each
+# other's way is no longer this script's problem — both are endpoints someone
+# else runs, and whether they share a machine is that machine's business.
 
 # --- episode state (populated by discover, or reloaded from meta.json) --------
 
@@ -27,9 +27,6 @@ declare -A TRACK_SOURCE=()
 declare -A TRACK_DURATION=()
 declare -A TRACK_SAMPLE_FMT=()
 declare -A TRACK_CODEC=()
-
-LLAMA_PID=""
-LLAMA_URL=""
 
 ALL_STAGES=(discover prepare transcribe detect plan render finalize)
 
@@ -349,98 +346,11 @@ write_loud_spans() {
 # transcribe — Whisper per track, all of it finished before any LLM work
 # ============================================================================
 
+# ============================================================================
+# transcribe — one request per track against a whisper-server
+# ============================================================================
+
 stage_transcribe() {
-    if [[ -n "$WHISPER_ENDPOINT" ]]; then
-        stage_transcribe_remote
-        return $?
-    fi
-
-    stage_begin transcribe "transcribing with Whisper (local)"
-    config_need_whisper
-
-    local -a markers=()
-    local participant marker prefix wav index=0
-    local total="${#PARTICIPANTS[@]}"
-
-    for participant in "${PARTICIPANTS[@]}"; do
-        index=$(( index + 1 ))
-        marker="$STAGE_DIR/asr-$participant.ok"
-        prefix="$WORK/asr/$participant"
-        wav="$WORK/prep/$participant.wav"
-        markers+=("$marker")
-
-        if [[ -s "$WORK/words/$participant.words.json" && -f "$marker" ]]; then
-            log_debug "$participant already transcribed"
-            continue
-        fi
-        rm -f "$marker"
-        [[ -s "$wav" || "$DRY_RUN" == 1 ]] || die "missing prepared track: $wav"
-
-        # Same cross-check as the remote path. whisper-cli reads the whole track
-        # in one go, so there are no boundaries to place here — this is purely so
-        # the plan stage has something to compare the transcript against.
-        [[ "$DRY_RUN" == 1 ]] || write_loud_spans "$participant" "$wav" \
-            "$WORK/asr/$participant.silence.log" "$WORK/asr/$participant.loud.json" \
-            || true
-
-        local -a whisper_args=(
-            -m "$WHISPER_MODEL" -f "$wav" -of "$prefix"
-            --output-json-full --print-progress -t "$WHISPER_THREADS"
-        )
-        [[ "$WHISPER_LANG" != "auto" ]] && whisper_args+=(-l "$WHISPER_LANG")
-        # Same conditioning as the remote path. The re-asking has no equivalent
-        # here: this branch hands the whole track to whisper-cli in one call and
-        # never sees a response it could question.
-        [[ -n "$WHISPER_PROMPT" ]] && whisper_args+=(--prompt "$WHISPER_PROMPT")
-        # Same Silero pass the remote path asks the server for. Without it this
-        # track's silence gets transcribed, and whatever Whisper invents there
-        # becomes speech in the plan.
-        if [[ "$WHISPER_VAD" == 1 ]]; then
-            whisper_args+=(
-                --vad -vm "$WHISPER_VAD_MODEL"
-                -vt "$WHISPER_VAD_THRESHOLD"
-                -vspd "$WHISPER_VAD_MIN_SPEECH_MS"
-                -vsd "$WHISPER_VAD_MIN_SILENCE_MS"
-                -vp "$WHISPER_VAD_SPEECH_PAD_MS"
-                -vo "$WHISPER_VAD_SAMPLES_OVERLAP"
-            )
-        fi
-        # Deliberately unquoted: this is a user-supplied argument string.
-        # shellcheck disable=SC2206
-        [[ -n "$WHISPER_EXTRA_ARGS" ]] && whisper_args+=($WHISPER_EXTRA_ARGS)
-
-        if (( WHISPER_JOBS <= 1 )); then
-            log_info "whisper: $participant ($index/$total)"
-            run_streaming parse_whisper_progress "$participant" \
-                "$WHISPER" "${whisper_args[@]}" \
-                || die "Whisper failed on $participant"
-            run py words --whisper-json "$prefix.json" \
-                --participant "$participant" \
-                --out "$WORK/words/$participant.words.json" \
-                || die "could not parse Whisper output for $participant"
-            touch "$marker"
-        else
-            pool_slot "$WHISPER_JOBS"
-            (
-                run "$WHISPER" "${whisper_args[@]}" \
-                    && run py words --whisper-json "$prefix.json" \
-                        --participant "$participant" \
-                        --out "$WORK/words/$participant.words.json" \
-                    && touch "$marker"
-            ) &
-        fi
-    done
-
-    # Nothing may proceed while a Whisper process still holds memory.
-    pool_wait "transcription" "${markers[@]}"
-    log_ok "all Whisper processes have exited; memory released"
-    state_mark transcribe
-    stage_end "${#PARTICIPANTS[@]} tracks transcribed"
-}
-
-# Transcription against a whisper-server someone else is running. No local
-# process, so nothing to serialise against the LLM stage on this machine.
-stage_transcribe_remote() {
     stage_begin transcribe "transcribing via $WHISPER_ENDPOINT"
     config_need_python
 
@@ -534,148 +444,6 @@ llm_schema_check_flag() {
     return 0
 }
 
-# The slot count LLAMA_EXTRA_ARGS pins, if it pins one. An explicit -np there is
-# the user being specific about their server, so it wins over LLM_CONCURRENCY
-# and we add no flag of our own.
-llm_explicit_slots() {
-    # shellcheck disable=SC2206
-    local -a extra=($LLAMA_EXTRA_ARGS)
-    local i
-    for (( i = 0; i < ${#extra[@]}; i++ )); do
-        case "${extra[i]}" in
-            -np|--parallel)     printf '%s' "${extra[i + 1]:-}"; return 0 ;;
-            -np=*|--parallel=*) printf '%s' "${extra[i]#*=}";    return 0 ;;
-        esac
-    done
-    return 0
-}
-
-# Unless llama-server is given --kv-unified, -c is the whole KV budget and each
-# slot gets -c / -np (rounded down to a multiple of 256). So raising the slot
-# count silently shrinks the window every chunk has to fit into, and a chunk
-# that no longer fits is refused, dropped, and reported only as a track that
-# found suspiciously few disfluencies.
-#
-# Roughly eight tokens per word — each one travels twice, in the flowing text
-# and again in the indexed listing — plus the ~570-token instruction prefix and
-# whatever is reserved for the reply, rounded up to the next 1024. That is the
-# arithmetic behind the sizing table in the README, and it reproduces it
-# exactly; if one moves, move the other.
-llm_context_warning() {
-    local slots="$1"
-    [[ "$slots" =~ ^[0-9]+$ ]] && (( slots > 0 )) || return 0
-
-    local per_slot=$(( LLAMA_CTX / slots ))
-    local needed=$(( LLM_CHUNK_WORDS * 8 + 570 + LLM_MAX_REPLY_TOKENS ))
-    needed=$(( (needed + 1023) / 1024 * 1024 ))
-    (( per_slot >= needed )) && return 0
-
-    log_warn "LLAMA_CTX=$LLAMA_CTX split over $slots slots leaves ~$per_slot tokens each, but a ${LLM_CHUNK_WORDS}-word window needs roughly $needed"
-    log_warn "raise LLAMA_CTX to $(( needed * slots )), lower LLM_CHUNK_WORDS, or add --kv-unified to LLAMA_EXTRA_ARGS — otherwise chunks are refused and those disfluencies survive"
-}
-
-llama_start() {
-    config_need_python
-
-    # An endpoint supplied by the user is still checked for life before we start
-    # sending it two hours of transcript.
-    if [[ -n "$LLAMA_ENDPOINT" ]]; then
-        LLAMA_URL="$LLAMA_ENDPOINT"
-        log_info "using the llama server already at $LLAMA_URL"
-        # Its slot count and context are its own business — nothing here can
-        # read them back, so the arithmetic llm_context_warning does for a
-        # server we start cannot be done for this one.
-        if (( LLM_CONCURRENCY > 1 )); then
-            log_info "sending $LLM_CONCURRENCY windows at a time; that server needs at least that many --parallel slots, each with room for a ${LLM_CHUNK_WORDS}-word window"
-        fi
-        [[ "$DRY_RUN" == 1 ]] && return 0
-        # Unquoted on purpose: the helper yields one flag or no argument at all.
-        # shellcheck disable=SC2046
-        PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
-            py llm-wait --endpoint "$LLAMA_URL" --timeout 30 \
-            --api "$LLM_API" --model-name "$LLAMA_MODEL_NAME" $(llm_schema_check_flag) \
-            || die "the configured llama endpoint at $LLAMA_URL is not usable"
-        log_ok "endpoint is responding"
-        return 0
-    fi
-
-    LLAMA_URL="http://${LLAMA_HOST}:${LLAMA_PORT}"
-    local server_log="$WORK/logs/llama-server.log"
-
-    # One slot per window we intend to have in flight, unless LLAMA_EXTRA_ARGS
-    # already says otherwise. Deriving it here is what keeps the two settings
-    # from drifting apart: a server with fewer slots than LLM_CONCURRENCY does
-    # not fail, it just queues the surplus internally and looks slow for no
-    # visible reason.
-    local -a parallel=()
-    local slots
-    slots=$(llm_explicit_slots)
-    if [[ -n "$slots" ]]; then
-        log_debug "LLAMA_EXTRA_ARGS pins the slot count at $slots; not deriving one"
-    elif (( LLM_CONCURRENCY > 1 )); then
-        slots="$LLM_CONCURRENCY"
-        parallel=(--parallel "$LLM_CONCURRENCY")
-    else
-        slots=1
-    fi
-    llm_context_warning "$slots"
-
-    log_info "starting llama-server on $LLAMA_URL ($(basename "$LLAMA_MODEL"))"
-    log_raw "\$ $LLAMA_SERVER -m $LLAMA_MODEL --host $LLAMA_HOST --port $LLAMA_PORT -c $LLAMA_CTX -ngl $LLAMA_NGL ${parallel[*]} $LLAMA_EXTRA_ARGS"
-
-    if [[ "$DRY_RUN" == 1 ]]; then
-        return 0
-    fi
-
-    # shellcheck disable=SC2206
-    local -a extra=()
-    [[ -n "$LLAMA_EXTRA_ARGS" ]] && extra=($LLAMA_EXTRA_ARGS)
-
-    "$LLAMA_SERVER" \
-        -m "$LLAMA_MODEL" \
-        --host "$LLAMA_HOST" \
-        --port "$LLAMA_PORT" \
-        -c "$LLAMA_CTX" \
-        -ngl "$LLAMA_NGL" \
-        "${parallel[@]}" \
-        "${extra[@]}" \
-        >"$server_log" 2>&1 &
-    LLAMA_PID=$!
-    log_debug "llama-server pid $LLAMA_PID, log $server_log"
-
-    # shellcheck disable=SC2046
-    if ! PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
-        py llm-wait --endpoint "$LLAMA_URL" --timeout "$LLAMA_STARTUP_TIMEOUT" \
-        --api "$LLM_API" --model-name "$LLAMA_MODEL_NAME" $(llm_schema_check_flag); then
-        log_error "llama-server never became ready; last lines of its log:"
-        [[ -f "$server_log" ]] && log_line "$(tail -n 20 "$server_log")"
-        llama_stop
-        die "giving up on the LLM stage"
-    fi
-    log_ok "model loaded and serving"
-}
-
-llama_stop() {
-    [[ -n "$LLAMA_PID" ]] || return 0
-    local pid="$LLAMA_PID"
-    LLAMA_PID=""
-    if kill -0 "$pid" 2>/dev/null; then
-        log_info "stopping llama-server (pid $pid) to free memory"
-        kill "$pid" 2>/dev/null || true
-        local waited=0
-        while kill -0 "$pid" 2>/dev/null && (( waited < 30 )); do
-            sleep 1
-            waited=$(( waited + 1 ))
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-            log_warn "llama-server ignored SIGTERM; sending SIGKILL"
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-        wait "$pid" 2>/dev/null || true
-        log_ok "llama-server stopped"
-    fi
-}
-
 stage_detect() {
     if [[ "$LLM_ENABLE" != 1 ]]; then
         stage_skip detect "LLM_ENABLE=0"
@@ -687,7 +455,15 @@ stage_detect() {
     config_need_llama
     state_done transcribe || log_warn "transcribe stage has not completed in this work dir"
 
-    llama_start
+    if [[ "$DRY_RUN" != 1 ]]; then
+        # Unquoted on purpose: either one flag or nothing at all.
+        # shellcheck disable=SC2046
+        PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
+            py llm-wait --endpoint "$LLAMA_ENDPOINT" --timeout 60 \
+            --api "$LLM_API" --model-name "$LLAMA_MODEL_NAME" \
+            $(llm_schema_check_flag) \
+            || die "the llama endpoint at $LLAMA_ENDPOINT is not usable"
+    fi
 
     local participant words target index=0
     local total="${#PARTICIPANTS[@]}"
@@ -715,7 +491,7 @@ stage_detect() {
         PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
             run_streaming parse_python_progress "$participant" \
             "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" detect \
-            --words "$words" --endpoint "$LLAMA_URL" --out "$target" \
+            --words "$words" --endpoint "$LLAMA_ENDPOINT" --out "$target" \
             --audit "$WORK/llm/$participant.audit.jsonl" \
             --chunk-words "$LLM_CHUNK_WORDS" --overlap "$LLM_CHUNK_OVERLAP" \
             --max-words "$LLM_MAX_EDIT_WORDS" --max-seconds "$LLM_MAX_EDIT_SECONDS" \
@@ -732,12 +508,10 @@ stage_detect() {
             # Exit 2 is a refused API key. Every remaining track would fail the
             # same way, and carrying on would deliver an episode that quietly
             # found no edits at all — so this one stops the run.
-            llama_stop
             die "the LLM endpoint refused our credentials. Fix the key, then resume with: $0 --episode $EPISODE_ID --from detect"
         elif (( rc == 3 )); then
             # Exit 3 is a server that will not constrain its output. Same
             # reasoning: every track would fail identically and silently.
-            llama_stop
             die "the LLM endpoint ignored the JSON schema. Try LLM_API=completion, then resume with: $0 --episode $EPISODE_ID --from detect"
         elif (( rc == 5 )); then
             # Exit 5 is a server that is up but has no model to serve. Same
@@ -746,7 +520,6 @@ stage_detect() {
             # model *during* the run — transcribe takes minutes, and nothing
             # reloads it with --no-models-autoload — so this is worth its own
             # message rather than one wasted track after another.
-            llama_stop
             die "the LLM endpoint has no model loaded${LLAMA_MODEL_NAME:+ for '$LLAMA_MODEL_NAME'}. Load it, then resume with: $0 --episode $EPISODE_ID --from detect"
         else
             # Exit 4 is every chunk of this track failing — the track was not
@@ -757,9 +530,6 @@ stage_detect() {
             log_warn "edit detection failed for $participant; that track keeps its disfluencies"
         fi
     done
-
-    # Free the model before anything else runs, whatever happened above.
-    llama_stop
 
     if (( failed == total )) && (( total > 0 )); then
         die "edit detection failed for every track"

@@ -1,8 +1,9 @@
 """Whisper output parsing.
 
-whisper-cli's ``--output-json-full`` gives per-segment token lists, each token
-carrying millisecond offsets. Words are reassembled from those tokens so that
-the LLM stage can address speech by word index rather than by timestamp.
+A whisper.cpp segment carries millisecond offsets and, on builds that emit them,
+a per-token list with offsets of its own. Words are reassembled from those
+tokens so that the LLM stage can address speech by word index rather than by
+timestamp. `asr.normalize_response` converts a server's reply into that shape.
 
 Token timings are not always usable — depending on build and flags the offsets
 can arrive all-zero or non-monotonic. When that happens the segment's words are
@@ -19,7 +20,6 @@ inventing one, and is the direction to err in.
 
 from __future__ import annotations
 
-import json
 import re
 
 from . import intervals
@@ -100,24 +100,12 @@ def _segment_words_by_proportion(segment) -> list[dict]:
     return words
 
 
-def parse_whisper_json(path: str, participant: str) -> dict:
-    """Read a whisper-cli JSON file into {participant, language, segments, words}."""
-    with open(path, encoding="utf-8") as handle:
-        data = json.load(handle)
-
-    return build_from_segments(
-        data.get("transcription") or [],
-        participant,
-        (data.get("result") or {}).get("language", ""),
-    )
-
-
 def build_from_segments(raw_segments, participant: str, language: str = "") -> dict:
     """Assemble words and segments from raw whisper segments.
 
-    Segments carry millisecond `offsets` and optionally a `tokens` list. This is
-    the shape whisper-cli writes; the remote client in `asr.py` converts a
-    server's response into it, so both paths reassemble words identically.
+    Segments carry millisecond `offsets` and optionally a `tokens` list — the
+    shape whisper.cpp uses, which `asr.normalize_response` converts a server's
+    reply into.
     """
     segments: list[dict] = []
     words: list[dict] = []

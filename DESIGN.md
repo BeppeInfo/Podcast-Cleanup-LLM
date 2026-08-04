@@ -21,8 +21,8 @@ synchronised: sample 0 of each is the same instant. Wanted, per episode:
 3. the tracks still separate, still in sync, ready for mixing;
 4. everything else — inputs and intermediates — gone at the end, logs kept.
 
-Constraint from the operator: Whisper and the LLM must never be resident in
-memory at the same time.
+Both models are reached over HTTP. Whether they fit in memory together is the
+business of whatever machine serves them; see §7 for what that gave up.
 
 ## 2. Shape of the solution
 
@@ -121,7 +121,7 @@ inputs/<episode>_<participant>.<ext>       any format ffmpeg can decode
    │               meta.json         durations replaced with measured ones
    │
    ├─ transcribe → words/<p>.words.json   words with timings, and segments
-   │                                      (local whisper-cli, or a server)
+   │                                      (one request per chunk, per track)
    │               asr/<p>.loud.json      the level scan: chunk boundaries, and
    │                                      the only opinion here that is not
    │                                      Whisper's (§8)
@@ -475,25 +475,45 @@ suspiciously little. `stage_detect` does that arithmetic before the episode and
 warns — but only for a server it starts itself, since a remote one's `-c` and
 `-np` cannot be read back.
 
-## 7. Model placement and memory
+## 7. Model placement
 
-Whisper and the LLM are configured independently. Empty `WHISPER_ENDPOINT` or
-`LLAMA_ENDPOINT` means local; a URL means an existing server is used as-is and no
-process is ever spawned or stopped. All four combinations are supported and the
-arrangement is printed at the start of every run.
+Both models are servers someone else runs. `WHISPER_ENDPOINT` and
+`LLAMA_ENDPOINT` are required — the second only when `LLM_ENABLE=1` — and
+nothing here starts, stops, waits on or otherwise manages a model process.
+Pointing them at `127.0.0.1` is how a single-machine install works; that is a
+deployment choice, and this side cannot tell the difference.
 
-The memory constraint is honoured structurally rather than by hoping:
+**There used to be a local mode**, and most of §7 used to be about defending it.
+`whisper-cli` was run per track and `llama-server` was started and stopped inside
+`stage_detect`, because the two must never hold memory at once on a machine that
+cannot fit both. That constraint drove real structure: `llama_stop` in the exit
+trap so a Ctrl-C could not leave a model resident, `pool_wait` proving every
+Whisper process had exited before `detect` began, `WHISPER_JOBS`, `LLAMA_NGL`,
+`LLAMA_CTX`, and a warning that computed whether `-c` divided by `--parallel`
+still left room for a chunk.
 
-- stages are strictly sequential;
-- `transcribe` waits for every Whisper process to exit — including background
-  ones when `WHISPER_JOBS > 1` — before returning, and logs that it has;
-- `llama_start` and `llama_stop` are both inside `stage_detect`, so the server's
-  lifetime is that stage and not the run. `llama_stop` also runs from the exit
-  trap, so a crash or Ctrl-C does not leave a model resident.
+All of it is gone. The reasoning: it was two ways to do one thing, and the
+second way is strictly more capable — a server on `127.0.0.1` does everything a
+subprocess did, and can be shared, restarted, swapped or moved to another
+machine without this script knowing. Keeping both meant every stage carrying a
+branch, fourteen settings existing only to construct command lines, and a
+process lifetime to get right on every failure path.
 
-This only covers processes the script manages. Two remote endpoints sharing a
-machine are that machine's problem, and the run warns rather than implying a
-guarantee it cannot make.
+**What was genuinely lost, and is worth stating plainly.** The memory constraint
+was previously enforced structurally, and now it is not enforced at all. If both
+servers share a machine that cannot hold both models, that machine will swap or
+OOM, and nothing here will prevent it or explain it. That was already true for
+anyone using two endpoints, which is why the old code warned about it; the
+change is that it is now the only mode. It is the right trade for this project —
+the models have lived on `choppaserver` for a while — but a single-machine user
+with tight RAM has to sequence the two servers themselves.
+
+The context-size check went the same way. It could compute `-c / --parallel`
+only because it was the thing passing those flags. Against a server it did not
+start, the arithmetic is unavailable, so the guidance moved into the config
+comment and the README sizing table. A chunk that does not fit is still refused
+silently and still shows up only as a track with suspiciously few edits — there
+is simply no longer anything positioned to warn first.
 
 ### Remote transcription
 
@@ -887,8 +907,9 @@ which of the two is wrong.
 
 - **Real Whisper and real llama.cpp.** Their output is neither cheap nor
   deterministic, and what needs testing is our handling of it, not their quality.
-  The consequence: the flags passed to `whisper-cli`, and llama-server's launch
-  arguments, are exercised by nothing. Those are the lines to re-read by hand.
+  The consequence: the request fields sent to each server — the `vad_*` form
+  values, `prompt`, `max_len` — are asserted against stubs that accept anything.
+  Those are the lines to re-read by hand.
 
   The sharper consequence is that **the stubs accept whatever the client sends**,
   because both sides were written here. A green suite proves the request has the
@@ -913,8 +934,8 @@ which of the two is wrong.
 - **Long-file behaviour.** Synthetic episodes are 10–30 s. Nothing here would
   catch a filter graph that is correct but unusably slow across two hours, or a
   memory problem that only appears at scale.
-- **Concurrency.** `FFMPEG_JOBS > 1` and `WHISPER_JOBS > 1` paths are not
-  exercised; the suites run serially.
+- **Concurrency.** The `FFMPEG_JOBS > 1` path is not exercised; the suites run
+  serially.
 
 ### What the first real run found
 
@@ -967,10 +988,11 @@ Cross-reference for [§9](#9-invariants):
 | 10. a whole-run fault aborts | `TestApiKeyAuth`, `TestAgainstStubServer` schema cases |
 | 11. concurrency changes speed only | `TestDetectConcurrency` (result and audit compared against a sequential run) |
 
-Invariant 6 is the gap worth remembering. It cannot be observed without loading
-two real models, so it is held structurally instead: `stage_transcribe` waits for
-every process to exit, and `llama_start`/`llama_stop` both live inside
-`stage_detect`. **Anyone touching either stage has to verify it by reading.**
+Invariant 6 no longer has a mechanism behind it. It described this script
+keeping two local models out of each other's way, and there are no local models
+any more — both are endpoints, and their memory is the serving machine's
+problem. It is recorded in §7 as something given up deliberately rather than
+quietly dropped.
 
 ### Adding a test
 
@@ -1044,7 +1066,7 @@ authority. The ones whose meaning is easy to get wrong:
 | `OUTPUT_CODEC`/`OUTPUT_EXT` | the output format, unrelated to what came in |
 | `RESAMPLE_TO` | empty means a rate mismatch is an error, not that nothing happens |
 | `WHISPER_VAD` | the only speech detection there is; off means silence gets transcribed and whatever is invented there becomes speech in the plan |
-| `WHISPER_VAD_MODEL` | local `whisper-cli` runs only — a server takes its own `-vm` at launch, which no request can override |
+| `WHISPER_ENDPOINT`/`LLAMA_ENDPOINT` | required, not optional; there is no local mode to fall back to, and `127.0.0.1` is how a one-machine install is spelled |
 | `SPEECH_PAD` | how far each word is widened before the union that makes the speech map; a gap needs `SILENCE_MIN_DURATION` **plus twice this** to be silence |
 | `SPLIT_SILENCE_THRESHOLD` | picks chunk boundaries, and sets how much loud-but-untranscribed audio gets reported; it never decides what is cut |
 | `WHISPER_RECOVER` | re-asks about stretches the first pass returned nothing for — the only thing that recovers a discarded decode window |
@@ -1062,5 +1084,5 @@ authority. The ones whose meaning is easy to get wrong:
 | `PODCAST_ROOT` | the whole layout; the four directory settings override it individually |
 | `LLM_API` | `chat` lets the server apply the model's template; `completion` is the raw-prompt fallback |
 | `LLM_CHECK_SCHEMA` | one request that turns a silent whole-run failure into an immediate one |
-| `LLM_CONCURRENCY` | throughput only; correct only when it matches the server's slot count, and `LLAMA_CTX` has to be split that many ways |
+| `LLM_CONCURRENCY` | throughput only; correct only when it matches the server's `--parallel`, whose `-c` is split that many ways unless it was given `--kv-unified` |
 | `*_API_KEY_FILE` | preferred over the inline form; the key never reaches argv or the log |

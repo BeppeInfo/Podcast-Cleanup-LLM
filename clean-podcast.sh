@@ -6,8 +6,8 @@
 # stretches are dead air and which are speech disfluencies, and renders the
 # tracks back out — still separate, still in sync, ready for mixing.
 #
-# The pipeline runs as ordered stages; see --list-stages. Whisper and llama.cpp
-# are never resident at the same time.
+# The pipeline runs as ordered stages; see --list-stages. Both models are
+# reached over HTTP; neither process is managed here.
 #
 # Usage: clean-podcast.sh [options] [TRACK...]
 #        clean-podcast.sh --help
@@ -70,16 +70,10 @@ Options:
   -j, --jobs N          parallel ffmpeg jobs
       --force           proceed even when the plan trips a safety limit
 
-  Where the models run. The two are independent, so any combination works:
-  local Whisper with a remote LLM, a remote Whisper with a local LLM, both
-  local, or both remote. An endpoint is used as-is and its process is never
-  managed here; without one, the local binary is run instead.
-      --whisper-endpoint URL    transcribe via a running whisper-server
-      --local-whisper           run whisper-cli locally, even if the config
-                                file names an endpoint
-      --llama-endpoint URL      detect via a running llama-server
-      --local-llama             start and stop llama-server here, even if the
-                                config file names an endpoint
+  Both models are servers someone else runs; nothing is started or stopped
+  here. Point these at 127.0.0.1 when they happen to be on this machine.
+      --whisper-endpoint URL    transcribe via this whisper-server
+      --llama-endpoint URL      detect via this llama-server
 
       --keep-inputs     do not delete the originals after a successful run
       --keep-work       do not delete the work directory
@@ -118,9 +112,7 @@ parse_args() {
             --no-whisper-vad) ARG_WHISPER_VAD=0; shift ;;
             --no-llm)      ARG_LLM_ENABLE=0; shift ;;
             --whisper-endpoint) ARG_WHISPER_ENDPOINT="${2:?--whisper-endpoint needs a URL}"; shift 2 ;;
-            --local-whisper)    ARG_LOCAL_WHISPER=1; shift ;;
             --llama-endpoint)   ARG_LLAMA_ENDPOINT="${2:?--llama-endpoint needs a URL}"; shift 2 ;;
-            --local-llama)      ARG_LOCAL_LLAMA=1; shift ;;
             -j|--jobs)     ARG_FFMPEG_JOBS="${2:?--jobs needs a number}"; shift 2 ;;
             --force)       FORCE=1; shift ;;
             --keep-inputs) ARG_KEEP_INPUTS=1; shift ;;
@@ -154,9 +146,6 @@ apply_overrides() {
     [[ -n "${ARG_LLM_ENABLE:-}" ]]      && LLM_ENABLE="$ARG_LLM_ENABLE"
     [[ -n "${ARG_WHISPER_ENDPOINT:-}" ]] && WHISPER_ENDPOINT="$ARG_WHISPER_ENDPOINT"
     [[ -n "${ARG_LLAMA_ENDPOINT:-}" ]]  && LLAMA_ENDPOINT="$ARG_LLAMA_ENDPOINT"
-    # These force local even when the config file names an endpoint.
-    [[ -n "${ARG_LOCAL_WHISPER:-}" ]]   && WHISPER_ENDPOINT=""
-    [[ -n "${ARG_LOCAL_LLAMA:-}" ]]     && LLAMA_ENDPOINT=""
     [[ -n "${ARG_FFMPEG_JOBS:-}" ]]     && FFMPEG_JOBS="$ARG_FFMPEG_JOBS"
     [[ -n "${ARG_KEEP_INPUTS:-}" ]]     && KEEP_INPUTS="$ARG_KEEP_INPUTS"
     [[ -n "${ARG_KEEP_WORK:-}" ]]       && KEEP_WORK="$ARG_KEEP_WORK"
@@ -205,9 +194,6 @@ on_exit() {
     local code=$?
     trap - EXIT
     progress_done
-
-    # Whatever went wrong, the model must not be left holding memory.
-    llama_stop || true
 
     if (( code == 0 )); then
         [[ -n "$EXIT_SUMMARY" ]] && log_line "$EXIT_SUMMARY"

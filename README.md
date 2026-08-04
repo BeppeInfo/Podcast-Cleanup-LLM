@@ -39,38 +39,29 @@ entirely, so the edit keeps its breathing room instead of sounding gasped.
 | --- | --- | --- |
 | ffmpeg + ffprobe | everything | the only hard dependency |
 | python3 | everything | standard library only |
-| whisper.cpp | the `transcribe` stage | `whisper-cli` locally, or a `whisper-server` endpoint |
-| llama.cpp | the `detect` stage | `llama-server` locally, or an endpoint |
+| a whisper-server | the `transcribe` stage | reached over HTTP; not started here |
+| a llama-server | the `detect` stage | reached over HTTP; not started here |
 | a Silero VAD model | the `transcribe` stage | `ggml-silero-*.bin`, run by whisper.cpp itself — no Python package |
 
 ## Where the models run
 
-Whisper and the LLM are configured independently, so all four combinations work:
+Both are servers you run yourself, reached over HTTP. `WHISPER_ENDPOINT` is
+required, and `LLAMA_ENDPOINT` too unless `LLM_ENABLE=0`. Nothing here starts,
+stops or waits on a model process, and every run prints the two URLs it is
+using. `--whisper-endpoint` and `--llama-endpoint` override them for one run.
 
-| | local Whisper | remote Whisper |
-| --- | --- | --- |
-| **local LLM** | both managed here | `--whisper-endpoint URL` |
-| **remote LLM** | `--llama-endpoint URL` | both endpoints |
+On one machine, point both at `127.0.0.1`. That is a deployment choice and this
+side cannot tell the difference — which also means **it will not keep the two
+models out of each other's memory.** Earlier versions ran both as subprocesses
+and sequenced them so peak usage was the larger model rather than the sum; that
+went away with the local mode. If both servers share a machine that cannot hold
+both, sequence them yourself.
 
-Local means the binary is run here and its lifetime is managed here. Remote means
-an endpoint is used as-is and no process is ever spawned or stopped. Config keys
-are `WHISPER_ENDPOINT` and `LLAMA_ENDPOINT` — empty for local; `--local-whisper`
-and `--local-llama` force local for one run when the config names an endpoint.
-Every run prints which arrangement it is using.
-
-**Memory.** When both are local they are **never resident at the same time**:
-every track is transcribed and each Whisper process exits before a model is
-loaded for detection, and the llama server is shut down before rendering begins,
-so peak memory is whichever single model is largest rather than their sum. That
-guarantee only covers processes this script manages — if both endpoints are
-remote and share a machine, keeping them out of each other's way is that
-machine's business, and the run says so.
-
-**One caveat on remote Whisper.** Word timings are only as good as what the
+**One caveat on word timings.** They are are only as good as what the
 server returns. A build honouring `max_len=1` returns one word per segment and
 the timings are exact; one that ignores it returns sentence segments, and word
 positions inside them are interpolated, which makes stutter cuts less tight. The
-run warns when that happens. Local `whisper-cli` always gives per-token timings.
+run warns when that happens.
 Audio is uploaded in chunks (`WHISPER_CHUNK_SECONDS`, default 120, 0 for one
 request), with boundaries nudged onto a quiet spot ffmpeg found so no chunk edge
 lands inside a word.
@@ -168,8 +159,7 @@ whisper-server \
 
   A build too old to parse those fields ignores them without complaint, and the
   symptom is a transcript with invented speech in it. `whisper-server --help |
-  grep -c vad` should report 8. For a local `whisper-cli` run the same values go
-  through `WHISPER_VAD_MODEL` and the `-vm/-vt/-vspd/-vsd/-vp/-vo` flags instead.
+  grep -c vad` should report 8.
 - **`-ml 1 -sow`** is the one that affects output quality. It makes every
   returned segment a single word, so word timings are exact rather than
   interpolated across a sentence, which is what decides how tightly a stutter
@@ -183,8 +173,8 @@ whisper-server \
   setting rather than raising a limit — `300` halves it. `0` sends a whole 2 h
   track as one ~230 MB request, which is rarely a good idea.
 - No `-cv/--convert` needed: the audio is already 16 kHz mono WAV.
-- Requests are sent one at a time, since a single model instance serialises them
-  anyway. `WHISPER_JOBS` applies only to the local path.
+- Requests are sent one at a time, since a single model instance serialises
+  them anyway.
 
 ### llama-server
 
@@ -228,9 +218,9 @@ llama-server \
   starts gets `--parallel` derived from `LLM_CONCURRENCY` automatically, and the
   detect stage checks the context arithmetic above before the episode starts.
 
-- **`LLAMA_CTX` in the config does nothing for a remote server** — it is only
-  passed to a server this script starts itself. The remote server's own `-c`
-  governs, and nothing checks that the two agree.
+- **The server's `-c` is the only context there is**, and nothing here checks it
+  against `LLM_CHUNK_WORDS`. A prompt that does not fit is truncated silently and
+  shows up only as a track with suspiciously few edits, so size it by hand.
 - **Any instruct model works**, not just the one in the example. Requests go to
   `/v1/chat/completions`, so llama-server applies the chat template of whatever
   model it has loaded — see "Choosing a model" below.
@@ -252,9 +242,9 @@ llama-server \
 
 ### Choosing a model
 
-Nothing here is tied to the models in the examples. Both are named only by
-`WHISPER_MODEL` and `LLAMA_MODEL`, which are paths — swap either, or upgrade to a
-new version of the same one, and the pipeline does not need to know.
+Nothing here is tied to the models in the examples. Which model each server has
+loaded is that server's business — swap either, or upgrade to a new version of
+the same one, and the pipeline does not need to know.
 
 **Whisper.** Any ggml model `whisper-cli` or `whisper-server` accepts. Bigger
 models transcribe better and are slower; what matters most downstream is word
@@ -413,8 +403,9 @@ clean-podcast.sh --dry-run                        # show the commands, touch not
 clean-podcast.sh --list-stages
 ```
 
-A note on `transcribe` and `detect`: their stage boundary is also the memory
-boundary when both models are local, so re-running only one of them is safe.
+A note on `transcribe` and `detect`: `detect` reads the transcripts `transcribe`
+wrote, so that boundary is a real dependency — but each stage's work is recorded
+per participant, so re-running either alone is safe.
 
 ## How the LLM stage is kept honest
 
@@ -549,11 +540,9 @@ and writes JSON and never touches audio.
   ~11 ms at 48 kHz). Smaller is more precise and fades more smoothly, but slower
   to render. It has to be the same for every track of an episode, which is why it
   is a config setting rather than a per-track choice.
-- `WHISPER_JOBS` stays at 1 unless there is RAM for several Whisper instances. It
-  never overlaps with the LLM stage either way.
 - `LLM_CONCURRENCY` is the one to reach for when the detect stage is the slow
   part and the machine running the model looks idle — one request at a time
   decodes at batch size 1 and cannot use the cores. Set it to the server's
-  `--parallel` slot count, and raise `LLAMA_CTX` by the same factor, since the
-  slots divide it. It changes speed only: the edits, the audit log and the
+  `--parallel` slot count, and raise the server's `-c` by the same factor, since
+  the slots divide it unless it was started with `--kv-unified`. It changes speed only: the edits, the audit log and the
   report come out identical to a sequential run.

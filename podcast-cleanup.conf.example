@@ -57,22 +57,18 @@ INPUT_EXTS="flac wav wave aiff aif m4a mp4 mka mkv mp3 ogg oga opus wv ape alac"
 
 # ------------------------------------------------------------------- whisper --
 
-# Leave WHISPER_ENDPOINT empty to run whisper-cli locally, once per track. Set
-# it to a running whisper-server and transcription is sent there instead, with
-# no local process managed.
-#
-# This is independent of how the LLM stage is served, so all four combinations
-# work: both local, both remote, local Whisper with a remote LLM, or a remote
-# Whisper with a local LLM. --whisper-endpoint / --local-whisper override this
-# per run, as --llama-endpoint / --local-llama do for the LLM.
+# Where transcription is sent. Required — there is no local Whisper any more, so
+# a run without it stops at the transcribe stage. Point it at 127.0.0.1 when the
+# server happens to be on this machine: it is still a server someone else runs,
+# and nothing here starts, stops or waits on that process.
 #
 # One caveat: word timings are only as good as what the server returns. A build
 # that honours max_len=1 returns one word per segment and the timings are exact;
 # one that ignores it returns sentence segments, and word positions inside them
 # are interpolated, which makes stutter cuts less tight. The run warns when that
-# happens. Local whisper-cli always gives per-token timings.
-WHISPER_ENDPOINT=""
-#WHISPER_ENDPOINT="http://gpu-box.lan:8080"
+# happens.
+WHISPER_ENDPOINT="http://127.0.0.1:8081"
+#WHISPER_ENDPOINT="http://gpu-box.lan:8081"
 WHISPER_ENDPOINT_PATH="/inference"
 
 # Sent as "Authorization: Bearer <key>". whisper.cpp's own server has no
@@ -107,18 +103,10 @@ WHISPER_API_KEY=""
 WHISPER_CHUNK_SECONDS="120"
 WHISPER_REQUEST_TIMEOUT="1800"
 
-# Used only when WHISPER_ENDPOINT is empty.
-WHISPER_BIN="/opt/whisper.cpp/bin/whisper-cli"
-WHISPER_MODEL="/srv/llm/models/whisper/ggml-large-v3-turbo.bin"
-WHISPER_THREADS="$(nproc)"
-
 # Language code, or "auto" to detect. Setting it explicitly is both faster and
 # more accurate than detection on a two-hour recording.
 WHISPER_LANG="auto"
 #WHISPER_LANG="pt"
-
-# Passed through verbatim, e.g. --prompt for domain vocabulary.
-WHISPER_EXTRA_ARGS=""
 
 # --------------------------------------------------- Whisper's Silero pass --
 
@@ -132,8 +120,8 @@ WHISPER_EXTRA_ARGS=""
 # over it becomes speech in the plan, because nothing else looks at the audio.
 WHISPER_VAD="1"
 
-# A remote whisper-server is given the Silero model at launch and cannot be told
-# per request, so this is for local whisper-cli runs only:
+# The server is given its Silero model at launch and cannot be told which one
+# per request, so start it with -vm:
 #
 #     whisper-server -m <model> --host 0.0.0.0 --port 8081 \
 #         -vm /srv/llm/models/whisper/ggml-silero-v6.2.0.bin
@@ -141,7 +129,6 @@ WHISPER_VAD="1"
 # Fetch one with whisper.cpp's models/download-vad-model.sh silero-v6.2.0. Every
 # other setting below travels with each request, so the same server serves runs
 # that want different values, and other clients of it are unaffected.
-WHISPER_VAD_MODEL="/srv/llm/models/whisper/ggml-silero-v6.2.0.bin"
 
 # Speech probability above which Silero calls a frame speech. whisper.cpp's own
 # default.
@@ -225,47 +212,28 @@ WHISPER_REASK_WORD_SECONDS="1.2"
 # nineteen seconds of the same audio did not; there is no gain in raising it.
 WHISPER_REASK_WINDOW="5.0"
 
-# Local Whisper never runs at the same time as a locally managed llama-server:
-# every track is transcribed and the process exits before the LLM stage begins.
-# Raise this only if there is RAM for several Whisper instances at once.
-WHISPER_JOBS="1"
-
 # ----------------------------------------------------------------- llama.cpp --
 
-# Leave LLAMA_ENDPOINT empty to have the script start llama-server itself for
-# the detection stage and shut it down immediately afterwards. Set it to an
-# existing server to use that instead — the script then never manages a process,
-# and keeping that server from competing with anything else for memory is the
-# other machine's business.
-LLAMA_ENDPOINT=""
-#LLAMA_ENDPOINT="http://127.0.0.1:8081"
+# Where edit detection is sent. Required unless LLM_ENABLE=0. As with Whisper,
+# this is a server someone else runs: keeping it from competing with anything
+# else for memory — including the whisper-server, if they share a machine — is
+# that machine's business, not this script's.
+LLAMA_ENDPOINT="http://127.0.0.1:8080"
 
-# Matches llama-server's own --api-key, and applies to a local server too if
-# LLAMA_EXTRA_ARGS starts one with that flag. Same advice as for the Whisper key
+# Matches llama-server's own --api-key. Same advice as for the Whisper key
 # above: prefer the _FILE form.
 LLAMA_API_KEY=""
 #LLAMA_API_KEY_FILE="/etc/podcast-cleanup/llama.key"
 
-LLAMA_SERVER_BIN="/opt/llama.cpp/bin/llama-server"
-LLAMA_MODEL="/srv/llm/models/qwen/Qwen3.6-35B-A3B.gguf"
-LLAMA_HOST="127.0.0.1"
-LLAMA_PORT="8081"
 
-# Context for a server this script starts. Ignored entirely when LLAMA_ENDPOINT
-# is set — a remote server's own -c governs, and nothing here checks the two
-# agree. At the default LLM_CHUNK_WORDS=350 a request is ~3.3k prompt tokens plus
-# 2048 reserved for the reply, so a slot needs about 6k. Note that llama-server
-# divides -c among --parallel slots: -c 8192 --parallel 4 leaves 2048 each and
-# truncates. Raising LLM_CONCURRENCY below therefore means raising this too —
-# the detect stage does the arithmetic and warns before an episode is wasted.
+# The server's own -c governs the context, and nothing here can check it agrees
+# with LLM_CHUNK_WORDS any more. Worth sizing by hand: at LLM_CHUNK_WORDS=350 a
+# request is ~3.3k prompt tokens plus whatever LLM_MAX_REPLY_TOKENS reserves, so
+# a slot needs about 6k. llama-server divides -c among its --parallel slots
+# unless given --kv-unified, so -c 8192 --parallel 4 leaves 2048 each and
+# truncates — silently, showing up only as a track with suspiciously few edits.
 # See "Running the servers" in the README.
-LLAMA_CTX="8192"
 
-# Layers offloaded to GPU (99 = all, 0 = CPU only).
-LLAMA_NGL="99"
-
-LLAMA_EXTRA_ARGS=""
-LLAMA_STARTUP_TIMEOUT="600"
 LLAMA_REQUEST_TIMEOUT="600"
 
 # Which llama.cpp endpoint the detection stage uses.

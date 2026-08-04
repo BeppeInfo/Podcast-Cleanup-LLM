@@ -39,10 +39,9 @@ config_defaults() {
     : "${TRACK_EXT:=}"
 
     # Whisper ---------------------------------------------------------------
-    # WHISPER_ENDPOINT: when set, transcription is sent to that whisper-server
-    # instead of running whisper-cli locally, and no local process is managed.
-    # Independent of how the LLM stage is served: local Whisper with a remote
-    # llama, or the reverse, are both fine.
+    # Where transcription is sent. Required — there is no local Whisper any
+    # more. Point it at 127.0.0.1 when the server runs on this machine; nothing
+    # here starts, stops or otherwise manages that process.
     : "${WHISPER_ENDPOINT:=}"
     : "${WHISPER_ENDPOINT_PATH:=/inference}"
     # Sent as "Authorization: Bearer <key>". whisper.cpp's own server has no
@@ -73,11 +72,7 @@ config_defaults() {
     : "${WHISPER_CHUNK_SECONDS:=120}"
     : "${WHISPER_REQUEST_TIMEOUT:=1800}"
 
-    : "${WHISPER_BIN:=/opt/whisper.cpp/bin/whisper-cli}"
-    : "${WHISPER_MODEL:=/srv/llm/models/whisper/ggml-large-v3-turbo.bin}"
-    : "${WHISPER_THREADS:=$(nproc 2>/dev/null || echo 4)}"
     : "${WHISPER_LANG:=auto}"
-    : "${WHISPER_EXTRA_ARGS:=}"
 
     # Whisper's own Silero pass ----------------------------------------------
     # This is the only speech detection in the pipeline. Whisper transcribes just
@@ -87,10 +82,9 @@ config_defaults() {
     # transcribed too, and whatever Whisper invents there becomes speech in the
     # plan, because nothing else looks at the audio.
     : "${WHISPER_VAD:=1}"
-    # The Silero model. A remote server takes it at launch (-vm) and cannot be
-    # told per request, so this is for local whisper-cli runs only; get one with
-    # whisper.cpp's models/download-vad-model.sh.
-    : "${WHISPER_VAD_MODEL:=/srv/llm/models/whisper/ggml-silero-v6.2.0.bin}"
+    # The server is given its Silero model at launch (-vm) and cannot be told
+    # which one per request. Everything below travels with each request, so one
+    # server serves runs that want different values.
     : "${WHISPER_VAD_THRESHOLD:=0.5}"
     : "${WHISPER_VAD_MIN_SPEECH_MS:=250}"
     # whisper.cpp defaults this to 100ms, which ends a speech segment at every
@@ -134,21 +128,13 @@ config_defaults() {
     : "${WHISPER_REASK_WINDOW:=5.0}"
 
     # llama.cpp -------------------------------------------------------------
-    # LLAMA_ENDPOINT: if set, an already-running server is used as-is and this
-    # script never spawns or stops one.
+    # Where edit detection is sent. Required unless LLM_ENABLE=0. As with
+    # Whisper, the server is someone else's process.
     : "${LLAMA_ENDPOINT:=}"
-    # Matches llama-server's own --api-key. Applies to a local server too, if
-    # LLAMA_EXTRA_ARGS starts one with --api-key.
+    # Matches llama-server's own --api-key. Set it when whatever fronts the
+    # endpoint expects one; whisper.cpp and llama.cpp have no auth themselves.
     : "${LLAMA_API_KEY:=}"
     : "${LLAMA_API_KEY_FILE:=}"
-    : "${LLAMA_SERVER_BIN:=/opt/llama.cpp/bin/llama-server}"
-    : "${LLAMA_MODEL:=/srv/llm/models/qwen/Qwen3.6-35B-A3B.gguf}"
-    : "${LLAMA_HOST:=127.0.0.1}"
-    : "${LLAMA_PORT:=8081}"
-    : "${LLAMA_CTX:=8192}"
-    : "${LLAMA_NGL:=99}"
-    : "${LLAMA_EXTRA_ARGS:=}"
-    : "${LLAMA_STARTUP_TIMEOUT:=600}"     # seconds to wait for /health
     : "${LLAMA_REQUEST_TIMEOUT:=600}"     # seconds per completion request
 
     # Which llama.cpp endpoint the detection stage talks to.
@@ -174,14 +160,17 @@ config_defaults() {
     # so this is pure throughput: at 1 the server decodes at batch size 1, which
     # is memory-bandwidth-bound and leaves most of a CPU idle.
     #
-    # It has to match the server's slot count. A server we start ourselves gets
-    # --parallel from this value; for LLAMA_ENDPOINT, set it to the -np the
-    # server was launched with. Going higher only queues requests inside the
-    # server, where this side cannot see them.
+    # It has to match the server's slot count: set it to the -np llama-server was
+    # launched with. Going higher only queues requests inside the server, where
+    # this side cannot see them.
     #
-    # Mind LLAMA_CTX with it: unless llama-server was given --kv-unified, -c is
-    # the total and each slot gets -c / -np. The detect stage checks that
-    # arithmetic against LLM_CHUNK_WORDS and warns before wasting an episode.
+    # Nothing here can check that any more, and the failure is quiet, so it is
+    # worth knowing: unless llama-server was given --kv-unified, its -c is the
+    # whole KV budget and each slot gets -c / -np. Raising -np shrinks the window
+    # every chunk must fit, and a chunk that no longer fits is refused, dropped,
+    # and shows up only as a track that found suspiciously few disfluencies.
+    # Roughly eight tokens per word, plus ~570 for the instructions and whatever
+    # the reply is allowed — the sizing table in the README does that arithmetic.
     : "${LLM_CONCURRENCY:=1}"
 
     # Chunk boundaries ------------------------------------------------------
@@ -260,7 +249,6 @@ config_defaults() {
     # Concurrency -----------------------------------------------------------
     # Whisper runs one track at a time by default: the model is large and must
     # not compete with itself for RAM/VRAM.
-    : "${WHISPER_JOBS:=1}"
     : "${FFMPEG_JOBS:=$(( $(nproc 2>/dev/null || echo 2) / 2 ))}"
     (( FFMPEG_JOBS < 1 )) && FFMPEG_JOBS=1
 
@@ -419,8 +407,8 @@ config_validate() {
              WHISPER_CHUNK_SECONDS WHISPER_REQUEST_TIMEOUT; do
         _require_number "$v"
     done
-    for v in LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP LLM_MAX_EDIT_WORDS WHISPER_JOBS \
-             FFMPEG_JOBS LLAMA_PORT LLAMA_CTX OUTPUT_COMPRESSION \
+    for v in LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP LLM_MAX_EDIT_WORDS \
+             FFMPEG_JOBS OUTPUT_COMPRESSION \
              LLM_CONCURRENCY RENDER_FRAME_SAMPLES WHISPER_VAD_MIN_SPEECH_MS \
              WHISPER_VAD_MIN_SILENCE_MS WHISPER_VAD_SPEECH_PAD_MS; do
         _require_int "$v"
@@ -460,9 +448,6 @@ config_validate() {
     (( LLM_CHUNK_OVERLAP < LLM_CHUNK_WORDS )) \
         || die "LLM_CHUNK_OVERLAP ($LLM_CHUNK_OVERLAP) must be smaller than LLM_CHUNK_WORDS ($LLM_CHUNK_WORDS)"
 
-    (( WHISPER_JOBS > 1 )) && log_warn \
-        "WHISPER_JOBS=$WHISPER_JOBS runs several Whisper instances at once; make sure the RAM is there"
-
     awk -v k="$SILENCE_KEEP" -v m="$SILENCE_MIN_DURATION" 'BEGIN{exit !(k < m)}' \
         || die "SILENCE_KEEP ($SILENCE_KEEP) must be smaller than SILENCE_MIN_DURATION ($SILENCE_MIN_DURATION)"
 
@@ -490,64 +475,19 @@ config_need_ffmpeg() {
 }
 
 config_need_whisper() {
-    if [[ -n "$WHISPER_ENDPOINT" ]]; then
-        log_debug "whisper: using remote endpoint $WHISPER_ENDPOINT"
-        return 0
-    fi
-    [[ -n "${WHISPER:-}" ]] && return 0
-    # A dry run is a preview, so a missing model is reported and stepped over
-    # rather than being the end of it. ffmpeg and python3 stay hard
-    # requirements — nothing can be previewed without them.
-    if ! WHISPER=$(require_bin whisper-cli "$WHISPER_BIN"); then
-        [[ "$DRY_RUN" == 1 ]] || exit 1
-        WHISPER="$WHISPER_BIN"
-        log_warn "dry run: carrying on without whisper-cli"
-    fi
-    if [[ ! -f "$WHISPER_MODEL" ]]; then
-        [[ "$DRY_RUN" == 1 ]] || die "Whisper model not found: $WHISPER_MODEL"
-        log_warn "dry run: no Whisper model at $WHISPER_MODEL"
-    fi
-    # The Silero model is whisper-cli's own argument, so it has to be here for a
-    # local run. A remote server was given one at launch instead, and nothing on
-    # this side can check that from here.
-    if [[ "$WHISPER_VAD" == 1 && ! -f "$WHISPER_VAD_MODEL" ]]; then
-        [[ "$DRY_RUN" == 1 ]] \
-            && log_warn "dry run: no Silero model at $WHISPER_VAD_MODEL" \
-            || die "WHISPER_VAD=1 needs the Silero model at WHISPER_VAD_MODEL ($WHISPER_VAD_MODEL). Fetch one with whisper.cpp's models/download-vad-model.sh silero-v6.2.0 — or set WHISPER_VAD=0, and accept that silence gets transcribed and whatever Whisper invents there becomes speech in the plan"
-    fi
-    log_debug "whisper: $WHISPER ($(basename "$WHISPER_MODEL"))"
+    [[ -n "$WHISPER_ENDPOINT" ]] \
+        || die "WHISPER_ENDPOINT is required: transcription is always sent to a whisper-server. Point it at one — http://127.0.0.1:8081 if it runs on this machine."
+    log_debug "whisper: $WHISPER_ENDPOINT"
 }
 
-# Which halves of the run this script is responsible for keeping out of memory's
-# way. Anything remote is the other machine's problem, and worth saying so.
 config_describe_models() {
-    local whisper_where llama_where
-    [[ -n "$WHISPER_ENDPOINT" ]] && whisper_where="remote" || whisper_where="local"
-    [[ -n "$LLAMA_ENDPOINT" ]] && llama_where="remote" || llama_where="local"
-    log_info "Whisper: $whisper_where${WHISPER_ENDPOINT:+ ($WHISPER_ENDPOINT)}   LLM: $llama_where${LLAMA_ENDPOINT:+ ($LLAMA_ENDPOINT)}"
-    if [[ "$whisper_where" == local && "$llama_where" == local ]]; then
-        log_debug "both models are local, so this run serialises them itself"
-    elif [[ "$whisper_where" == remote && "$llama_where" == remote ]]; then
-        log_warn "both models are remote: if they share a machine, keeping them from overlapping in memory is that machine's business, not this script's"
-    fi
+    log_info "Whisper: $WHISPER_ENDPOINT   LLM: $LLAMA_ENDPOINT"
 }
 
 config_need_llama() {
-    if [[ -n "$LLAMA_ENDPOINT" ]]; then
-        log_debug "llama: using external endpoint $LLAMA_ENDPOINT"
-        return 0
-    fi
-    [[ -n "${LLAMA_SERVER:-}" ]] && return 0
-    if ! LLAMA_SERVER=$(require_bin llama-server "$LLAMA_SERVER_BIN"); then
-        [[ "$DRY_RUN" == 1 ]] || exit 1
-        LLAMA_SERVER="$LLAMA_SERVER_BIN"
-        log_warn "dry run: carrying on without llama-server"
-    fi
-    if [[ ! -f "$LLAMA_MODEL" ]]; then
-        [[ "$DRY_RUN" == 1 ]] || die "llama model not found: $LLAMA_MODEL"
-        log_warn "dry run: no llama model at $LLAMA_MODEL"
-    fi
-    log_debug "llama: $LLAMA_SERVER ($(basename "$LLAMA_MODEL"))"
+    [[ -n "$LLAMA_ENDPOINT" ]] \
+        || die "LLAMA_ENDPOINT is required: edit detection is always sent to a llama-server. Point it at one, or set LLM_ENABLE=0 to do silence editing only."
+    log_debug "llama: $LLAMA_ENDPOINT"
 }
 
 config_need_python() {
@@ -577,14 +517,14 @@ config_dump() {
              OUTPUT_CODEC OUTPUT_EXT OUTPUT_EXTRA_ARGS RESAMPLE_TO \
              WHISPER_ENDPOINT WHISPER_ENDPOINT_PATH WHISPER_CHUNK_SECONDS \
              WHISPER_REQUEST_TIMEOUT \
-             WHISPER_BIN WHISPER_MODEL WHISPER_THREADS WHISPER_LANG WHISPER_JOBS \
-             WHISPER_VAD WHISPER_VAD_MODEL WHISPER_VAD_THRESHOLD \
+             WHISPER_LANG \
+             WHISPER_VAD WHISPER_VAD_THRESHOLD \
              WHISPER_VAD_MIN_SPEECH_MS WHISPER_VAD_MIN_SILENCE_MS \
              WHISPER_VAD_SPEECH_PAD_MS WHISPER_VAD_SAMPLES_OVERLAP \
              WHISPER_RECOVER WHISPER_PROMPT WHISPER_REASK \
              WHISPER_REASK_WORD_SECONDS WHISPER_REASK_WINDOW SPEECH_MAP_CLIP \
-             LLAMA_ENDPOINT LLAMA_SERVER_BIN LLAMA_MODEL LLAMA_HOST LLAMA_PORT \
-             LLAMA_CTX LLAMA_NGL LLAMA_MODEL_NAME LLM_API LLM_MAX_REPLY_TOKENS \
+             LLAMA_ENDPOINT \
+             LLAMA_MODEL_NAME LLM_API LLM_MAX_REPLY_TOKENS \
              LLM_CHECK_SCHEMA LLM_CONCURRENCY \
              SPLIT_SILENCE_THRESHOLD SPLIT_MIN_SILENCE SPEECH_PAD \
              SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \

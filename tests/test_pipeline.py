@@ -176,7 +176,9 @@ class TestTranscriptParsing(unittest.TestCase):
                 )
             ],
         }
-        parsed = tr.parse_whisper_json(self._write(payload), "alice")
+        parsed = tr.build_from_segments(
+            payload["transcription"], "alice", payload["result"]["language"]
+        )
         self.assertEqual([w["text"] for w in parsed["words"]], ["I", "I", "think", "so"])
         self.assertEqual([w["i"] for w in parsed["words"]], [0, 1, 2, 3])
         # Sub-word tokens fuse into one word spanning both.
@@ -197,7 +199,7 @@ class TestTranscriptParsing(unittest.TestCase):
                 )
             ]
         }
-        parsed = tr.parse_whisper_json(self._write(payload), "bob")
+        parsed = tr.build_from_segments(payload["transcription"], "bob")
         self.assertEqual(parsed["approximated_segments"], 1)
         self.assertEqual(len(parsed["words"]), 3)
         self.assertAlmostEqual(parsed["words"][0]["start"], 1.0)
@@ -949,8 +951,8 @@ class TestAgainstStubServer(unittest.TestCase):
         self.assertEqual(len(result["edits"]), 1)
         edit = result["edits"][0]
         # The model asked for both copies of "eu". Only the first is taken: the
-        # sentence still needs one, and it is the last. The trim is recorded on
-        # the edit so what the model actually asked for stays visible.
+        # sentence still needs one, and it is the last. The reply is recorded
+        # as it arrived, so the trim is visible rather than silent.
         self.assertEqual(edit["text"], "eu")
         self.assertEqual(edit["spared"], "eu")
         self.assertAlmostEqual(edit["start"], 0.0)
