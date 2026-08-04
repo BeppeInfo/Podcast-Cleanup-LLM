@@ -123,19 +123,17 @@ stage_discover() {
 
     # Exit 2 is an empty inbox rather than a fault; the caller turns it into
     # "nothing to do" and stops. Anything else has already explained itself.
-    # stderr to a file, not a process substitution: when the next thing this
-    # does is die, a substitution's output can be lost before it is read, and
-    # what is lost is the explanation of the failure.
-    local resolved rc=0 notes
-    notes=$(mktemp -t podcast-discover-XXXXXX)
-    resolved=$("$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}" \
-        2>"$notes") || rc=$?
-    discover_notes <"$notes"
-    rm -f "$notes"
+    # Python writes its own notes and refusals into the same run log, in the
+    # same format, so nothing here has to translate them. Exit 2 is an empty
+    # inbox rather than a fault; anything else has already explained itself.
+    local resolved rc=0
+    resolved=$(PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" \
+        PODCAST_LOG_STAGE=discover \
+        "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}") || rc=$?
     if (( rc == 2 )); then
         return 2
     elif (( rc != 0 )); then
-        die "could not inspect the input tracks"
+        exit 1
     fi
     eval "$resolved"
 
@@ -175,20 +173,6 @@ stage_discover() {
     state_mark discover
     stage_end "${#PARTICIPANTS[@]} tracks"
     return 0
-}
-
-# Python reports an empty inbox and its probe findings on stderr; both belong in
-# the log at the level the shell would have used.
-discover_notes() {
-    local line
-    while IFS= read -r line; do
-        case "$line" in
-            NOTHING_TO_DO*) log_warn "${line#NOTHING_TO_DO }" ;;
-            error:*)        log_error "${line#error: }" ;;
-            warning:*|WARN*) log_warn "${line#*: }" ;;
-            *)              log_info "$line" ;;
-        esac
-    done
 }
 
 # Re-establish the paths a resumed run needs without re-scanning the input dir.

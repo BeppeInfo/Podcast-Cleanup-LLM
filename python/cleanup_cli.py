@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cleanup import intervals as iv  # noqa: E402
 from cleanup import asr, config as cfg, discover, llm, plan as planner  # noqa: E402
-from cleanup import render, silence, transcript as tr  # noqa: E402
+from cleanup import render, runlog, silence, transcript as tr  # noqa: E402
 
 
 def _read_json(path):
@@ -323,16 +323,22 @@ def cmd_discover(args):
     """
     import shlex
 
+    # The same log the launcher is writing, so these lines land in order and in
+    # the same format. See cleanup/runlog.py.
+    log = runlog.Log.from_env()
     try:
         paths = (list(args.file) if args.file
                  else discover.find_tracks(args.input_dir, args.exts.split()))
         episode_id, tracks = discover.parse_tracks(
             paths, args.separator, args.episode)
     except discover.NothingToDo as exc:
-        print(f"NOTHING_TO_DO {exc}", file=sys.stderr)
+        # Not a failure: an empty inbox. Exit 2 tells the launcher to stop
+        # quietly rather than report a fault.
+        log.warn(f"{exc} — nothing to do")
         raise SystemExit(2) from None
     except discover.DiscoverError as exc:
-        _fail(str(exc))
+        log.error(str(exc))
+        raise SystemExit(1) from None
 
     where = discover.episode_paths(episode_id, args.work_root, args.output_dir)
     if not args.dry_run:
@@ -340,7 +346,9 @@ def cmd_discover(args):
         meta = build_meta(
             [f"{name}={path}" for name, path in sorted(tracks.items())],
             episode_id, args.ffprobe, args.resample_to,
-            say=lambda line: print(line, file=sys.stderr, flush=True),
+            say=lambda line: (log.warn(line.split(": ", 1)[-1])
+                              if line.startswith(("warning:", "note:"))
+                              else log.info(line)),
         )
         _write_json(os.path.join(where["work"], "meta.json"), meta)
 

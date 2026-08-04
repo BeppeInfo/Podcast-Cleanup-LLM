@@ -11,6 +11,7 @@ it gets checked rather than eyeballed.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -25,10 +26,13 @@ import wave
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
 from cleanup import intervals as iv
+from cleanup import runlog
 from cleanup import asr, config as cfg, discover, llm, plan as planner, render, silence, transcript as tr
 # The CLI itself, for the exit codes the shell branches on. Importing is safe:
 # it only runs main() under __main__.
 import cleanup_cli as cli
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # --- a tiny evaluator for the ffmpeg expression subset we generate ------------
@@ -1979,6 +1983,90 @@ class TestUntranscribedAudio(unittest.TestCase):
         # The scan starts 0.2s earlier and ends 0.2s later than the word.
         result = self._plan(words, {"a": [(9.8, 12.2)]})
         self.assertEqual(result["untranscribed_audio"], {})
+
+
+class TestRunLog(unittest.TestCase):
+    """The console format has to match lib/log.sh while both are in use."""
+
+    SCRIPT = """
+LOG_LEVEL=%s; LOG_FILE=""
+source lib/log.sh
+stage_total 3
+stage_begin prepare "decoding tracks to 16 kHz mono"
+log_debug "a detail"
+log_info "a note"
+log_ok "done a thing"
+log_warn "a warning"
+log_error "a failure"
+progress 1 2 host
+log_line ""
+log_line "  a header"
+log_report "first
+second"
+stage_end "2 tracks decoded"
+stage_skip detect "LLM_ENABLE=0"
+"""
+
+    def _python(self, level):
+        buf = io.StringIO()
+        log = runlog.Log(level=level, stream=buf, colour=False)
+        log.stage_total(3)
+        log.stage_begin("prepare", "decoding tracks to 16 kHz mono")
+        log.debug("a detail")
+        log.info("a note")
+        log.ok("done a thing")
+        log.warn("a warning")
+        log.error("a failure")
+        log.progress(1, 2, "host")
+        log.line("")
+        log.line("  a header")
+        log.report("first\nsecond")
+        log.stage_end("2 tracks decoded")
+        log.stage_skip("detect", "LLM_ENABLE=0")
+        return buf.getvalue()
+
+    def _bash(self, level):
+        result = subprocess.run(
+            ["bash", "-c", self.SCRIPT % level],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"}, check=True)
+        return result.stderr
+
+    def test_console_output_matches_the_shell_at_every_level(self):
+        for level in ("debug", "info", "warn", "error"):
+            with self.subTest(level=level):
+                self.assertEqual(self._python(level), self._bash(level))
+
+    def test_duration_formatting_matches_the_shell(self):
+        cases = [0, 5, 59, 60, 61, 599, 3599, 3600, 3661, 86399]
+        script = "source lib/log.sh\n" + "\n".join(
+            f'fmt_duration {n}; echo' for n in cases)
+        out = subprocess.run(["bash", "-c", script], capture_output=True,
+                             text=True, cwd=REPO_ROOT, check=True).stdout.split()
+        self.assertEqual([runlog.fmt_duration(n) for n in cases], out)
+
+    def test_the_log_file_carries_level_and_stage(self):
+        path = os.path.join(tempfile.mkdtemp(), "run.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        log = runlog.Log(path=path, stream=io.StringIO(), colour=False)
+        log.stage_name = "discover"
+        log.warn("two episodes at once")
+        written = open(path, encoding="utf-8").read()
+        self.assertIn("[warn] (discover) two episodes at once", written)
+
+    def test_from_env_adopts_the_launchers_log(self):
+        path = os.path.join(tempfile.mkdtemp(), "run.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        log = runlog.Log.from_env(
+            environ={"PODCAST_LOG_FILE": path, "LOG_LEVEL": "warn",
+                     "PODCAST_LOG_STAGE": "prepare"},
+            stream=io.StringIO())
+        self.assertEqual(log.level, "warn")
+        self.assertEqual(log.stage_name, "prepare")
+        self.assertFalse(log.enabled("info"))
+
+    def test_no_path_is_a_no_op_not_a_crash(self):
+        runlog.Log(stream=io.StringIO(), colour=False).warn("nowhere to write")
 
 
 class TestDiscover(unittest.TestCase):
