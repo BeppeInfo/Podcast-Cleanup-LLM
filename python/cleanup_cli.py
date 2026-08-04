@@ -692,6 +692,17 @@ def cmd_stage_plan(args):
         raise SystemExit(1) from None
 
 
+def cmd_stage_prepare(args):
+    """The prepare stage: decode every track, then measure what came out."""
+    log = runlog.Log.from_env()
+    settings = cfg.from_environment()
+    try:
+        pipeline.stage_prepare(args.work, settings, log, ffmpeg=args.ffmpeg)
+    except pipeline.StageError as exc:
+        log.error(str(exc))
+        raise SystemExit(1) from None
+
+
 # --- filters ------------------------------------------------------------------
 
 
@@ -934,6 +945,11 @@ def build_parser():
     p.add_argument("--resample-to", default="")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_discover)
+
+    p = sub.add_parser("stage-prepare", help="run the prepare stage")
+    p.add_argument("--work", required=True)
+    p.add_argument("--ffmpeg", default="ffmpeg")
+    p.set_defaults(func=cmd_stage_prepare)
 
     p = sub.add_parser("stage-plan", help="run the plan stage")
     p.add_argument("--work", required=True, help="the episode work directory")

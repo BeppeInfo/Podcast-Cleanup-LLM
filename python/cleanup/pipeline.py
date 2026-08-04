@@ -12,13 +12,14 @@ decide whether the run continues — that belongs to whatever is sequencing them
 
 from __future__ import annotations
 
+import concurrent.futures
 import glob
 import json
 import os
 
 from . import intervals as iv
 from . import plan as planner
-from . import render, transcript as tr
+from . import proc, render, silence, transcript as tr
 
 
 class StageError(Exception):
@@ -81,6 +82,107 @@ def build_speech_map(participants, words, durations, loud, pad, clip, log):
                 + ", ".join(f"{name} {amount}s" for name, amount in sorted(busy.items()))
                 + "; the speech map is the overlap with the level scan")
     return speech
+
+
+def refresh_durations(work: str, log) -> dict:
+    """Replace container durations with the length of the decoded audio.
+
+    A container's header is not always right: AAC decodes longer than it claims,
+    Opus shorter, and a truncated file of any format can claim anything. The
+    prepare stage has just decoded every track, so its output is the authority —
+    and the frame-exact render prediction is only exact if this is.
+    """
+    path = os.path.join(work, "meta.json")
+    meta = read_json(path)
+    changes = []
+    for track in meta["tracks"]:
+        prepared = os.path.join(work, "prep", f"{track['participant']}.wav")
+        if not os.path.isfile(prepared):
+            raise StageError(f"prepared track missing, cannot measure: {prepared}")
+        measured = round(silence.wav_duration(prepared), 4)
+        before = track["duration"]
+        track["duration"] = measured
+        if abs(measured - before) > 0.002:
+            changes.append((track["participant"], before, measured))
+
+    meta["duration"] = max(t["duration"] for t in meta["tracks"])
+    durations = [t["duration"] for t in meta["tracks"]]
+    meta["duration_spread"] = round(max(durations) - min(durations), 3)
+    meta["durations_measured"] = True
+    render.write_json(path, meta)
+
+    log.report(
+        f"measured length of {len(meta['tracks'])} tracks: {meta['duration']:.3f}s")
+    for participant, before, after in changes:
+        log.report(f"  {participant}: container said {before:.3f}s, decodes to "
+                   f"{after:.3f}s ({(after - before) * 1000:+.0f} ms)")
+    return meta
+
+
+def decode_command(ffmpeg: str, source: str, target: str):
+    """16 kHz mono PCM — the one format Whisper and Silero both want."""
+    return [
+        ffmpeg, "-nostdin", "-y", "-v", "warning", "-progress", "pipe:1",
+        "-nostats", "-i", source,
+        "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+        "-f", "wav", target,
+    ]
+
+
+def stage_prepare(work: str, settings, log, ffmpeg: str = "ffmpeg") -> None:
+    """Decode every track to what the transcriber wants, then measure it.
+
+    Already-decoded tracks are skipped on their marker, which is what lets a
+    resumed run pick up mid-episode.
+    """
+    meta = read_json(os.path.join(work, "meta.json"))
+    state = os.path.join(work, "state")
+    jobs = max(1, int(settings["FFMPEG_JOBS"]))
+
+    pending = []
+    for track in meta["tracks"]:
+        participant = track["participant"]
+        target = os.path.join(work, "prep", f"{participant}.wav")
+        marker = os.path.join(state, f"prep-{participant}.ok")
+        done = (os.path.isfile(marker) and os.path.isfile(target)
+                and os.path.getsize(target) > 0)
+        if done:
+            log.debug(f"{participant} already prepared")
+            continue
+        if os.path.exists(marker):
+            os.remove(marker)
+        pending.append((participant, track, target, marker))
+
+    def decode(item) -> tuple[str, int]:
+        participant, track, target, marker = item
+        argv = decode_command(ffmpeg, track["source"], target)
+        # Live progress only when one job owns the console; concurrent writers
+        # on one in-place counter garble each other.
+        on_line = None
+        if jobs <= 1:
+            on_line = proc.ffmpeg_progress(
+                log, float(track["duration"]) * 1_000_000, f"decoding {participant}")
+        status = proc.run(argv, log, on_line=on_line)
+        if status == 0:
+            open(marker, "w").close()
+            log.ok(f"decoded {participant}")
+        return participant, status
+
+    if jobs <= 1 or len(pending) <= 1:
+        results = [decode(item) for item in pending]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            results = list(pool.map(decode, pending))
+
+    failed = [name for name, status in results if status != 0]
+    if failed:
+        raise StageError(f"decoding failed for: {', '.join(sorted(failed))}")
+
+    # Unconditionally, even when everything was already decoded: `discover`
+    # rewrites meta.json with container durations and clears durations_measured,
+    # so a run resumed at this stage would otherwise carry those forward into a
+    # render prediction that is supposed to be frame-exact.
+    refresh_durations(work, log)
 
 
 def stage_plan(work: str, settings, log, force: bool = False) -> dict:

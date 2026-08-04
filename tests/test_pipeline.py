@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from cleanup import intervals as iv
 from cleanup import runlog
-from cleanup import asr, config as cfg, discover, llm, pipeline  # noqa: E501
+from cleanup import asr, config as cfg, discover, llm, pipeline, proc  # noqa: E501
 from cleanup import plan as planner, render, silence, transcript as tr
 # The CLI itself, for the exit codes the shell branches on. Importing is safe:
 # it only runs main() under __main__.
@@ -1986,6 +1986,59 @@ class TestUntranscribedAudio(unittest.TestCase):
         self.assertEqual(result["untranscribed_audio"], {})
 
 
+class TestProc(unittest.TestCase):
+    """Running a command: what reaches the log, and what reaches the console."""
+
+    def _log(self):
+        path = os.path.join(tempfile.mkdtemp(), "run.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        buf = io.StringIO()
+        return runlog.Log(path=path, stream=buf, colour=False), buf
+
+    def test_output_goes_to_the_log_not_the_console(self):
+        log, buf = self._log()
+        status = proc.run(["sh", "-c", "echo chatty; echo more"], log)
+        self.assertEqual(status, 0)
+        written = open(log.path, encoding="utf-8").read()
+        self.assertIn("chatty", written)
+        self.assertIn("more", written)
+        # Nothing interesting happened, so the console stays quiet.
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_a_failure_reports_and_shows_the_tail(self):
+        log, buf = self._log()
+        status = proc.run(["sh", "-c", "echo boom >&2; exit 3"], log)
+        self.assertEqual(status, 3)
+        self.assertIn("command failed (exit 3)", buf.getvalue())
+        self.assertIn("boom", buf.getvalue())
+
+    def test_the_command_itself_is_logged_quoted(self):
+        log, _ = self._log()
+        proc.run(["sh", "-c", "true", "arg with spaces"], log)
+        self.assertIn("'arg with spaces'", open(log.path, encoding="utf-8").read())
+
+    def test_dry_run_says_what_it_would_do_and_runs_nothing(self):
+        log, buf = self._log()
+        target = os.path.join(os.path.dirname(log.path), "must-not-exist")
+        status = proc.run(["touch", target], log, dry_run=True)
+        self.assertEqual(status, 0)
+        self.assertFalse(os.path.exists(target))
+        self.assertIn("would run", buf.getvalue())
+
+    def test_ffmpeg_progress_reads_microseconds(self):
+        log, buf = self._log()
+        on_line = proc.ffmpeg_progress(log, 10_000_000, "decoding alice")
+        on_line("frame=1")                 # not a progress line
+        on_line("out_time_ms=5000000")     # halfway, in microseconds
+        on_line("out_time_ms=garbage")     # survives nonsense
+        self.assertIn("(500/1000) decoding alice", buf.getvalue())
+
+    def test_no_total_means_no_counter(self):
+        log, buf = self._log()
+        proc.ffmpeg_progress(log, 0, "x")("out_time_ms=5000000")
+        self.assertEqual(buf.getvalue(), "")
+
+
 class TestPipelinePlanStage(unittest.TestCase):
     """The plan stage as one call, taking its numbers from the settings."""
 
@@ -2074,6 +2127,98 @@ class TestPipelinePlanStage(unittest.TestCase):
             ["a"], words, {"a": 30.0}, {"a": [[1.0, 1.5]]},
             pad=0.25, clip=True, log=log)
         self.assertIn("word timings ran past the audio", buf.getvalue())
+
+
+class TestPipelinePrepareStage(unittest.TestCase):
+    """Decoding, skipping what is done, and always re-measuring."""
+
+    def _episode(self, sources):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for leaf in ("prep", "state", "asr", "words", "llm", "render"):
+            os.makedirs(os.path.join(root, leaf), exist_ok=True)
+        tracks = []
+        for participant, seconds in sources.items():
+            path = os.path.join(root, f"{participant}.wav")
+            with wave.open(path, "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(48000)
+                handle.writeframes(b"\0\0" * int(48000 * seconds))
+            tracks.append({
+                "participant": participant, "source": path,
+                # Deliberately wrong: the point of the measure step.
+                "duration": seconds + 5.0,
+                "sample_rate": 48000, "render_rate": 48000,
+                "sample_fmt": "s16", "lossless": True,
+            })
+        meta = {"episode_id": "ep", "duration": max(sources.values()) + 5.0,
+                "sample_rate": 48000, "durations_measured": False,
+                "tracks": tracks}
+        with open(os.path.join(root, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle)
+        return root
+
+    def _log(self):
+        buf = io.StringIO()
+        return runlog.Log(stream=buf, colour=False), buf
+
+    def _settings(self, **over):
+        values = cfg.defaults()
+        values.update(over)
+        return values
+
+    def test_decodes_and_replaces_the_container_duration(self):
+        root = self._episode({"alice": 1.0})
+        log, buf = self._log()
+        pipeline.stage_prepare(root, self._settings(FFMPEG_JOBS="1"), log)
+        self.assertTrue(os.path.isfile(os.path.join(root, "prep", "alice.wav")))
+        self.assertTrue(os.path.isfile(os.path.join(root, "state", "prep-alice.ok")))
+        meta = json.load(open(os.path.join(root, "meta.json")))
+        self.assertTrue(meta["durations_measured"])
+        # 1.0s of audio, not the 6.0s the fixture claimed.
+        self.assertAlmostEqual(meta["tracks"][0]["duration"], 1.0, places=2)
+        self.assertIn("container said", buf.getvalue())
+
+    def test_an_already_decoded_track_is_skipped_but_still_measured(self):
+        root = self._episode({"alice": 1.0})
+        log, _ = self._log()
+        pipeline.stage_prepare(root, self._settings(FFMPEG_JOBS="1"), log)
+
+        # Reset the durations the way `discover` would, then resume.
+        meta = json.load(open(os.path.join(root, "meta.json")))
+        meta["tracks"][0]["duration"] = 99.0
+        meta["durations_measured"] = False
+        with open(os.path.join(root, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle)
+
+        # "already prepared" is a debug line, as it was in the shell.
+        buf = io.StringIO()
+        log = runlog.Log(level="debug", stream=buf, colour=False)
+        pipeline.stage_prepare(root, self._settings(FFMPEG_JOBS="1"), log)
+        self.assertIn("already prepared", buf.getvalue())
+        again = json.load(open(os.path.join(root, "meta.json")))
+        self.assertAlmostEqual(again["tracks"][0]["duration"], 1.0, places=2)
+
+    def test_several_tracks_decode_in_parallel(self):
+        root = self._episode({"alice": 0.5, "bob": 0.5, "carol": 0.5})
+        log, buf = self._log()
+        pipeline.stage_prepare(root, self._settings(FFMPEG_JOBS="3"), log)
+        for name in ("alice", "bob", "carol"):
+            self.assertTrue(
+                os.path.isfile(os.path.join(root, "prep", f"{name}.wav")), name)
+            self.assertIn(f"decoded {name}", buf.getvalue())
+
+    def test_a_decode_failure_names_the_track(self):
+        root = self._episode({"alice": 0.5})
+        meta = json.load(open(os.path.join(root, "meta.json")))
+        meta["tracks"][0]["source"] = os.path.join(root, "nothing-here.wav")
+        with open(os.path.join(root, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle)
+        log, _ = self._log()
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_prepare(root, self._settings(FFMPEG_JOBS="1"), log)
+        self.assertIn("alice", str(caught.exception))
 
 
 class TestRunLog(unittest.TestCase):

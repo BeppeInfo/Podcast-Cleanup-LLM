@@ -180,61 +180,20 @@ stage_prepare() {
     stage_begin prepare "decoding tracks to 16 kHz mono"
     config_need_ffmpeg
 
-    local -a markers=()
-    local participant target marker
-
-    for participant in "${PARTICIPANTS[@]}"; do
-        target="$WORK/prep/$participant.wav"
-        marker="$STAGE_DIR/prep-$participant.ok"
-        markers+=("$marker")
-
-        if [[ -s "$target" && -f "$marker" ]]; then
-            log_debug "$participant already prepared"
-            continue
-        fi
-        rm -f "$marker"
-
-        local -a decode_cmd=(
-            "$FFMPEG" -nostdin -y -v warning -progress pipe:1 -nostats
-            -i "${TRACK_SOURCE[$participant]}"
-            -map 0:a:0 -ac 1 -ar 16000 -c:a pcm_s16le
-            -f wav "$target"
-        )
-
-        # Live progress only makes sense when one job owns the console; several
-        # concurrent writers would just garble each other's counter.
-        if (( FFMPEG_JOBS <= 1 )); then
-            FFMPEG_TOTAL_US=$(track_total_us "$participant") \
-                run_streaming parse_ffmpeg_progress "decoding $participant" \
-                "${decode_cmd[@]}" || die "could not decode $participant"
-            state_touch "$marker"
-        else
-            pool_slot "$FFMPEG_JOBS"
-            (
-                run "${decode_cmd[@]}" \
-                    && state_touch "$marker" \
-                    && log_ok "decoded $participant"
-            ) &
-        fi
-    done
-
-    pool_wait "decoding" "${markers[@]}"
-
-    # Now that every track has actually been decoded, take its length from the
-    # decoded audio rather than from a container header that may be wrong — an
-    # AAC file decodes longer than it claims, an Opus one shorter, and a
-    # truncated file of any format can claim anything. The frame-exact render
-    # prediction is only exact if this is right.
-    if [[ "$DRY_RUN" != 1 ]]; then
-        local measure_report
-        if ! measure_report=$(py meta-refresh --meta "$WORK/meta.json" \
-            --prep-dir "$WORK/prep" 2>&1); then
-            log_line "$measure_report"
-            die "could not measure the decoded track lengths"
-        fi
-        log_report "$measure_report"
-        load_meta
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log_info "would decode ${#PARTICIPANTS[@]} tracks into $WORK/prep"
+        stage_end "dry run"
+        return 0
     fi
+
+    PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" PODCAST_LOG_STAGE=prepare \
+        "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" stage-prepare \
+        --work "$WORK" --ffmpeg "$FFMPEG" \
+        || exit 1
+
+    # Durations were replaced with the measured ones, so the shell's copy is out
+    # of date.
+    load_meta
 
     state_mark prepare
     stage_end "${#PARTICIPANTS[@]} tracks decoded"
