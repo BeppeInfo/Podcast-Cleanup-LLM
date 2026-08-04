@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,7 @@ import wave
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
 from cleanup import intervals as iv
-from cleanup import asr, config as cfg, llm, plan as planner, render, silence, transcript as tr
+from cleanup import asr, config as cfg, discover, llm, plan as planner, render, silence, transcript as tr
 # The CLI itself, for the exit codes the shell branches on. Importing is safe:
 # it only runs main() under __main__.
 import cleanup_cli as cli
@@ -1978,6 +1979,82 @@ class TestUntranscribedAudio(unittest.TestCase):
         # The scan starts 0.2s earlier and ends 0.2s later than the word.
         result = self._plan(words, {"a": [(9.8, 12.2)]})
         self.assertEqual(result["untranscribed_audio"], {})
+
+
+class TestDiscover(unittest.TestCase):
+    """Which files are one episode, and what the refusals say."""
+
+    def _dir(self, *names):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for name in names:
+            open(os.path.join(root, name), "w").close()
+        return root
+
+    def test_finds_by_extension_case_insensitively(self):
+        root = self._dir("ep1_a.flac", "ep1_b.FLAC", "notes.txt", "ep1_c.wav")
+        found = discover.find_tracks(root, ["flac"])
+        self.assertEqual([os.path.basename(p) for p in found],
+                         ["ep1_a.flac", "ep1_b.FLAC"])
+
+    def test_an_empty_inbox_is_not_a_failure(self):
+        with self.assertRaises(discover.NothingToDo):
+            discover.find_tracks(self._dir("notes.txt"), ["flac"])
+        with self.assertRaises(discover.NothingToDo):
+            discover.find_tracks("/nowhere/at/all", ["flac"])
+
+    def test_splits_on_the_first_separator(self):
+        episode, tracks = discover.parse_tracks(
+            ["/in/ep_1_bob.flac"], "_")
+        self.assertEqual(episode, "ep")
+        self.assertEqual(list(tracks), ["1_bob"])
+
+    def test_two_episodes_at_once_is_refused_by_name(self):
+        with self.assertRaises(discover.DiscoverError) as caught:
+            discover.parse_tracks(["/in/ep1_a.flac", "/in/ep2_b.flac"], "_")
+        self.assertIn("ep1", str(caught.exception))
+        self.assertIn("ep2", str(caught.exception))
+
+    def test_episode_override_unifies_them(self):
+        episode, tracks = discover.parse_tracks(
+            ["/in/ep1_a.flac", "/in/ep2_b.flac"], "_", episode_override="only")
+        self.assertEqual(episode, "only")
+        self.assertEqual(sorted(tracks), ["a", "b"])
+
+    def test_the_same_participant_twice_names_both_files(self):
+        with self.assertRaises(discover.DiscoverError) as caught:
+            discover.parse_tracks(["/in/ep1_a.flac", "/in/ep1_a.wav"], "_")
+        message = str(caught.exception)
+        self.assertIn("ep1_a.flac", message)
+        self.assertIn("ep1_a.wav", message)
+        self.assertIn("INPUT_EXTS", message)
+
+    def test_a_name_without_the_separator_says_the_shape_wanted(self):
+        with self.assertRaises(discover.DiscoverError) as caught:
+            discover.parse_tracks(["/in/justaname.flac"], "_")
+        self.assertIn("<episode>_<participant>", str(caught.exception))
+
+    def test_empty_halves_are_refused(self):
+        for name in ("_bob.flac", "ep1_.flac"):
+            with self.subTest(name=name):
+                with self.assertRaises(discover.DiscoverError):
+                    discover.parse_tracks([f"/in/{name}"], "_")
+
+    def test_a_dash_separator_works_too(self):
+        episode, tracks = discover.parse_tracks(
+            ["/in/sample-host.flac", "/in/sample-guest.flac"], "-")
+        self.assertEqual(episode, "sample")
+        self.assertEqual(sorted(tracks), ["guest", "host"])
+
+    def test_episode_paths_and_tree(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        where = discover.episode_paths(
+            "ep1", os.path.join(root, "work"), os.path.join(root, "out"))
+        discover.make_work_tree(where)
+        for leaf in discover.WORK_SUBDIRS:
+            self.assertTrue(os.path.isdir(os.path.join(where["work"], leaf)), leaf)
+        self.assertTrue(os.path.isdir(where["output"]))
 
 
 class TestConfig(unittest.TestCase):

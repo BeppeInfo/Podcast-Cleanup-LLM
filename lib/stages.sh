@@ -106,104 +106,62 @@ probe_duration() {
 stage_discover() {
     stage_begin discover "locating the episode and its tracks"
     config_need_ffmpeg
+    config_need_python
 
-    if (( ${#INPUT_FILES[@]} == 0 )) && [[ ! -d "$INPUT_DIR" ]]; then
-        # Only reachable on a dry run, which creates nothing: every other run
-        # has had config_make_tree build the layout by now. An absent input
-        # directory is the same situation as an empty one.
-        log_warn "input directory does not exist yet: $INPUT_DIR"
-        return 2
-    fi
-
-    if (( ${#INPUT_FILES[@]} == 0 )); then
-        # Any of the configured extensions, matched case-insensitively — some
-        # recorders write .WAV, and ffmpeg does not care either way.
-        local -a name_test=()
-        local ext
-        for ext in $INPUT_EXTS; do
-            (( ${#name_test[@]} )) && name_test+=(-o)
-            name_test+=(-iname "*.${ext}")
-        done
-        mapfile -t INPUT_FILES < <(
-            find "$INPUT_DIR" -maxdepth 1 -type f \( "${name_test[@]}" \) | sort
-        )
-    fi
-
-    if (( ${#INPUT_FILES[@]} == 0 )); then
-        log_warn "no files matching [$INPUT_EXTS] in $INPUT_DIR — nothing to do"
-        return 2
-    fi
-
-    # Episode id comes from the part of the filename before the separator; all
-    # tracks must agree on it, otherwise two recordings got mixed together.
-    local -a track_args=()
-    local -A seen=()
-    local file base participant episode
-
+    local -a args=(
+        discover --exts "$INPUT_EXTS" --separator "$TRACK_SEPARATOR"
+        --work-root "$WORK_ROOT" --output-dir "$OUTPUT_DIR"
+        --ffprobe "$FFPROBE" --input-dir "$INPUT_DIR"
+    )
+    [[ -n "$RESAMPLE_TO" ]] && args+=(--resample-to "$RESAMPLE_TO")
+    [[ -n "${EPISODE_ID_OVERRIDE:-}" ]] && args+=(--episode "$EPISODE_ID_OVERRIDE")
+    [[ "$DRY_RUN" == 1 ]] && args+=(--dry-run)
+    local file
     for file in "${INPUT_FILES[@]}"; do
-        base=$(basename "$file")
-        base="${base%.*}"
-        if [[ "$base" != *"$TRACK_SEPARATOR"* ]]; then
-            die "cannot parse '$base': expected <episode>${TRACK_SEPARATOR}<participant>.<ext>"
-        fi
-        episode="${base%%"$TRACK_SEPARATOR"*}"
-        participant="${base#*"$TRACK_SEPARATOR"}"
-
-        [[ -n "$episode" && -n "$participant" ]] \
-            || die "cannot parse '$base': empty episode or participant"
-        [[ "$participant" != *"/"* ]] \
-            || die "participant name may not contain a slash: '$participant'"
-
-        if [[ -n "${EPISODE_ID_OVERRIDE:-}" ]]; then
-            episode="$EPISODE_ID_OVERRIDE"
-        fi
-        if [[ -z "$EPISODE_ID" ]]; then
-            EPISODE_ID="$episode"
-        elif [[ "$episode" != "$EPISODE_ID" ]]; then
-            die "found tracks from two episodes ('$EPISODE_ID' and '$episode'); process them separately or pass --episode"
-        fi
-
-        # Also catches the same track present in two formats, which would
-        # otherwise silently pick whichever sorted first.
-        [[ -z "${seen[$participant]:-}" ]] \
-            || die "participant '$participant' appears twice: $(basename "${seen[$participant]}") and $(basename "$file"). Keep one and remove the other, or narrow INPUT_EXTS."
-        seen["$participant"]="$file"
-        track_args+=("$participant=$file")
+        args+=(--file "$file")
     done
 
-    WORK="$WORK_ROOT/$EPISODE_ID"
-    STAGE_DIR="$WORK/state"
-    OUT_DIR="$OUTPUT_DIR/$EPISODE_ID"
-    STAGING_DIR="$OUT_DIR/.staging"
-
-    if [[ "$DRY_RUN" != 1 ]]; then
-        mkdir -p "$WORK"/{prep,asr,words,llm,render,logs} "$STAGE_DIR" "$OUT_DIR"
+    # Exit 2 is an empty inbox rather than a fault; the caller turns it into
+    # "nothing to do" and stops. Anything else has already explained itself.
+    # stderr to a file, not a process substitution: when the next thing this
+    # does is die, a substitution's output can be lost before it is read, and
+    # what is lost is the explanation of the failure.
+    local resolved rc=0 notes
+    notes=$(mktemp -t podcast-discover-XXXXXX)
+    resolved=$("$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}" \
+        2>"$notes") || rc=$?
+    discover_notes <"$notes"
+    rm -f "$notes"
+    if (( rc == 2 )); then
+        return 2
+    elif (( rc != 0 )); then
+        die "could not inspect the input tracks"
     fi
+    eval "$resolved"
 
-    # From here on the run log lives with the episode. Carry over what the
-    # temporary log already holds, rather than starting a fresh one and losing
-    # the config dump that precedes episode discovery.
+    # From here the run log lives with the episode. What the temporary log
+    # already holds is carried over rather than lost — it has the config dump.
     local episode_log="$WORK/logs/run.log"
     if [[ "$DRY_RUN" != 1 && "$LOG_FILE" != "$episode_log" ]]; then
-        local previous="$LOG_FILE"
-        if [[ -f "$previous" ]]; then
-            cat "$previous" >>"$episode_log"
-            rm -f "$previous"
+        if [[ -f "$LOG_FILE" ]]; then
+            cat "$LOG_FILE" >>"$episode_log"
+            rm -f "$LOG_FILE"
         fi
         LOG_FILE="$episode_log"
         log_raw "=== log adopted into $WORK ==="
     fi
 
     log_line ""
-    log_line "  ${C_BOLD}Episode${C_RESET} $EPISODE_ID  ${C_DIM}(${#track_args[@]} tracks)${C_RESET}"
-    for participant in $(printf '%s\n' "${!seen[@]}" | sort); do
-        log_line "    ${C_CYAN}${participant}${C_RESET} ${C_DIM}← $(basename "${seen[$participant]}")${C_RESET}"
+    log_line "  ${C_BOLD}Episode${C_RESET} $EPISODE_ID  ${C_DIM}(${#PARTICIPANTS[@]} tracks)${C_RESET}"
+    local participant
+    for participant in "${PARTICIPANTS[@]}"; do
+        log_line "    ${C_CYAN}${participant}${C_RESET} ${C_DIM}← $(basename "${TRACK_SOURCE[$participant]}")${C_RESET}"
     done
     log_line ""
 
     if [[ "$DRY_RUN" == 1 ]]; then
-        # Nothing gets written, so the track details can only come from a
-        # meta.json an earlier run left behind.
+        # Nothing was written, so track detail can only come from a meta.json an
+        # earlier run left behind.
         if [[ -f "$WORK/meta.json" ]]; then
             load_meta
             log_info "reusing the meta.json from a previous run"
@@ -211,24 +169,26 @@ stage_discover() {
             log_warn "no meta.json yet, so later stages can only be listed"
         fi
     else
-        local -a meta_args=(
-            meta --episode "$EPISODE_ID" --ffprobe "$FFPROBE"
-            --out "$WORK/meta.json"
-        )
-        [[ -n "$RESAMPLE_TO" ]] && meta_args+=(--resample-to "$RESAMPLE_TO")
-        local probe_report
-        if ! probe_report=$(py "${meta_args[@]}" "${track_args[@]}" 2>&1); then
-            # log_line, not log_report: an explanation of a failure has to be
-            # visible even under --quiet.
-            log_line "$probe_report"
-            die "could not inspect the input tracks"
-        fi
-        log_report "$probe_report"
         load_meta
     fi
 
     state_mark discover
-    stage_end "${#track_args[@]} tracks"
+    stage_end "${#PARTICIPANTS[@]} tracks"
+    return 0
+}
+
+# Python reports an empty inbox and its probe findings on stderr; both belong in
+# the log at the level the shell would have used.
+discover_notes() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            NOTHING_TO_DO*) log_warn "${line#NOTHING_TO_DO }" ;;
+            error:*)        log_error "${line#error: }" ;;
+            warning:*|WARN*) log_warn "${line#*: }" ;;
+            *)              log_info "$line" ;;
+        esac
+    done
 }
 
 # Re-establish the paths a resumed run needs without re-scanning the input dir.
@@ -338,7 +298,7 @@ write_loud_spans() {
     fi
 
     run py loud-spans --log "$log" --participant "$participant" \
-        --duration "${TRACK_DURATION[$participant]}" --out "$target" \
+        --duration "${TRACK_DURATION[$participant]:-0}" --out "$target" \
         || { log_warn "could not parse the level scan for $participant"; return 1; }
 }
 
@@ -391,7 +351,7 @@ stage_transcribe() {
             transcribe-remote
             --wav "$wav" --participant "$participant" --out "$target"
             --endpoint "$WHISPER_ENDPOINT" --path "$WHISPER_ENDPOINT_PATH"
-            --duration "${TRACK_DURATION[$participant]}"
+            --duration "${TRACK_DURATION[$participant]:-0}"
             --chunk-seconds "$WHISPER_CHUNK_SECONDS"
             --speech-pad "$SPEECH_PAD"
             --language "$WHISPER_LANG"

@@ -21,7 +21,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cleanup import intervals as iv  # noqa: E402
-from cleanup import asr, config as cfg, llm, plan as planner, render, silence, transcript as tr  # noqa: E402
+from cleanup import asr, config as cfg, discover, llm, plan as planner  # noqa: E402
+from cleanup import render, silence, transcript as tr  # noqa: E402
 
 
 def _read_json(path):
@@ -100,15 +101,24 @@ def _probe(ffprobe, path):
     }
 
 
-def cmd_meta(args):
+def build_meta(track_pairs, episode, ffprobe, resample_to, say=print):
+    """Probe each track and assemble meta.json's contents.
+
+    Shared by `meta` and `discover`; the checks it makes — one sample rate per
+    episode, lossy inputs, a suspicious duration spread — belong to the episode,
+    not to whichever subcommand asked.
+
+    `say` is where the human-readable findings go. `discover` sends them to
+    stderr, because its stdout is shell assignments that get eval'd.
+    """
     tracks = []
-    for item in args.track:
+    for item in track_pairs:
         if "=" not in item:
             _fail(f"track argument must be participant=path, got '{item}'")
         participant, path = item.split("=", 1)
         if not os.path.isfile(path):
             _fail(f"track file not found: {path}")
-        probe = _probe(args.ffprobe, path)
+        probe = _probe(ffprobe, path)
         tracks.append({"participant": participant, "source": os.path.abspath(path), **probe})
 
     tracks.sort(key=lambda t: t["participant"])
@@ -116,11 +126,12 @@ def cmd_meta(args):
 
     # Every track must be frame-aligned at the same rate, or identical cuts
     # would remove different amounts of time from each and they would drift.
-    resample_to = None
-    if args.resample_to == "auto":
+    if resample_to == "auto":
         resample_to = max(rates)
-    elif args.resample_to:
-        resample_to = int(args.resample_to)
+    elif resample_to:
+        resample_to = int(resample_to)
+    else:
+        resample_to = None
 
     if resample_to is None and len(rates) > 1:
         detail = ", ".join(f"{t['participant']}={t['sample_rate']}Hz" for t in tracks)
@@ -139,7 +150,7 @@ def cmd_meta(args):
     durations = [t["duration"] for t in tracks]
     spread = max(durations) - min(durations)
     meta = {
-        "episode_id": args.episode,
+        "episode_id": episode,
         "duration": max(durations),
         "duration_spread": round(spread, 3),
         "sample_rate": target_rate,
@@ -147,33 +158,38 @@ def cmd_meta(args):
         "durations_measured": False,
         "tracks": tracks,
     }
-    _write_json(args.out, meta)
 
     formats = ", ".join(sorted({f"{t['codec']}" for t in tracks}))
-    print(
+    say(
         f"{len(tracks)} tracks, {formats}, {target_rate} Hz, "
         f"{meta['duration']:.1f}s (spread {spread:.3f}s)"
     )
     changed = [t for t in tracks if t["resampled"]]
     if changed:
-        print(
+        say(
             "resampling to "
             f"{target_rate} Hz: "
             + ", ".join(f"{t['participant']} from {t['sample_rate']}" for t in changed)
         )
     lossy = [t for t in tracks if not t["lossless"]]
     if lossy:
-        print(
+        say(
             "note: lossy input ("
             + ", ".join(f"{t['participant']}={t['codec']}" for t in lossy)
             + "). Cutting and re-encoding cannot recover what the codec already "
             "discarded, and a lossless output will be larger for no gain."
         )
     if spread > 1.0:
-        print(
+        say(
             f"warning: track lengths differ by {spread:.1f}s — if they are not "
             "aligned at sample 0 the cleanup will drift"
         )
+    return meta
+
+
+def cmd_meta(args):
+    meta = build_meta(args.track, args.episode, args.ffprobe, args.resample_to)
+    _write_json(args.out, meta)
 
 
 def cmd_meta_refresh(args):
@@ -296,6 +312,47 @@ def cmd_config(args):
     except cfg.ConfigError as exc:
         _fail(str(exc))
     print(cfg.to_shell(settings))
+
+
+def cmd_discover(args):
+    """Identify the episode, build its work tree, and write meta.json.
+
+    Emits shell assignments on stdout so the launcher can `eval` them, in the
+    same way `meta-shell` does for a resumed run. Exit 2 means an empty inbox,
+    which is not a failure — the launcher reports "nothing to do" and stops.
+    """
+    import shlex
+
+    try:
+        paths = (list(args.file) if args.file
+                 else discover.find_tracks(args.input_dir, args.exts.split()))
+        episode_id, tracks = discover.parse_tracks(
+            paths, args.separator, args.episode)
+    except discover.NothingToDo as exc:
+        print(f"NOTHING_TO_DO {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    except discover.DiscoverError as exc:
+        _fail(str(exc))
+
+    where = discover.episode_paths(episode_id, args.work_root, args.output_dir)
+    if not args.dry_run:
+        discover.make_work_tree(where)
+        meta = build_meta(
+            [f"{name}={path}" for name, path in sorted(tracks.items())],
+            episode_id, args.ffprobe, args.resample_to,
+            say=lambda line: print(line, file=sys.stderr, flush=True),
+        )
+        _write_json(os.path.join(where["work"], "meta.json"), meta)
+
+    print(f"EPISODE_ID={shlex.quote(episode_id)}")
+    print(f"WORK={shlex.quote(where['work'])}")
+    print(f"STAGE_DIR={shlex.quote(where['state'])}")
+    print(f"OUT_DIR={shlex.quote(where['output'])}")
+    print(f"STAGING_DIR={shlex.quote(where['staging'])}")
+    names = " ".join(shlex.quote(n) for n in sorted(tracks))
+    print(f"PARTICIPANTS=({names})")
+    for name, path in sorted(tracks.items()):
+        print(f"TRACK_SOURCE[{shlex.quote(name)}]={shlex.quote(path)}")
 
 
 # --- detection ----------------------------------------------------------------
@@ -834,6 +891,20 @@ def build_parser():
     p.add_argument("--no-keys", action="store_true",
                    help="skip reading the API key files")
     p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("discover", help="identify one episode's tracks")
+    p.add_argument("--input-dir", default="")
+    p.add_argument("--file", action="append", default=[],
+                   help="explicit track path; repeatable, skips the scan")
+    p.add_argument("--exts", default="flac")
+    p.add_argument("--separator", default="_")
+    p.add_argument("--episode", default="", help="override the parsed episode id")
+    p.add_argument("--work-root", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--ffprobe", default="ffprobe")
+    p.add_argument("--resample-to", default="")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_discover)
 
     p = sub.add_parser("whisper-wait", help="check a whisper endpoint is reachable")
     p.add_argument("--endpoint", required=True)
