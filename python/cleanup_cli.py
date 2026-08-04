@@ -53,138 +53,43 @@ def _fail(message):
     raise SystemExit(f"error: {message}")
 
 
-# --- meta ---------------------------------------------------------------------
+def cmd_list_stages(args):
+    for stage in pipeline.ALL_STAGES:
+        print(f"  {stage}")
 
 
-# Codecs that reproduce their input exactly. Anything else is assumed lossy,
-# which is worth saying out loud before it gets re-encoded.
-LOSSLESS_CODECS = {
-    "flac", "alac", "wavpack", "tta", "ape", "monkeysaudio", "shorten",
-    "mlp", "truehd", "als", "pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_s24be",
-    "pcm_s32le", "pcm_s32be", "pcm_f32le", "pcm_f64le", "pcm_u8", "pcm_s8",
-}
+def cmd_run(args):
+    """Run the pipeline. The one place that sequences the stages."""
+    log = runlog.Log.from_env()
+    settings = cfg.from_environment()
+    try:
+        stages = pipeline.select_stages(args.from_stage, args.to_stage, args.stages)
+    except pipeline.StageError as exc:
+        log.error(str(exc))
+        raise SystemExit(1) from None
+
+    log.line("")
+    log.line(f"{log.c.bold}Podcast cleanup{log.c.reset}"
+             f"{log.c.dim} — stages: {' '.join(stages)}{log.c.reset}")
+    log.info(f"Whisper: {settings['WHISPER_ENDPOINT']}   "
+             f"LLM: {settings['LLAMA_ENDPOINT']}")
+    if args.dry_run:
+        log.warn("dry run: no files will be written or removed")
+
+    raise SystemExit(pipeline.run_episode(
+        settings, log, stages,
+        episode_override=args.episode,
+        input_files=args.file or (),
+        dry_run=args.dry_run,
+        force=args.force,
+        ffmpeg=args.ffmpeg,
+        ffprobe=args.ffprobe,
+        program=args.program,
+        api_keys={"whisper": _api_key(WHISPER_KEY_ENV),
+                  "llama": _api_key(LLAMA_KEY_ENV)},
+    ))
 
 
-def _probe(ffprobe, path):
-    result = subprocess.run(
-        [
-            ffprobe, "-v", "error", "-select_streams", "a:0",
-            "-show_entries",
-            "stream=codec_name,sample_rate,channels,sample_fmt,bits_per_raw_sample",
-            "-show_entries", "format=duration,format_name",
-            "-of", "json", path,
-        ],
-        capture_output=True, text=True, check=False,
-    )
-    if result.returncode != 0:
-        _fail(f"ffprobe failed on {path}: {result.stderr.strip()}")
-    data = json.loads(result.stdout)
-    streams = data.get("streams") or []
-    if not streams:
-        _fail(f"{path}: no audio stream ffmpeg can see")
-    stream = streams[0]
-    duration = float((data.get("format") or {}).get("duration") or 0.0)
-    if duration <= 0:
-        _fail(f"{path}: could not determine duration")
-    codec = stream.get("codec_name") or ""
-    return {
-        # Renamed once the prepare stage has measured the real thing.
-        "container_duration": round(duration, 3),
-        "duration": round(duration, 3),
-        "codec": codec,
-        "lossless": codec in LOSSLESS_CODECS,
-        "container": (data.get("format") or {}).get("format_name", ""),
-        "sample_rate": int(stream["sample_rate"]),
-        "channels": int(stream.get("channels") or 1),
-        "sample_fmt": stream.get("sample_fmt") or "",
-        "bits_per_raw_sample": int(stream.get("bits_per_raw_sample") or 0),
-    }
-
-
-def build_meta(track_pairs, episode, ffprobe, resample_to, say=print):
-    """Probe each track and assemble meta.json's contents.
-
-    Shared by `meta` and `discover`; the checks it makes — one sample rate per
-    episode, lossy inputs, a suspicious duration spread — belong to the episode,
-    not to whichever subcommand asked.
-
-    `say` is where the human-readable findings go. `discover` sends them to
-    stderr, because its stdout is shell assignments that get eval'd.
-    """
-    tracks = []
-    for item in track_pairs:
-        if "=" not in item:
-            _fail(f"track argument must be participant=path, got '{item}'")
-        participant, path = item.split("=", 1)
-        if not os.path.isfile(path):
-            _fail(f"track file not found: {path}")
-        probe = _probe(ffprobe, path)
-        tracks.append({"participant": participant, "source": os.path.abspath(path), **probe})
-
-    tracks.sort(key=lambda t: t["participant"])
-    rates = sorted({t["sample_rate"] for t in tracks})
-
-    # Every track must be frame-aligned at the same rate, or identical cuts
-    # would remove different amounts of time from each and they would drift.
-    if resample_to == "auto":
-        resample_to = max(rates)
-    elif resample_to:
-        resample_to = int(resample_to)
-    else:
-        resample_to = None
-
-    if resample_to is None and len(rates) > 1:
-        detail = ", ".join(f"{t['participant']}={t['sample_rate']}Hz" for t in tracks)
-        _fail(
-            "all tracks of an episode must share a sample rate, so that one cut "
-            f"removes the same span from every track ({detail}). Either resample "
-            "beforehand, or set RESAMPLE_TO (or --resample-to auto) to have this "
-            "run do it."
-        )
-
-    target_rate = resample_to if resample_to is not None else rates[0]
-    for track in tracks:
-        track["render_rate"] = target_rate
-        track["resampled"] = track["sample_rate"] != target_rate
-
-    durations = [t["duration"] for t in tracks]
-    spread = max(durations) - min(durations)
-    meta = {
-        "episode_id": episode,
-        "duration": max(durations),
-        "duration_spread": round(spread, 3),
-        "sample_rate": target_rate,
-        "resample_to": resample_to,
-        "durations_measured": False,
-        "tracks": tracks,
-    }
-
-    formats = ", ".join(sorted({f"{t['codec']}" for t in tracks}))
-    say(
-        f"{len(tracks)} tracks, {formats}, {target_rate} Hz, "
-        f"{meta['duration']:.1f}s (spread {spread:.3f}s)"
-    )
-    changed = [t for t in tracks if t["resampled"]]
-    if changed:
-        say(
-            "resampling to "
-            f"{target_rate} Hz: "
-            + ", ".join(f"{t['participant']} from {t['sample_rate']}" for t in changed)
-        )
-    lossy = [t for t in tracks if not t["lossless"]]
-    if lossy:
-        say(
-            "note: lossy input ("
-            + ", ".join(f"{t['participant']}={t['codec']}" for t in lossy)
-            + "). Cutting and re-encoding cannot recover what the codec already "
-            "discarded, and a lossless output will be larger for no gain."
-        )
-    if spread > 1.0:
-        say(
-            f"warning: track lengths differ by {spread:.1f}s — if they are not "
-            "aligned at sample 0 the cleanup will drift"
-        )
-    return meta
 def cmd_meta_shell(args):
     """Emit meta.json as shell assignments, for `eval` by a resumed stage.
 
@@ -237,55 +142,6 @@ def cmd_config(args):
     except cfg.ConfigError as exc:
         _fail(str(exc))
     print(cfg.to_shell(settings))
-
-
-def cmd_discover(args):
-    """Identify the episode, build its work tree, and write meta.json.
-
-    Emits shell assignments on stdout so the launcher can `eval` them, in the
-    same way `meta-shell` does for a resumed run. Exit 2 means an empty inbox,
-    which is not a failure — the launcher reports "nothing to do" and stops.
-    """
-    import shlex
-
-    # The same log the launcher is writing, so these lines land in order and in
-    # the same format. See cleanup/runlog.py.
-    log = runlog.Log.from_env()
-    try:
-        paths = (list(args.file) if args.file
-                 else discover.find_tracks(args.input_dir, args.exts.split()))
-        episode_id, tracks = discover.parse_tracks(
-            paths, args.separator, args.episode)
-    except discover.NothingToDo as exc:
-        # Not a failure: an empty inbox. Exit 2 tells the launcher to stop
-        # quietly rather than report a fault.
-        log.warn(f"{exc} — nothing to do")
-        raise SystemExit(2) from None
-    except discover.DiscoverError as exc:
-        log.error(str(exc))
-        raise SystemExit(1) from None
-
-    where = discover.episode_paths(episode_id, args.work_root, args.output_dir)
-    if not args.dry_run:
-        discover.make_work_tree(where)
-        meta = build_meta(
-            [f"{name}={path}" for name, path in sorted(tracks.items())],
-            episode_id, args.ffprobe, args.resample_to,
-            say=lambda line: (log.warn(line.split(": ", 1)[-1])
-                              if line.startswith(("warning:", "note:"))
-                              else log.info(line)),
-        )
-        _write_json(os.path.join(where["work"], "meta.json"), meta)
-
-    print(f"EPISODE_ID={shlex.quote(episode_id)}")
-    print(f"WORK={shlex.quote(where['work'])}")
-    print(f"STAGE_DIR={shlex.quote(where['state'])}")
-    print(f"OUT_DIR={shlex.quote(where['output'])}")
-    print(f"STAGING_DIR={shlex.quote(where['staging'])}")
-    names = " ".join(shlex.quote(n) for n in sorted(tracks))
-    print(f"PARTICIPANTS=({names})")
-    for name, path in sorted(tracks.items()):
-        print(f"TRACK_SOURCE[{shlex.quote(name)}]={shlex.quote(path)}")
 
 
 def cmd_config_names(args):
@@ -394,56 +250,6 @@ def cmd_detect(args):
             raise SystemExit(4)
 
 
-def cmd_stage_detect(args):
-    """The detect stage: one pass over each track's transcript."""
-    log = runlog.Log.from_env()
-    settings = cfg.from_environment()
-    try:
-        pipeline.stage_detect(
-            args.work, settings, log, api_key=_api_key(LLAMA_KEY_ENV),
-            resume_hint=args.resume_hint,
-        )
-    except pipeline.StageError as exc:
-        log.error(str(exc))
-        raise SystemExit(1) from None
-
-
-def cmd_stage_render(args):
-    """The render stage: one ffmpeg pass per track, then verify the lengths."""
-    log = runlog.Log.from_env()
-    settings = cfg.from_environment()
-    try:
-        pipeline.stage_render(args.work, args.staging, settings, log,
-                              ffmpeg=args.ffmpeg, ffprobe=args.ffprobe)
-    except pipeline.StageError as exc:
-        log.error(str(exc))
-        raise SystemExit(1) from None
-
-
-def cmd_stage_finalize(args):
-    """The finalize stage: publish, then remove what is no longer needed.
-
-    Prints the run log's path as a shell assignment, because it moves when the
-    work directory goes and the launcher keeps logging after this returns.
-    """
-    import shlex
-
-    log = runlog.Log.from_env()
-    settings = cfg.from_environment()
-    sources = {}
-    for item in args.source or []:
-        participant, _, path = item.partition("=")
-        sources[participant] = path
-    try:
-        published = pipeline.stage_finalize(
-            args.work, args.output, args.staging, settings, log,
-            args.episode, sources)
-    except pipeline.StageError as exc:
-        log.error(str(exc))
-        raise SystemExit(1) from None
-    print(f"LOG_FILE={shlex.quote(published)}")
-
-
 # --- plan ---------------------------------------------------------------------
 
 
@@ -514,40 +320,6 @@ def cmd_plan(args):
         )
 
 
-def cmd_stage_plan(args):
-    """The plan stage, end to end: params, plan, report, filtergraphs."""
-    log = runlog.Log.from_env()
-    settings = cfg.from_environment()
-    try:
-        pipeline.stage_plan(args.work, settings, log, force=args.force)
-    except pipeline.StageError as exc:
-        log.error(str(exc))
-        raise SystemExit(1) from None
-
-
-def cmd_stage_prepare(args):
-    """The prepare stage: decode every track, then measure what came out."""
-    log = runlog.Log.from_env()
-    settings = cfg.from_environment()
-    try:
-        pipeline.stage_prepare(args.work, settings, log, ffmpeg=args.ffmpeg)
-    except pipeline.StageError as exc:
-        log.error(str(exc))
-        raise SystemExit(1) from None
-
-
-def cmd_stage_transcribe(args):
-    """The transcribe stage: level scan and transcription, per track."""
-    log = runlog.Log.from_env()
-    settings = cfg.from_environment()
-    try:
-        pipeline.stage_transcribe(
-            args.work, settings, log, ffmpeg=args.ffmpeg,
-            api_key=_api_key(WHISPER_KEY_ENV),
-        )
-    except pipeline.StageError as exc:
-        log.error(str(exc))
-        raise SystemExit(1) from None
 def cmd_verify(args):
     """Check a finished directory's durations against the plan, by hand.
 
@@ -575,6 +347,24 @@ def build_parser():
     parser = argparse.ArgumentParser(prog="cleanup_cli", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p = sub.add_parser("list-stages", help="the stage names, in order")
+    p.set_defaults(func=cmd_list_stages)
+
+    p = sub.add_parser("run", help="run the pipeline")
+    p.add_argument("--from", dest="from_stage", default="")
+    p.add_argument("--to", dest="to_stage", default="")
+    p.add_argument("--stages", default="", help="exactly these, comma separated")
+    p.add_argument("--episode", default="")
+    p.add_argument("--file", action="append", default=[],
+                   help="explicit input track; repeatable, skips the scan")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--ffmpeg", default="ffmpeg")
+    p.add_argument("--ffprobe", default="ffprobe")
+    p.add_argument("--program", default="",
+                   help="how this run was invoked, for the resume hint")
+    p.set_defaults(func=cmd_run)
+
     p = sub.add_parser("meta-shell", help="meta.json as shell assignments")
     p.add_argument("--meta", required=True)
     p.set_defaults(func=cmd_meta_shell)
@@ -593,60 +383,6 @@ def build_parser():
     p = sub.add_parser(
         "config-names", help="the setting names, for the launcher to export")
     p.set_defaults(func=cmd_config_names)
-
-    p = sub.add_parser("discover", help="identify one episode's tracks")
-    p.add_argument("--input-dir", default="")
-    p.add_argument("--file", action="append", default=[],
-                   help="explicit track path; repeatable, skips the scan")
-    p.add_argument("--exts", default="flac")
-    p.add_argument("--separator", default="_")
-    p.add_argument("--episode", default="", help="override the parsed episode id")
-    p.add_argument("--work-root", required=True)
-    p.add_argument("--output-dir", required=True)
-    p.add_argument("--ffprobe", default="ffprobe")
-    p.add_argument("--resample-to", default="")
-    p.add_argument("--dry-run", action="store_true")
-    p.set_defaults(func=cmd_discover)
-
-    p = sub.add_parser("stage-prepare", help="run the prepare stage")
-    p.add_argument("--work", required=True)
-    p.add_argument("--ffmpeg", default="ffmpeg")
-    p.set_defaults(func=cmd_stage_prepare)
-
-    p = sub.add_parser("stage-transcribe", help="run the transcribe stage")
-    p.add_argument("--work", required=True)
-    p.add_argument("--ffmpeg", default="ffmpeg")
-    p.set_defaults(func=cmd_stage_transcribe)
-
-    p = sub.add_parser("stage-finalize", help="run the finalize stage")
-    p.add_argument("--work", required=True)
-    p.add_argument("--output", required=True)
-    p.add_argument("--staging", required=True)
-    p.add_argument("--episode", required=True)
-    p.add_argument("--source", action="append", metavar="NAME=PATH",
-                   help="the original input for a participant; repeatable")
-    p.set_defaults(func=cmd_stage_finalize)
-
-    p = sub.add_parser("stage-render", help="run the render stage")
-    p.add_argument("--work", required=True)
-    p.add_argument("--staging", required=True,
-                   help="where finished tracks are written before publishing")
-    p.add_argument("--ffmpeg", default="ffmpeg")
-    p.add_argument("--ffprobe", default="ffprobe")
-    p.set_defaults(func=cmd_stage_render)
-
-    p = sub.add_parser("stage-detect", help="run the detect stage")
-    p.add_argument("--work", required=True)
-    p.add_argument("--resume-hint", default="",
-                   help="the command that would resume this run, for the "
-                        "messages about faults that end it")
-    p.set_defaults(func=cmd_stage_detect)
-
-    p = sub.add_parser("stage-plan", help="run the plan stage")
-    p.add_argument("--work", required=True, help="the episode work directory")
-    p.add_argument("--force", action="store_true",
-                   help="proceed even when the plan trips a safety limit")
-    p.set_defaults(func=cmd_stage_plan)
 
     p = sub.add_parser("whisper-wait", help="check a whisper endpoint is reachable")
     p.add_argument("--endpoint", required=True)

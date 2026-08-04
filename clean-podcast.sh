@@ -20,8 +20,6 @@ LIB_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$LIB_ROOT/lib/log.sh"
 # shellcheck source=lib/config.sh
 source "$LIB_ROOT/lib/config.sh"
-# shellcheck source=lib/stages.sh
-source "$LIB_ROOT/lib/stages.sh"
 
 CONFIG_FILE=""
 EPISODE_ID_OVERRIDE=""
@@ -106,8 +104,9 @@ parse_args() {
             --only)        EXPLICIT_STAGES="${2:?--only needs a stage}"; shift 2 ;;
             --stages)      EXPLICIT_STAGES="${2:?--stages needs a list}"; shift 2 ;;
             --list-stages)
+                config_need_python
                 printf 'Stages, in order:\n'
-                printf '  %s\n' "${ALL_STAGES[@]}"
+                "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" list-stages
                 exit 0 ;;
             --no-whisper-vad) ARG_WHISPER_VAD=0; shift ;;
             --no-llm)      ARG_LLM_ENABLE=0; shift ;;
@@ -129,89 +128,6 @@ parse_args() {
     done
 }
 
-# --- stage selection ---------------------------------------------------------
-
-stage_index() {
-    local wanted="$1" index=0 name
-    for name in "${ALL_STAGES[@]}"; do
-        if [[ "$name" == "$wanted" ]]; then
-            printf '%d' "$index"
-            return 0
-        fi
-        index=$(( index + 1 ))
-    done
-    die "unknown stage '$wanted' (known: ${ALL_STAGES[*]})"
-}
-
-selected_stages() {
-    local -a chosen=()
-    if [[ -n "$EXPLICIT_STAGES" ]]; then
-        local IFS=','
-        read -r -a chosen <<<"$EXPLICIT_STAGES"
-        local name
-        for name in "${chosen[@]}"; do
-            stage_index "$name" >/dev/null
-        done
-    else
-        local first=0 last=$(( ${#ALL_STAGES[@]} - 1 ))
-        [[ -n "$FROM_STAGE" ]] && first=$(stage_index "$FROM_STAGE")
-        [[ -n "$TO_STAGE" ]] && last=$(stage_index "$TO_STAGE")
-        (( first <= last )) || die "--from $FROM_STAGE comes after --to $TO_STAGE"
-        local index
-        for (( index = first; index <= last; index++ )); do
-            chosen+=("${ALL_STAGES[$index]}")
-        done
-    fi
-    printf '%s\n' "${chosen[@]}"
-}
-
-# --- failure handling --------------------------------------------------------
-
-on_exit() {
-    local code=$?
-    trap - EXIT
-    progress_done
-
-    if (( code == 0 )); then
-        [[ -n "$EXIT_SUMMARY" ]] && log_line "$EXIT_SUMMARY"
-        return 0
-    fi
-
-    log_raw "=== run failed with exit code $code ==="
-    log_line ""
-    log_error "run failed (exit $code)"
-
-    if [[ -n "$EPISODE_ID" && -d "${WORK:-}" && "$DRY_RUN" != 1 ]]; then
-        printf 'failed at %s with exit code %s\n' "$(date -Is)" "$code" \
-            >"$WORK/FAILED" 2>/dev/null || true
-        log_line "      ${C_DIM}work directory kept: $WORK${C_RESET}"
-        log_line "      ${C_DIM}resume with: $0 --episode $EPISODE_ID --from <stage>${C_RESET}"
-
-        mkdir -p "$FAILED_DIR" 2>/dev/null || true
-        if [[ -d "$FAILED_DIR" && -f "$LOG_FILE" ]]; then
-            cp -f -- "$LOG_FILE" "$FAILED_DIR/${EPISODE_ID}.log" 2>/dev/null || true
-            log_line "      ${C_DIM}log copied to $FAILED_DIR/${EPISODE_ID}.log${C_RESET}"
-        fi
-
-        # Unattended runs can ask for the inputs to be parked, so that a cron
-        # job does not retry the same broken episode forever.
-        if [[ "${FAILED_ACTION:-log}" == move ]] && (( ${#PARTICIPANTS[@]} )); then
-            local target="$FAILED_DIR/$EPISODE_ID"
-            mkdir -p "$target" 2>/dev/null || true
-            local participant
-            for participant in "${PARTICIPANTS[@]}"; do
-                [[ -f "${TRACK_SOURCE[$participant]:-}" ]] || continue
-                mv -f -- "${TRACK_SOURCE[$participant]}" "$target/" 2>/dev/null || true
-            done
-            log_line "      ${C_DIM}inputs moved to $target${C_RESET}"
-        else
-            log_line "      ${C_DIM}inputs left untouched${C_RESET}"
-        fi
-    fi
-    log_line ""
-    return "$code"
-}
-
 # --- main --------------------------------------------------------------------
 
 main() {
@@ -227,42 +143,28 @@ main() {
     config_export
     config_dump
     config_make_tree
+    config_need_ffmpeg
 
-    local -a stages=()
-    mapfile -t stages < <(selected_stages)
-
-    log_line ""
-    log_line "${C_BOLD}Podcast cleanup${C_RESET}${C_DIM} — stages: ${stages[*]}${C_RESET}"
-    config_describe_models
-    [[ "$DRY_RUN" == 1 ]] && log_warn "dry run: no files will be written or removed"
-
-    stage_total "${#stages[@]}"
-
-    # A run that does not start at discover has to rebuild its context.
-    if [[ "${stages[0]}" != "discover" ]]; then
-        EPISODE_ID="$EPISODE_ID_OVERRIDE"
-        resume_context
-    fi
-
-    local stage rc
-    for stage in "${stages[@]}"; do
-        rc=0
-        "stage_$stage" || rc=$?
-        if (( rc == 2 )) && [[ "$stage" == discover ]]; then
-            log_line ""
-            log_line "Nothing to do."
-            return 0
-        fi
-        (( rc == 0 )) || die "stage '$stage' failed with exit code $rc"
+    # And from here it is Python's run: the stage sequence, the resume
+    # behaviour and the failure handling all live in cleanup/pipeline.py, so
+    # anything else driving this pipeline gets them too.
+    local -a args=(run --ffmpeg "$FFMPEG" --ffprobe "$FFPROBE")
+    [[ -n "$FROM_STAGE" ]] && args+=(--from "$FROM_STAGE")
+    [[ -n "$TO_STAGE" ]] && args+=(--to "$TO_STAGE")
+    [[ -n "$EXPLICIT_STAGES" ]] && args+=(--stages "$EXPLICIT_STAGES")
+    [[ -n "$EPISODE_ID_OVERRIDE" ]] && args+=(--episode "$EPISODE_ID_OVERRIDE")
+    [[ "$DRY_RUN" == 1 ]] && args+=(--dry-run)
+    [[ "${FORCE:-0}" == 1 ]] && args+=(--force)
+    args+=(--program "$0")
+    local file
+    for file in "${INPUT_FILES[@]}"; do
+        args+=(--file "$file")
     done
 
-    EXIT_SUMMARY=$(printf '\n%s✓%s %sfinished %s in %s%s' \
-        "$C_GREEN" "$C_RESET" "$C_BOLD" "$EPISODE_ID" "$(run_elapsed)" "$C_RESET")
-    if [[ -d "${OUT_DIR:-}" ]]; then
-        EXIT_SUMMARY+=$(printf '\n  %soutputs: %s%s' "$C_DIM" "$OUT_DIR" "$C_RESET")
-    fi
-    return 0
+    PODCAST_WHISPER_API_KEY="$WHISPER_API_KEY" \
+        PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
+        PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" \
+        exec "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}"
 }
 
-trap on_exit EXIT
 main "$@"

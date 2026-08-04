@@ -18,14 +18,461 @@ import json
 import os
 import shutil
 import subprocess
+import time
 
 from . import intervals as iv
 from . import plan as planner
-from . import asr, llm, proc, render, silence, transcript as tr
+from . import asr, discover as disco, llm, proc, render
+from . import silence, transcript as tr
 
 
 class StageError(Exception):
     """The stage could not finish. The message is for the operator."""
+
+
+def _probe_fail(message):
+    raise StageError(message)
+
+
+# Codecs that reproduce their input exactly. Anything else is assumed lossy,
+# which is worth saying out loud before it gets re-encoded.
+LOSSLESS_CODECS = {
+    "flac", "alac", "wavpack", "tta", "ape", "monkeysaudio", "shorten",
+    "mlp", "truehd", "als", "pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_s24be",
+    "pcm_s32le", "pcm_s32be", "pcm_f32le", "pcm_f64le", "pcm_u8", "pcm_s8",
+}
+
+
+def _probe(ffprobe, path):
+    result = subprocess.run(
+        [
+            ffprobe, "-v", "error", "-select_streams", "a:0",
+            "-show_entries",
+            "stream=codec_name,sample_rate,channels,sample_fmt,bits_per_raw_sample",
+            "-show_entries", "format=duration,format_name",
+            "-of", "json", path,
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        _probe_fail(f"ffprobe failed on {path}: {result.stderr.strip()}")
+    data = json.loads(result.stdout)
+    streams = data.get("streams") or []
+    if not streams:
+        _probe_fail(f"{path}: no audio stream ffmpeg can see")
+    stream = streams[0]
+    duration = float((data.get("format") or {}).get("duration") or 0.0)
+    if duration <= 0:
+        _probe_fail(f"{path}: could not determine duration")
+    codec = stream.get("codec_name") or ""
+    return {
+        # Renamed once the prepare stage has measured the real thing.
+        "container_duration": round(duration, 3),
+        "duration": round(duration, 3),
+        "codec": codec,
+        "lossless": codec in LOSSLESS_CODECS,
+        "container": (data.get("format") or {}).get("format_name", ""),
+        "sample_rate": int(stream["sample_rate"]),
+        "channels": int(stream.get("channels") or 1),
+        "sample_fmt": stream.get("sample_fmt") or "",
+        "bits_per_raw_sample": int(stream.get("bits_per_raw_sample") or 0),
+    }
+
+
+def build_meta(track_pairs, episode, ffprobe, resample_to, say=print):
+    """Probe each track and assemble meta.json's contents.
+
+    Shared by `meta` and `discover`; the checks it makes — one sample rate per
+    episode, lossy inputs, a suspicious duration spread — belong to the episode,
+    not to whichever subcommand asked.
+
+    `say` is where the human-readable findings go. `discover` sends them to
+    stderr, because its stdout is shell assignments that get eval'd.
+    """
+    tracks = []
+    for item in track_pairs:
+        if "=" not in item:
+            _probe_fail(f"track argument must be participant=path, got '{item}'")
+        participant, path = item.split("=", 1)
+        if not os.path.isfile(path):
+            _probe_fail(f"track file not found: {path}")
+        probe = _probe(ffprobe, path)
+        tracks.append({"participant": participant, "source": os.path.abspath(path), **probe})
+
+    tracks.sort(key=lambda t: t["participant"])
+    rates = sorted({t["sample_rate"] for t in tracks})
+
+    # Every track must be frame-aligned at the same rate, or identical cuts
+    # would remove different amounts of time from each and they would drift.
+    if resample_to == "auto":
+        resample_to = max(rates)
+    elif resample_to:
+        resample_to = int(resample_to)
+    else:
+        resample_to = None
+
+    if resample_to is None and len(rates) > 1:
+        detail = ", ".join(f"{t['participant']}={t['sample_rate']}Hz" for t in tracks)
+        _probe_fail(
+            "all tracks of an episode must share a sample rate, so that one cut "
+            f"removes the same span from every track ({detail}). Either resample "
+            "beforehand, or set RESAMPLE_TO (or --resample-to auto) to have this "
+            "run do it."
+        )
+
+    target_rate = resample_to if resample_to is not None else rates[0]
+    for track in tracks:
+        track["render_rate"] = target_rate
+        track["resampled"] = track["sample_rate"] != target_rate
+
+    durations = [t["duration"] for t in tracks]
+    spread = max(durations) - min(durations)
+    meta = {
+        "episode_id": episode,
+        "duration": max(durations),
+        "duration_spread": round(spread, 3),
+        "sample_rate": target_rate,
+        "resample_to": resample_to,
+        "durations_measured": False,
+        "tracks": tracks,
+    }
+
+    formats = ", ".join(sorted({f"{t['codec']}" for t in tracks}))
+    say(
+        f"{len(tracks)} tracks, {formats}, {target_rate} Hz, "
+        f"{meta['duration']:.1f}s (spread {spread:.3f}s)"
+    )
+    changed = [t for t in tracks if t["resampled"]]
+    if changed:
+        say(
+            "resampling to "
+            f"{target_rate} Hz: "
+            + ", ".join(f"{t['participant']} from {t['sample_rate']}" for t in changed)
+        )
+    lossy = [t for t in tracks if not t["lossless"]]
+    if lossy:
+        say(
+            "note: lossy input ("
+            + ", ".join(f"{t['participant']}={t['codec']}" for t in lossy)
+            + "). Cutting and re-encoding cannot recover what the codec already "
+            "discarded, and a lossless output will be larger for no gain."
+        )
+    if spread > 1.0:
+        say(
+            f"warning: track lengths differ by {spread:.1f}s — if they are not "
+            "aligned at sample 0 the cleanup will drift"
+        )
+    return meta
+ALL_STAGES = ("discover", "prepare", "transcribe", "detect", "plan",
+              "render", "finalize")
+
+
+class NothingToDo(Exception):
+    """An empty inbox. Not a failure; the run reports it and stops."""
+
+
+class Episode:
+    """The paths and tracks every stage needs, in one place.
+
+    Built by `discover`, or rebuilt from meta.json by a resumed run. Nothing
+    here is derived twice: `resume` reads the same meta.json `discover` wrote,
+    which is what makes `--from` work without re-scanning the input directory.
+    """
+
+    def __init__(self, episode_id: str, settings):
+        self.id = episode_id
+        where = disco.episode_paths(
+            episode_id, settings["WORK_ROOT"], settings["OUTPUT_DIR"])
+        self.work = where["work"]
+        self.state = where["state"]
+        self.output = where["output"]
+        self.staging = where["staging"]
+        self.tracks: dict[str, str] = {}
+
+    @property
+    def log_path(self) -> str:
+        return os.path.join(self.work, "logs", "run.log")
+
+    def load_tracks(self) -> dict:
+        meta = read_json(os.path.join(self.work, "meta.json"))
+        self.tracks = {t["participant"]: t["source"] for t in meta["tracks"]}
+        return meta
+
+
+def select_stages(from_stage: str = "", to_stage: str = "",
+                  explicit: str = "") -> list[str]:
+    """Which stages this run executes, in order."""
+    if explicit:
+        chosen = [name.strip() for name in explicit.split(",") if name.strip()]
+        unknown = [name for name in chosen if name not in ALL_STAGES]
+        if unknown:
+            raise StageError(f"unknown stage '{unknown[0]}' "
+                             f"(known: {' '.join(ALL_STAGES)})")
+        return chosen
+
+    for name in (from_stage, to_stage):
+        if name and name not in ALL_STAGES:
+            raise StageError(f"unknown stage '{name}' "
+                             f"(known: {' '.join(ALL_STAGES)})")
+    first = ALL_STAGES.index(from_stage) if from_stage else 0
+    last = ALL_STAGES.index(to_stage) if to_stage else len(ALL_STAGES) - 1
+    if first > last:
+        raise StageError(f"--from {from_stage} comes after --to {to_stage}")
+    return list(ALL_STAGES[first:last + 1])
+
+
+def state_done(episode, stage: str) -> bool:
+    return os.path.isfile(os.path.join(episode.state, f"{stage}.done"))
+
+
+def state_mark(episode, stage: str, dry_run: bool) -> None:
+    if not dry_run:
+        open(os.path.join(episode.state, f"{stage}.done"), "w").close()
+
+
+def resume_episode(settings, log, episode_id: str) -> Episode:
+    """Re-establish what a run needs without re-scanning the input directory."""
+    if not episode_id:
+        raise StageError("--from requires --episode (or an input dir to scan)")
+    episode = Episode(episode_id, settings)
+    if not os.path.isdir(episode.work):
+        raise StageError(f"no work directory for episode '{episode_id}' "
+                         f"at {episode.work}")
+    disco.make_work_tree({"work": episode.work, "output": episode.output})
+    log.path = episode.log_path
+    episode.load_tracks()
+    return episode
+
+
+def resume_command(program: str, episode_id: str) -> str:
+    """What to type to pick this run up again. Composed here because the
+    episode id is not known until discovery, and the launcher runs before it."""
+    if not program:
+        return ""
+    return f"{program} --episode {episode_id} --from <stage>"
+
+
+def report_failure(episode, settings, log, program: str, dry_run: bool) -> None:
+    """Keep everything, say where it is, and leave a marker saying why.
+
+    A failed run must be resumable, so nothing is cleaned up here. The inputs
+    can optionally be parked instead, so an unattended run does not retry the
+    same broken episode forever.
+    """
+    if episode is None or dry_run or not os.path.isdir(episode.work):
+        return
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        with open(os.path.join(episode.work, "FAILED"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(f"failed at {stamp}\n")
+    except OSError:
+        pass
+
+    log.line(f"{log.c.dim}      work directory kept: {episode.work}{log.c.reset}")
+    hint = resume_command(program, episode.id)
+    if hint:
+        log.line(f"{log.c.dim}      resume with: {hint}{log.c.reset}")
+
+    failed_dir = settings["FAILED_DIR"]
+    os.makedirs(failed_dir, exist_ok=True)
+    if log.path and os.path.isfile(log.path):
+        copied = os.path.join(failed_dir, f"{episode.id}.log")
+        try:
+            shutil.copyfile(log.path, copied)
+            log.line(f"{log.c.dim}      log copied to {copied}{log.c.reset}")
+        except OSError:
+            pass
+
+    if settings.get("FAILED_ACTION", "log") == "move" and episode.tracks:
+        target = os.path.join(failed_dir, episode.id)
+        os.makedirs(target, exist_ok=True)
+        for source in episode.tracks.values():
+            if os.path.isfile(source):
+                try:
+                    shutil.move(source, target)
+                except OSError:
+                    pass
+        log.line(f"{log.c.dim}      inputs moved to {target}{log.c.reset}")
+    else:
+        log.line(f"{log.c.dim}      inputs left untouched{log.c.reset}")
+
+
+def run_episode(settings, log, stages, *, episode_override: str = "",
+                input_files=(), dry_run: bool = False, force: bool = False,
+                ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe",
+                program: str = "", api_keys=None) -> int:
+    """Run the selected stages in order. Returns a process exit status.
+
+    The one place that knows the sequence, so both the CLI and anything else
+    driving the pipeline get the same ordering, the same resume behaviour and the
+    same failure handling.
+    """
+    keys = api_keys or {}
+    log.stage_total(len(stages))
+    episode = None
+
+    try:
+        if stages[0] != "discover":
+            episode = resume_episode(settings, log, episode_override)
+
+        for stage in stages:
+            if stage == "discover":
+                log.stage_begin("discover", "locating the episode and its tracks")
+                episode = discover_episode(
+                    settings, log, input_files, episode_override, dry_run, ffprobe)
+                state_mark(episode, "discover", dry_run)
+                log.stage_end(f"{len(episode.tracks)} tracks")
+                continue
+
+            if stage == "prepare":
+                log.stage_begin("prepare", "decoding tracks to 16 kHz mono")
+                if dry_run:
+                    log.info(f"would decode {len(episode.tracks)} tracks")
+                else:
+                    stage_prepare(episode.work, settings, log, ffmpeg=ffmpeg)
+                    episode.load_tracks()
+                log.stage_end(f"{len(episode.tracks)} tracks decoded")
+
+            elif stage == "transcribe":
+                log.stage_begin(
+                    "transcribe", f"transcribing via {settings['WHISPER_ENDPOINT']}")
+                if dry_run:
+                    log.info(f"would transcribe {len(episode.tracks)} tracks")
+                else:
+                    stage_transcribe(episode.work, settings, log, ffmpeg=ffmpeg,
+                                     api_key=keys.get("whisper"))
+                log.stage_end(f"{len(episode.tracks)} tracks transcribed remotely")
+
+            elif stage == "detect":
+                if settings["LLM_ENABLE"] != "1":
+                    log.stage_skip("detect", "LLM_ENABLE=0")
+                    state_mark(episode, "detect", dry_run)
+                    continue
+                log.stage_begin("detect", "finding stutters and false starts")
+                if not state_done(episode, "transcribe"):
+                    log.warn("transcribe stage has not completed in this work dir")
+                if dry_run:
+                    log.info(f"would analyse {len(episode.tracks)} transcripts")
+                else:
+                    stage_detect(episode.work, settings, log,
+                                 api_key=keys.get("llama"),
+                                 resume_hint=resume_command(program, episode.id))
+                log.stage_end(f"{len(episode.tracks)} tracks analysed")
+
+            elif stage == "plan":
+                log.stage_begin("plan", "deciding what to cut and what to mute")
+                if dry_run:
+                    log.info(f"would unify {episode.work}/words and llm into a plan")
+                else:
+                    stage_plan(episode.work, settings, log, force=force)
+                log.stage_end("plan written")
+
+            elif stage == "render":
+                log.stage_begin("render", "rendering cleaned tracks")
+                if dry_run:
+                    log.info(f"would render into {episode.staging}")
+                else:
+                    stage_render(episode.work, episode.staging, settings, log,
+                                 ffmpeg=ffmpeg, ffprobe=ffprobe)
+                log.stage_end(f"{len(episode.tracks)} tracks rendered and verified")
+
+            elif stage == "finalize":
+                log.stage_begin("finalize", "publishing outputs and cleaning up")
+                if dry_run:
+                    log.info(f"would publish into {episode.output}")
+                else:
+                    stage_finalize(episode.work, episode.output, episode.staging,
+                                   settings, log, episode.id, episode.tracks)
+                log.stage_end(f"outputs in {episode.output}")
+
+            if stage != "discover":
+                state_mark(episode, stage, dry_run)
+
+    except NothingToDo as exc:
+        log.warn(f"{exc} — nothing to do")
+        log.line("")
+        log.line("Nothing to do.")
+        return 0
+    except StageError as exc:
+        log.line("")
+        log.error(str(exc))
+        report_failure(episode, settings, log, program, dry_run)
+        log.line("")
+        return 1
+
+    log.line("")
+    log.line(f"{log.c.green}✓{log.c.reset} {log.c.bold}finished {episode.id} "
+             f"in {log.elapsed()}{log.c.reset}")
+    if os.path.isdir(episode.output):
+        log.line(f"  {log.c.dim}outputs: {episode.output}{log.c.reset}")
+    log.line("")
+    return 0
+
+
+def discover_episode(settings, log, input_files, episode_override: str,
+                     dry_run: bool, ffprobe: str) -> Episode:
+    """Identify the episode, build its work tree, and adopt the run log."""
+    try:
+        paths = (list(input_files) if input_files
+                 else disco.find_tracks(settings["INPUT_DIR"],
+                                        settings["INPUT_EXTS"].split()))
+        episode_id, tracks = disco.parse_tracks(
+            paths, settings["TRACK_SEPARATOR"], episode_override)
+    except disco.NothingToDo as exc:
+        raise NothingToDo(str(exc)) from None
+    except disco.DiscoverError as exc:
+        raise StageError(str(exc)) from None
+
+    episode = Episode(episode_id, settings)
+    episode.tracks = tracks
+    if not dry_run:
+        disco.make_work_tree({"work": episode.work, "output": episode.output})
+        adopt_log(log, episode)
+        meta = build_meta(
+            [f"{name}={path}" for name, path in sorted(tracks.items())],
+            episode_id, ffprobe, settings["RESAMPLE_TO"],
+            say=lambda line: (log.warn(line.split(": ", 1)[-1])
+                              if line.startswith(("warning:", "note:"))
+                              else log.info(line)))
+        render.write_json(os.path.join(episode.work, "meta.json"), meta)
+
+    log.line("")
+    log.line(f"  {log.c.bold}Episode{log.c.reset} {episode_id}  "
+             f"{log.c.dim}({len(tracks)} tracks){log.c.reset}")
+    for participant in sorted(tracks):
+        log.line(f"    {log.c.cyan}{participant}{log.c.reset} "
+                 f"{log.c.dim}← {os.path.basename(tracks[participant])}"
+                 f"{log.c.reset}")
+    log.line("")
+
+    if not dry_run:
+        episode.load_tracks()
+    elif os.path.isfile(os.path.join(episode.work, "meta.json")):
+        episode.load_tracks()
+        log.info("reusing the meta.json from a previous run")
+    else:
+        log.warn("no meta.json yet, so later stages can only be listed")
+    return episode
+
+
+def adopt_log(log, episode) -> None:
+    """Move the run log into the episode directory, carrying over what it holds.
+
+    Until the episode is known the log is somewhere temporary. Starting a fresh
+    one here would lose the config dump that precedes discovery.
+    """
+    target = episode.log_path
+    if log.path == target:
+        return
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if log.path and os.path.isfile(log.path):
+        with open(log.path, encoding="utf-8", errors="replace") as source, \
+                open(target, "a", encoding="utf-8") as sink:
+            sink.write(source.read())
+        os.remove(log.path)
+    log.path = target
+    log.raw(f"=== log adopted into {episode.work} ===")
 
 
 # Settings that reach the plan as numbers, and the names it knows them by.

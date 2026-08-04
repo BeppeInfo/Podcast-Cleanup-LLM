@@ -2672,64 +2672,98 @@ class TestPipelinePrepareStage(unittest.TestCase):
 
 
 class TestRunLog(unittest.TestCase):
-    """The console format has to match lib/log.sh while both are in use."""
+    """The console format.
 
-    SCRIPT = """
-LOG_LEVEL=%s; LOG_FILE=""
-source lib/log.sh
-stage_total 3
-stage_begin prepare "decoding tracks to 16 kHz mono"
-log_debug "a detail"
-log_info "a note"
-log_ok "done a thing"
-log_warn "a warning"
-log_error "a failure"
-progress 1 2 host
-log_line ""
-log_line "  a header"
-log_report "first
-second"
-stage_end "2 tracks decoded"
-stage_skip detect "LLM_ENABLE=0"
-"""
+    Two halves, for a reason. The launcher still emits a few lines of its own —
+    tool discovery, the config dump, a configuration error — through lib/log.sh,
+    into the same file. Those are compared against bash directly, because both
+    implementations exist and must not drift.
 
-    def _python(self, level):
+    Everything else (stage headers, the counter, multi-line reports, durations)
+    left bash with the driver loop, so there is nothing to compare against any
+    more. Those are pinned to their exact output instead: the format is still a
+    promise, it just no longer has a second implementation to check it against.
+    """
+
+    def _python_levels(self, level):
         buf = io.StringIO()
         log = runlog.Log(level=level, stream=buf, colour=False)
-        log.stage_total(3)
-        log.stage_begin("prepare", "decoding tracks to 16 kHz mono")
         log.debug("a detail")
         log.info("a note")
-        log.ok("done a thing")
         log.warn("a warning")
         log.error("a failure")
+        return buf.getvalue()
+
+    def _bash_levels(self, level):
+        script = f"""
+LOG_LEVEL={level}; LOG_FILE=""
+source lib/log.sh
+log_debug "a detail"
+log_info "a note"
+log_warn "a warning"
+log_error "a failure"
+"""
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, cwd=REPO_ROOT,
+            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"}, check=True)
+        return result.stderr
+
+    def test_the_levels_still_shared_with_bash_match_it(self):
+        for level in ("debug", "info", "warn", "error"):
+            with self.subTest(level=level):
+                self.assertEqual(self._python_levels(level),
+                                 self._bash_levels(level))
+
+    def test_the_log_file_line_matches_bash(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        mine, theirs = os.path.join(root, "py.log"), os.path.join(root, "sh.log")
+        runlog.Log(path=mine, stream=io.StringIO(), colour=False).warn("careful")
+        subprocess.run(
+            ["bash", "-c", f'LOG_FILE={theirs}; source lib/log.sh; '
+                           'log_warn "careful"'],
+            cwd=REPO_ROOT, check=True, capture_output=True)
+        # Timestamps differ; the rest must not.
+        strip = lambda text: text.split(" ", 2)[2]
+        self.assertEqual(strip(open(mine).read()), strip(open(theirs).read()))
+
+    def test_stage_headers_and_counter_keep_their_format(self):
+        buf = io.StringIO()
+        log = runlog.Log(level="info", stream=buf, colour=False)
+        log.stage_total(3)
+        log.stage_begin("prepare", "decoding tracks to 16 kHz mono")
+        log.ok("decoded host")
         log.progress(1, 2, "host")
         log.line("")
         log.line("  a header")
         log.report("first\nsecond")
-        log.stage_end("2 tracks decoded")
         log.stage_skip("detect", "LLM_ENABLE=0")
-        return buf.getvalue()
+        self.assertEqual(buf.getvalue(), (
+            "[1/3] prepare  decoding tracks to 16 kHz mono\n"
+            "  \u2713 decoded host\n"
+            "      (1/2) host\n"
+            "\n"
+            "  a header\n"
+            "      first\n"
+            "      second\n"
+            "[2/3] detect \u2014 skipped (LLM_ENABLE=0)\n"
+        ))
 
-    def _bash(self, level):
-        result = subprocess.run(
-            ["bash", "-c", self.SCRIPT % level],
-            capture_output=True, text=True, cwd=REPO_ROOT,
-            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"}, check=True)
-        return result.stderr
+    def test_stage_end_reports_a_duration(self):
+        buf = io.StringIO()
+        log = runlog.Log(level="info", stream=buf, colour=False)
+        log.stage_total(1)
+        log.stage_begin("plan")
+        log.stage_end("plan written")
+        self.assertIn("      plan written in 0s\n", buf.getvalue())
 
-    def test_console_output_matches_the_shell_at_every_level(self):
-        for level in ("debug", "info", "warn", "error"):
-            with self.subTest(level=level):
-                self.assertEqual(self._python(level), self._bash(level))
-
-    def test_duration_formatting_matches_the_shell(self):
-        cases = [0, 5, 59, 60, 61, 599, 3599, 3600, 3661, 86399]
-        script = "source lib/log.sh\n" + "\n".join(
-            f'fmt_duration {n}; echo' for n in cases)
-        out = subprocess.run(["bash", "-c", script], capture_output=True,
-                             text=True, cwd=REPO_ROOT, check=True).stdout.split()
-        self.assertEqual([runlog.fmt_duration(n) for n in cases], out)
+    def test_duration_formatting(self):
+        for seconds, want in ((0, "0s"), (5, "5s"), (59, "59s"), (60, "1m00s"),
+                              (61, "1m01s"), (3599, "59m59s"), (3600, "1h00m00s"),
+                              (3661, "1h01m01s"), (86399, "23h59m59s"),
+                              (-5, "0s")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(runlog.fmt_duration(seconds), want)
 
     def test_the_log_file_carries_level_and_stage(self):
         path = os.path.join(tempfile.mkdtemp(), "run.log")
@@ -2737,8 +2771,8 @@ stage_skip detect "LLM_ENABLE=0"
         log = runlog.Log(path=path, stream=io.StringIO(), colour=False)
         log.stage_name = "discover"
         log.warn("two episodes at once")
-        written = open(path, encoding="utf-8").read()
-        self.assertIn("[warn] (discover) two episodes at once", written)
+        self.assertIn("[warn] (discover) two episodes at once",
+                      open(path, encoding="utf-8").read())
 
     def test_from_env_adopts_the_launchers_log(self):
         path = os.path.join(tempfile.mkdtemp(), "run.log")
@@ -2753,7 +2787,6 @@ stage_skip detect "LLM_ENABLE=0"
 
     def test_no_path_is_a_no_op_not_a_crash(self):
         runlog.Log(stream=io.StringIO(), colour=False).warn("nowhere to write")
-
 
 class TestDiscover(unittest.TestCase):
     """Which files are one episode, and what the refusals say."""
