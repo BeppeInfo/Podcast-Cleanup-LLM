@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,7 +24,7 @@ import wave
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
 from cleanup import intervals as iv
-from cleanup import asr, llm, plan as planner, render, silence, transcript as tr
+from cleanup import asr, config as cfg, llm, plan as planner, render, silence, transcript as tr
 # The CLI itself, for the exit codes the shell branches on. Importing is safe:
 # it only runs main() under __main__.
 import cleanup_cli as cli
@@ -1977,6 +1978,115 @@ class TestUntranscribedAudio(unittest.TestCase):
         # The scan starts 0.2s earlier and ends 0.2s later than the word.
         result = self._plan(words, {"a": [(9.8, 12.2)]})
         self.assertEqual(result["untranscribed_audio"], {})
+
+
+class TestConfig(unittest.TestCase):
+    """The settings layer: where a value comes from and what shape it must have."""
+
+    def _conf(self, body):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".conf", delete=False, encoding="utf-8")
+        handle.write(body)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_defaults_cover_every_setting(self):
+        values = cfg.defaults()
+        self.assertEqual(set(values), set(cfg.SETTINGS))
+        self.assertTrue(values["FFMPEG_JOBS"].isdigit())
+
+    def test_config_file_is_sourced_by_bash(self):
+        # Not parsed here: a value referencing another one has to keep working.
+        path = self._conf('SILENCE_KEEP="0.2"\nOUTPUT_EXT="wav"\n'
+                          'OUTPUT_CODEC="pcm_${OUTPUT_EXT}"\n')
+        values = cfg.load(config_file=path, environ={})
+        self.assertEqual(values["SILENCE_KEEP"], "0.2")
+        self.assertEqual(values["OUTPUT_CODEC"], "pcm_wav")
+
+    def test_environment_beats_the_file_and_the_cli_beats_both(self):
+        path = self._conf('SILENCE_KEEP="0.2"\n')
+        self.assertEqual(
+            cfg.load(config_file=path, environ={})["SILENCE_KEEP"], "0.2")
+        self.assertEqual(
+            cfg.load(config_file=path,
+                     environ={"SILENCE_KEEP": "0.3"})["SILENCE_KEEP"], "0.3")
+        self.assertEqual(
+            cfg.load(config_file=path, environ={"SILENCE_KEEP": "0.3"},
+                     overrides={"SILENCE_KEEP": "0.4"})["SILENCE_KEEP"], "0.4")
+
+    def test_a_name_the_file_does_not_set_falls_through(self):
+        path = self._conf('SILENCE_KEEP="0.2"\n')
+        values = cfg.load(config_file=path, environ={"MIN_CUT": "0.9"})
+        self.assertEqual(values["MIN_CUT"], "0.9")
+
+    def test_root_override_re_derives_the_layout(self):
+        path = self._conf('PODCAST_ROOT="/from/file"\nINPUT_DIR="/from/file/in"\n')
+        # What the launcher sends for --root: the root, and the four cleared.
+        values = cfg.load(config_file=path, environ={}, overrides={
+            "PODCAST_ROOT": "/cli", "INPUT_DIR": "", "OUTPUT_DIR": "",
+            "WORK_ROOT": "", "FAILED_DIR": "",
+        })
+        cfg.resolve_paths(values, "/script")
+        self.assertEqual(values["INPUT_DIR"], "/cli/incoming")
+
+    def test_paths_fall_back_to_the_script_directory(self):
+        values = cfg.load(environ={})
+        values["PODCAST_ROOT"] = ""
+        cfg.resolve_paths(values, "/opt/app")
+        self.assertEqual(values["PODCAST_ROOT"], "/opt/app")
+        self.assertEqual(values["WORK_ROOT"], "/opt/app/work")
+
+    def test_validation_rejects_what_the_shell_rejected(self):
+        for override, expected in [
+            ({"SILENCE_KEEP": "9"}, "SILENCE_KEEP"),
+            ({"LLM_API": "grpc"}, "LLM_API"),
+            ({"RENDER_FRAME_SAMPLES": "3"}, "RENDER_FRAME_SAMPLES"),
+            ({"CUT_PADDING": "abc"}, "CUT_PADDING"),
+            ({"RESAMPLE_TO": "44"}, "RESAMPLE_TO"),
+            ({"LLM_CHUNK_OVERLAP": "900"}, "LLM_CHUNK_OVERLAP"),
+            ({"TRACK_SEPARATOR": ""}, "TRACK_SEPARATOR"),
+            ({"FAILED_ACTION": "burn"}, "FAILED_ACTION"),
+        ]:
+            with self.subTest(override=override):
+                values = cfg.load(environ={}, overrides=override)
+                with self.assertRaises(cfg.ConfigError) as caught:
+                    cfg.validate(values)
+                self.assertIn(expected, str(caught.exception))
+
+    def test_a_clean_configuration_validates(self):
+        values = cfg.load(environ={})
+        cfg.resolve_paths(values, "/opt/app")
+        cfg.validate(values)
+
+    def test_deprecated_track_ext_becomes_an_input_filter(self):
+        values = cfg.load(environ={}, overrides={"TRACK_EXT": "wav"})
+        said = []
+        cfg.validate(values, warn=said.append)
+        self.assertEqual(values["INPUT_EXTS"], "wav")
+        self.assertTrue(any("TRACK_EXT is deprecated" in m for m in said))
+
+    def test_key_file_is_read_and_trimmed(self):
+        path = self._conf("  s3cret  \n")
+        values = cfg.load(environ={}, overrides={"WHISPER_API_KEY_FILE": path})
+        cfg.resolve_api_keys(values)
+        self.assertEqual(values["WHISPER_API_KEY"], "s3cret")
+
+    def test_empty_key_file_is_an_error(self):
+        path = self._conf("\n")
+        values = cfg.load(environ={}, overrides={"LLAMA_API_KEY_FILE": path})
+        with self.assertRaises(cfg.ConfigError):
+            cfg.resolve_api_keys(values)
+
+    def test_shell_output_survives_a_hostile_value(self):
+        values = cfg.load(environ={}, overrides={
+            "WHISPER_PROMPT": "it's \"quoted\"; rm -rf /"})
+        emitted = cfg.to_shell(values)
+        probe = subprocess.run(
+            ["bash", "-c", f'{emitted}\nprintf "%s" "$WHISPER_PROMPT"'],
+            capture_output=True, text=True, check=True)
+        self.assertEqual(probe.stdout, "it's \"quoted\"; rm -rf /")
+
 
 
 class TestPlanBuilder(unittest.TestCase):

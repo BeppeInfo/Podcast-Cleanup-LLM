@@ -129,29 +129,6 @@ parse_args() {
     done
 }
 
-# Command-line values are applied after the config file, so they win.
-apply_overrides() {
-    # An explicit --root re-derives the whole layout: a config file's INPUT_DIR
-    # is a weaker statement than the root asked for on the command line. The
-    # per-directory options just below still win over it, being equally explicit
-    # and more specific.
-    if [[ -n "${ARG_PODCAST_ROOT:-}" ]]; then
-        PODCAST_ROOT="$ARG_PODCAST_ROOT"
-        INPUT_DIR="" OUTPUT_DIR="" WORK_ROOT="" FAILED_DIR=""
-    fi
-    [[ -n "${ARG_INPUT_DIR:-}" ]]       && INPUT_DIR="$ARG_INPUT_DIR"
-    [[ -n "${ARG_OUTPUT_DIR:-}" ]]      && OUTPUT_DIR="$ARG_OUTPUT_DIR"
-    [[ -n "${ARG_WORK_ROOT:-}" ]]       && WORK_ROOT="$ARG_WORK_ROOT"
-    [[ -n "${ARG_WHISPER_VAD:-}" ]]     && WHISPER_VAD="$ARG_WHISPER_VAD"
-    [[ -n "${ARG_LLM_ENABLE:-}" ]]      && LLM_ENABLE="$ARG_LLM_ENABLE"
-    [[ -n "${ARG_WHISPER_ENDPOINT:-}" ]] && WHISPER_ENDPOINT="$ARG_WHISPER_ENDPOINT"
-    [[ -n "${ARG_LLAMA_ENDPOINT:-}" ]]  && LLAMA_ENDPOINT="$ARG_LLAMA_ENDPOINT"
-    [[ -n "${ARG_FFMPEG_JOBS:-}" ]]     && FFMPEG_JOBS="$ARG_FFMPEG_JOBS"
-    [[ -n "${ARG_KEEP_INPUTS:-}" ]]     && KEEP_INPUTS="$ARG_KEEP_INPUTS"
-    [[ -n "${ARG_KEEP_WORK:-}" ]]       && KEEP_WORK="$ARG_KEEP_WORK"
-    return 0
-}
-
 # --- stage selection ---------------------------------------------------------
 
 stage_index() {
@@ -244,11 +221,9 @@ main() {
     # discover stage adopts it into the work directory and carries it over.
     log_init "$(mktemp -t podcast-cleanup-XXXXXX.log)"
 
+    # One call: defaults, config file, environment and the options above are
+    # resolved and checked on the Python side, and come back as assignments.
     config_load "$CONFIG_FILE"
-    apply_overrides
-    config_resolve_paths
-    config_validate
-    config_resolve_api_keys
     config_dump
     config_make_tree
 

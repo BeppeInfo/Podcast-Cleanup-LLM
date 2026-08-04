@@ -21,7 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cleanup import intervals as iv  # noqa: E402
-from cleanup import asr, llm, plan as planner, render, silence, transcript as tr  # noqa: E402
+from cleanup import asr, config as cfg, llm, plan as planner, render, silence, transcript as tr  # noqa: E402
 
 
 def _read_json(path):
@@ -268,6 +268,34 @@ def cmd_loud_spans(args):
 
 
 # --- transcript ---------------------------------------------------------------
+
+
+def cmd_config(args):
+    """Resolve every setting and emit it as shell assignments.
+
+    The launcher `eval`s this, so the Python side is the single authority for
+    defaults, precedence and validation, and the shell keeps only what it needs
+    to run ffmpeg. Warnings go to stderr so `eval` never swallows them.
+    """
+    overrides = {}
+    for item in args.set or []:
+        if "=" not in item:
+            _fail(f"--set expects NAME=VALUE, got '{item}'")
+        name, _, value = item.partition("=")
+        overrides[name] = value
+
+    def warn(message):
+        print(f"WARN {message}", file=sys.stderr, flush=True)
+
+    try:
+        settings = cfg.load(args.config or "", overrides)
+        cfg.resolve_paths(settings, args.script_root)
+        cfg.validate(settings, warn)
+        if not args.no_keys:
+            cfg.resolve_api_keys(settings, warn)
+    except cfg.ConfigError as exc:
+        _fail(str(exc))
+    print(cfg.to_shell(settings))
 
 
 # --- detection ----------------------------------------------------------------
@@ -795,6 +823,17 @@ def build_parser():
     p.add_argument("--request-timeout", type=float, default=1800.0)
     p.add_argument("--path", default="/inference")
     p.set_defaults(func=cmd_transcribe_remote)
+
+    p = sub.add_parser(
+        "config", help="resolve settings and print them as shell assignments")
+    p.add_argument("--config", default="", help="config file; searched if absent")
+    p.add_argument("--script-root", required=True,
+                   help="fallback PODCAST_ROOT: the directory holding the script")
+    p.add_argument("--set", action="append", metavar="NAME=VALUE",
+                   help="override one setting; repeatable, beats env and file")
+    p.add_argument("--no-keys", action="store_true",
+                   help="skip reading the API key files")
+    p.set_defaults(func=cmd_config)
 
     p = sub.add_parser("whisper-wait", help="check a whisper endpoint is reachable")
     p.add_argument("--endpoint", required=True)
