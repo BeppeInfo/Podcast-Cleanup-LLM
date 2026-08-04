@@ -8,6 +8,12 @@ stale are [Cuts and mutes](#cuts-and-mutes), [The data flow](#the-data-flow) and
 [Invariants](#invariants) — the last of these is the list a change can quietly
 break without any test noticing.
 
+Two of them have gone stale in exactly that way and were rewritten rather than
+patched: §2 described a shell/Python split that no longer organises anything, and
+§9 listed an invariant whose mechanism had been deleted. Both now say what
+replaced them *and* what was given up, because a reasoning record that only lists
+current decisions is not much use for the next one.
+
 ---
 
 ## 1. The problem
@@ -27,25 +33,65 @@ business of whatever machine serves them; see §7 for what that gave up.
 ## 2. Shape of the solution
 
 ```
-                 ┌─────────────────────── clean-podcast.sh ──────────────────────┐
-                 │  CLI · config · stage sequencing · failure handling           │
-                 └───┬───────────────────────────────────────────────────────┬───┘
-                     │ drives                                                │ calls
-        ┌────────────▼────────────┐                        ┌─────────────────▼──────────────┐
-        │ ffmpeg  whisper  llama  │                        │ python/cleanup_cli.py          │
-        │ (audio and the models)  │                        │ + python/cleanup/*  (decisions)│
-        └─────────────────────────┘                        └────────────────────────────────┘
+   clean-podcast.sh ──────┐                    ┌────── a second front end
+   options · settings     │                    │       (a web app; not written yet)
+   find ffmpeg · exec     │                    │
+                          ▼                    ▼
+              ┌───────────────────────────────────────────┐
+              │ python/cleanup/pipeline.py                │
+              │ the stages, in order, and what they mean  │
+              └───┬───────────────────────────────────┬───┘
+                  │ runs, via proc.py                 │ decides with
+        ┌─────────▼──────────────────┐   ┌────────────▼──────────────────┐
+        │ ffmpeg                     │   │ intervals · plan · transcript  │
+        │ asr.py  ──→ whisper-server │   │ render · discover · silence    │
+        │ llm.py  ──→ llama-server   │   │ (no audio, no sockets, no      │
+        │                            │   │  subprocesses — just judgement)│
+        └────────────────────────────┘   └────────────────────────────────┘
 ```
 
-The split is deliberate and worth preserving: **the shell touches audio and
-processes, the Python decides what to do and never touches audio.** Every
-interesting judgement — interval algebra, which findings to trust, what to cut —
-is therefore reachable from a unit test without any external tool.
+`pipeline.py` is the engine. It owns the stage sequence, what each stage does,
+resuming, and what happens when one fails. `clean-podcast.sh` parses the options,
+resolves the settings, finds ffmpeg, and execs it — that is all it is for, and a
+web app will enter at the same place with the same settings.
 
-The draft this replaced generated Python inside unquoted shell heredocs, so
-every `$` in a regex was a hazard and nothing was testable. There are no
-heredocs in the pipeline now; Python lives in `.py` files and is invoked with
-argv.
+**The organising split used to be a different one, and it is worth knowing why it
+went.** For most of this project's life the rule was *the shell touches audio and
+processes, the Python decides what to do and never touches audio* — so every
+judgement was reachable from a unit test with no external tool. That was a good
+rule and it is no longer the rule. The reason is that a second front end cannot
+call a bash function: a web app driving this pipeline would either shell out to
+`clean-podcast.sh` and scrape its filesystem side effects, or grow a second copy
+of the sequencing. Both are worse than moving the sequencing into Python, so the
+sequencing moved, and running ffmpeg came with it.
+
+What was actually valuable in the old rule is kept, by a narrower boundary
+instead. The modules in the right-hand box — `intervals`, `plan`, `transcript`,
+`render`, `discover`, `silence` — open no sockets, start no processes and touch no
+audio. Every judgement that decides what happens to the audio lives in one of
+them, so a test for what gets cut still needs nothing but python3. `pipeline.py`
+and `proc.py` are where subprocesses happen, and they are deliberately thin: they
+sequence and report, they do not decide.
+
+`asr.py` and `llm.py` sit outside that tidy split, and always have. Each is a
+client *and* a body of judgement — `llm._validate` decides which findings to
+trust, `asr.reask_collapsed` decides which words to question again — in the same
+file as the socket. That is why `tests/stub_servers.py` exists: standing up a fake
+HTTP server is the only way to reach those decisions, and it is a worse way than
+calling a function. Worth separating one day; not worth pretending is already
+done.
+
+The cost is real and worth stating. `lib/stages.sh` was 1010 lines of bash that
+one could read top to bottom; the same logic in Python is spread over functions
+and is easier to get subtly wrong in ways a shell script's linear flow would have
+made obvious. Six ports in, the suites caught four such mistakes — a skipped
+re-measure, a renamed key in `expected.json`, an early return that skipped
+cleanup, and a guard that rejected what it should have allowed. None were
+visible by reading.
+
+The draft *this* replaced generated Python inside unquoted shell heredocs, so
+every `$` in a regex was a hazard and nothing was testable. There are no heredocs
+in the pipeline, and there never should be again.
 
 ## 3. Cuts and mutes
 
@@ -130,6 +176,7 @@ inputs/<episode>_<participant>.<ext>       any format ffmpeg can decode
    │               llm/<p>.audit.jsonl    every response, accepted or not
    │
    ├─ plan ──────→ plan.json         cuts, mutes, keep-list, stats, warnings
+   │               params.json       the numbers this run used, for the record
    │               expected.json     frame-exact predicted output length
    │               render/<p>.filter one ffmpeg filtergraph per track
    │
@@ -752,9 +799,11 @@ are marked.
    `output_duration == total(keep)`.
 5. **No LLM-supplied number reaches the audio unvalidated.** Indices are checked
    against the transcript; timings come from Whisper.
-6. **No locally managed Whisper process overlaps a locally managed llama server.**
-   *(Structural — no test; check `stage_transcribe` and `stage_detect` when
-   touching either.)*
+6. ~~**No locally managed Whisper process overlaps a locally managed llama
+   server.**~~ *Retired.* There are no locally managed model processes: both are
+   endpoints someone else runs. Whether they fit in memory together is the
+   serving machine's business, and nothing here can enforce it. §7 records what
+   that gave up rather than letting it evaporate.
 7. **Inputs are deleted only after every output is verified.**
 8. **The transcript describes the audio that now exists** — words removed by a
    cut or silenced by a mute are gone from it, and timestamps are on the rendered
@@ -765,11 +814,17 @@ are marked.
     tolerance — dropping a window whose response cannot be used — is only safe
     because it is rare. A refused key, an unhonoured schema, or a server with no
     model loaded would drop all of them and finish reporting no edits, which is
-    indistinguishable from clean speech, so all three abort instead (exit 2, 3
-    and 5). A track where *every* window failed for ordinary reasons is the
-    weaker case: exit 4, which fails that track and lets the rest of the episode
-    finish. Any new whole-run failure mode belongs here rather than in the
-    per-chunk `except`.
+    indistinguishable from clean speech, so all three abort instead. A track where
+    *every* window failed for ordinary reasons is the weaker case: that track is
+    left unmarked and the rest of the episode finishes, so a resumed run retries
+    it rather than skipping it as complete. Any new whole-run failure mode belongs
+    with the first three rather than in the per-chunk `except`.
+
+    These were four exit codes — 2, 3, 5 and 4 — while the shell ran one Python
+    process per track and had to branch on what came back. In one process they are
+    `AuthRejected`, `SchemaIgnored`, `ModelUnavailable` and a counted failure, and
+    the distinction lives in where each is caught rather than in a number two
+    languages had to agree on.
 
     The unloaded model earned its place the hard way. A router with
     `--no-models-autoload` dropped the model *during* the transcribe stage, so
@@ -810,10 +865,19 @@ models, and nothing on the network.
 
 | Layer | Runs | Needs | Catches | Cannot catch |
 | --- | --- | --- | --- | --- |
-| Unit — `tests/test_pipeline.py` | pure decision code | python3 | wrong intervals, bad validation, malformed expressions | anything about what ffmpeg or a model actually does |
+| Unit — `tests/test_pipeline.py` | the decision modules, and each stage | python3; ffmpeg and bash for some | wrong intervals, bad validation, malformed expressions, a stage skipping work or deleting too early | anything about what a model actually does |
 | Stubbed integration — same file + `tests/stub_servers.py` | real HTTP clients against fake servers | python3 | wrong request payloads, bad response handling, retry behaviour | whether a real server would answer that way |
 | End to end — `tests/selftest.sh` | the real pipeline over synthetic audio | ffmpeg | wrong rendered audio, wrong stage wiring, wrong file layout | model quality, real-world audio, long-file behaviour |
 | Manual — `tests/samples/` against real servers | the whole pipeline over a real recording | ffmpeg, a whisper-server, a llama-server | wire formats a stub would have accepted, quiet speech, invented words, a threshold in the wrong place | anything absent from one 11-second clip |
+
+The first layer stopped being purely pure when the stages moved into Python, and
+that was worth accepting. Most of it still needs nothing but python3, but the
+stage tests run real ffmpeg over a fraction of a second of synthesised audio, and
+the log tests run bash to compare against `lib/log.sh`. In exchange, things that
+were previously only reachable end to end — a resumed stage skipping its
+re-measure, a publish failing without deleting the inputs, a no-edit track being
+copied rather than converted — are now unit-testable, and three of those were
+broken when first tested.
 
 The unit layer is where a bug should be reproduced if it possibly can be: it is
 fast, needs no audio, and a failure points at one function. The end-to-end layer
@@ -1038,12 +1102,18 @@ logs for inspection.
   non-lexical sounds. Crutches made of real words — *"well…"*, *"you know"*,
   *"né"* — are detected by no kind at all (§6).
 - Whisper removes some disfluencies during transcription, so `detect` can only
-  work on what survives (§6). Its yield is lower than the raw speech would
-  suggest, and nothing recovers the difference.
-- **Nothing checks the transcript against the audio**, because the speech map is
-  derived from the transcript (§7). Audible material Whisper wrote nothing for —
-  laughter, a cough, a dropped filler — reads as silence and can be cut. Only the
-  shape of a looping transcript is still detectable.
+  work on what survives (§6). `WHISPER_PROMPT` recovers most of them — five of six
+  on the sample fixture — but it is a decoding bias, not a guarantee, and one
+  false start resisted every setting tried. The yield is still bounded by the
+  transcript, and nothing recovers what stays absent.
+- **Almost nothing checks the transcript against the audio.** The speech map is
+  made of the transcript (§7), so audible material Whisper wrote nothing for —
+  laughter, a cough, a dropped filler — reads as silence and can be cut. Two
+  things narrow that. The level scan refuses a cut over a long stretch of loud
+  audio no transcript accounts for, and `SPEECH_MAP_CLIP` stops a word's timings
+  claiming silence they ran across. Neither can tell speech from a cough, so
+  neither turns the scan into a speech map; the shape of a looping transcript
+  remains the only other signal.
 - **A whisper build that ignores the `vad_*` request fields is undetectable from
   here.** It answers normally and transcribes the silence too, and what it invents
   there becomes speech in the plan. `whisper-server --help | grep -c vad` should
