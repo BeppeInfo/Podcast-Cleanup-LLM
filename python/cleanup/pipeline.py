@@ -386,7 +386,10 @@ def run_episode(settings, log, stages, *, episode_override: str = "",
                                    settings, log, episode.id, episode.tracks)
                 log.stage_end(f"outputs in {episode.output}")
 
-            if stage != "discover":
+            # Not finalize: it has just removed the work directory that the
+            # marker would live in, and a stage that deletes its own state has
+            # nothing to record. Nothing resumes past it either.
+            if stage not in ("discover", "finalize"):
                 state_mark(episode, stage, dry_run)
 
     except NothingToDo as exc:

@@ -1320,6 +1320,71 @@ fi
 # ============================================================================
 
 printf '\n'
+# ============================================================================
+printf '\n%sCase 14: the default run cleans up after itself%s\n' "$BOLD" "$RESET"
+# ============================================================================
+#
+# Every other case passes --keep-work, because every other case wants to read the
+# work directory afterwards. That left the *default* — delete the inputs and the
+# work directory once the outputs are verified — exercised by nothing, which is
+# how a run that published correctly could still end by failing to write a state
+# marker into a directory it had just removed.
+
+CASE14="$SANDBOX/case14"
+# Both tracks sound throughout, so the level scan does not clip the stub's
+# transcript back and the speech map is the words themselves — as in case 1.
+build_episode ep014 "$CASE14/incoming" \
+    "$(windows_expr '0,10')" "$(windows_expr '0,10')" 10
+
+python3 - "$SANDBOX" <<'REPLIES14'
+import json, os, sys
+sandbox = sys.argv[1]
+# Dense enough that the plan removes a plausible slice. A sparser transcript
+# makes almost the whole episode silence, and MAX_CUT_FRACTION refuses it —
+# correctly, and unhelpfully for a case about what happens after success.
+moments = [n / 2 for n in range(1, 8)] + [n / 2 for n in range(12, 19)]
+words = [{"text": f"w{i}", "offsets": {"from": int(at * 1000),
+                                       "to": int((at + 0.4) * 1000)}}
+         for i, at in enumerate(moments)]
+with open(os.path.join(sandbox, "w14.json"), "w") as handle:
+    json.dump([{"segments": words}], handle)
+with open(os.path.join(sandbox, "l14.json"), "w") as handle:
+    json.dump([{"edits": []}], handle)
+REPLIES14
+
+W14="$SANDBOX/w14.port"
+L14="$SANDBOX/l14.port"
+W14_PID=$(start_stub whisper "$SANDBOX/w14.json" "$W14" "$SANDBOX/w14-req.jsonl")
+L14_PID=$(start_stub llama "$SANDBOX/l14.json" "$L14" "$SANDBOX/l14-req.jsonl")
+
+if wait_for_port_file "$W14" && wait_for_port_file "$L14"; then
+    if "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
+        --input "$CASE14/incoming" --output "$CASE14/output" \
+        --work "$CASE14/work" --config "$CONF" --quiet \
+        --whisper-endpoint "http://127.0.0.1:$(cat "$W14")" \
+        --llama-endpoint "http://127.0.0.1:$(cat "$L14")" \
+        >"$SANDBOX/case14.stdout" 2>&1
+    then
+        check "a default run completes" true
+    else
+        check "a default run completes" false
+        fail_note "$(tail -n 25 "$SANDBOX/case14.stdout")"
+    fi
+
+    check "the work directory is gone" \
+        bash -c "[[ ! -d '$CASE14/work/ep014' ]]"
+    check "the inputs are gone" \
+        bash -c "[[ -z \"\$(ls -A '$CASE14/incoming' 2>/dev/null)\" ]]"
+    check "the outputs are there" \
+        bash -c "[[ -s '$CASE14/output/ep014/alice.flac' && -s '$CASE14/output/ep014/bob.flac' ]]"
+    check "the log outlived the work directory" \
+        bash -c "[[ -s '$CASE14/output/ep014/logs/run.log' ]]"
+    check "the run finished rather than merely published" \
+        bash -c "grep -q 'finished ep014' '$CASE14/output/ep014/logs/run.log'"
+fi
+kill "$W14_PID" "$L14_PID" 2>/dev/null || true
+
+
 if (( FAILURES == 0 )); then
     printf '%s✓ all %d checks passed%s\n\n' "$GREEN" "$CHECKS" "$RESET"
     exit 0

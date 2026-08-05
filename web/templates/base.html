@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Podcast cleanup{% endblock %}</title>
+{% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
+<style>
+  :root { color-scheme: light dark; --edge: #8883; --dim: #8888; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 46rem;
+         margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; margin: 0; }
+  h2 { font-size: 1rem; margin: 1.6rem 0 .4rem; }
+  nav { display: flex; gap: 1rem; align-items: baseline;
+        border-bottom: 1px solid var(--edge); padding-bottom: .6rem;
+        margin-bottom: 1.2rem; }
+  nav .spacer { flex: 1; }
+  a { color: inherit; }
+  .dim { color: var(--dim); }
+  .row { display: grid; grid-template-columns: 15rem 1fr; gap: .5rem 1rem;
+         align-items: baseline; margin-bottom: .5rem; }
+  .row label { text-align: right; }
+  .hint { grid-column: 2; font-size: .85em; color: var(--dim); margin-top: -.3rem; }
+  input[type=text], input[type=number], select { width: 100%; padding: .3rem;
+         font: inherit; border: 1px solid var(--edge); border-radius: 3px;
+         background: transparent; color: inherit; }
+  input[type=file] { font: inherit; }
+  button { font: inherit; padding: .4rem .9rem; border: 1px solid var(--edge);
+           border-radius: 3px; background: transparent; color: inherit;
+           cursor: pointer; }
+  button.primary { border-color: currentColor; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  fieldset { border: 1px solid var(--edge); border-radius: 4px;
+             margin: 0 0 1.2rem; padding: .8rem 1rem 1rem; }
+  legend { padding: 0 .4rem; font-weight: 600; }
+  ol.stages { list-style: none; padding: 0; }
+  ol.stages li { padding: .15rem 0; }
+  ol.stages .done::before    { content: "\2713  "; }
+  ol.stages .running::before { content: "\25B8  "; }
+  ol.stages .pending::before { content: "\00B7  "; color: var(--dim); }
+  ol.stages .skipped::before { content: "\2013  "; color: var(--dim); }
+  ol.stages .pending, ol.stages .skipped { color: var(--dim); }
+  pre.log { background: #8881; padding: .6rem .8rem; border-radius: 4px;
+            overflow-x: auto; font-size: .85em; max-height: 16rem; }
+  .notice { border: 1px solid var(--edge); border-left: 3px solid currentColor;
+            padding: .6rem .9rem; border-radius: 3px; margin-bottom: 1rem; }
+  ul.files { list-style: none; padding: 0; }
+  ul.files li { padding: .1rem 0; }
+</style>
+</head>
+<body>
+<nav>
+  <h1><a href="{{ url_for('index') }}" style="text-decoration:none">Podcast cleanup</a></h1>
+  <span class="spacer"></span>
+  <a href="{{ url_for('index') }}">Episode</a>
+  <a href="{{ url_for('settings_page') }}">Settings</a>
+</nav>
+{% block body %}{% endblock %}
+</body>
+</html>

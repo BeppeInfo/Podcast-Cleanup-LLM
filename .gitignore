@@ -19,3 +19,6 @@ podcast-cleanup.conf
 /*.wav
 /*.m4a
 /*.mp3
+
+# The web app's data volume when it is run from a checkout.
+/data/

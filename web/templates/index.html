@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block body %}
+
+{% if error %}<p class="notice">{{ error }}</p>{% endif %}
+
+{% if status.state == "running" %}
+
+  <h2>{{ status.episode }} — running <span class="dim">({{ status.elapsed }})</span></h2>
+  <ol class="stages">
+    {% for name, state in status.stages %}
+      <li class="{{ state }}">{{ name }}{% if state == "skipped" %} <span class="dim">— skipped</span>{% endif %}</li>
+    {% endfor %}
+  </ol>
+  {% if status.recent %}
+    <pre class="log">{% for line in status.recent %}{{ line }}
+{% endfor %}</pre>
+  {% endif %}
+  <p class="dim">This page refreshes itself. Uploading is closed until the run
+  finishes — one episode at a time.</p>
+
+{% elif status.state in ("done", "failed") %}
+
+  {% if status.state == "failed" %}
+    <h2>{{ status.episode }} — failed</h2>
+    <p class="notice">{{ status.error }}<br>
+      <span class="dim">Nothing was deleted. The work directory and the
+      original inputs are where they were, so the run can be resumed from the
+      command line.</span></p>
+  {% else %}
+    <h2>{{ status.episode }} — finished <span class="dim">in {{ status.elapsed }}</span></h2>
+  {% endif %}
+
+  <ol class="stages">
+    {% for name, state in status.stages %}
+      <li class="{{ state }}">{{ name }}</li>
+    {% endfor %}
+  </ol>
+
+  {% if outputs %}
+    <h2>Results</h2>
+    <ul class="files">
+      {% for name in outputs %}<li class="dim">{{ name }}</li>{% endfor %}
+    </ul>
+    <p>
+      <a href="{{ url_for('download', episode=status.episode) }}">
+        <button class="primary" type="button">Download all &amp; remove</button></a>
+      <a href="{{ url_for('download', episode=status.episode, keep=1) }}">
+        <button type="button">Download &amp; keep</button></a>
+    </p>
+    <p class="dim">Downloading removes the episode from the server unless you
+    choose keep. If a download is interrupted, use keep and check the file
+    before clearing it.</p>
+  {% else %}
+    <p class="dim">No output files.</p>
+  {% endif %}
+
+  {% if status.recent %}
+    <pre class="log">{% for line in status.recent %}{{ line }}
+{% endfor %}</pre>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('reset') }}" style="display:inline">
+    <button type="submit">Start another</button>
+  </form>
+  {% if outputs %}
+    <form method="post" action="{{ url_for('discard') }}" style="display:inline">
+      <input type="hidden" name="episode" value="{{ status.episode }}">
+      <button type="submit">Discard without downloading</button>
+    </form>
+  {% endif %}
+
+{% else %}
+
+  <h2>New episode</h2>
+  <form method="post" action="{{ url_for('start') }}" enctype="multipart/form-data">
+    <div class="row">
+      <label for="episode">Episode name</label>
+      <input type="text" id="episode" name="episode" required
+             placeholder="ep042" pattern="[A-Za-z0-9_-]+">
+      <p class="hint">Letters, numbers, dashes and underscores. It names the
+      output directory.</p>
+    </div>
+
+    <fieldset>
+      <legend>Tracks</legend>
+      <p class="dim">One file per participant, already synchronised — sample 0
+      of each must be the same instant. Nothing here aligns them.</p>
+      {% for n in range(1, 5) %}
+        <div class="row">
+          <label for="p{{ n }}">Participant {{ n }}</label>
+          <div>
+            <input type="text" id="p{{ n }}" name="participant"
+                   placeholder="{% if n == 1 %}host{% elif n == 2 %}guest{% else %}optional{% endif %}"
+                   pattern="[A-Za-z0-9_-]*">
+            <input type="file" name="track" accept="audio/*,video/*">
+          </div>
+        </div>
+      {% endfor %}
+    </fieldset>
+
+    <button class="primary" type="submit">Start</button>
+    <span class="dim">Settings are on the other page and apply to this run.</span>
+  </form>
+
+{% endif %}
+{% endblock %}

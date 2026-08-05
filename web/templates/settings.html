@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block body %}
+
+{% if request.args.get("saved") %}
+  <p class="notice">Saved. These apply to the next run.</p>
+{% endif %}
+{% if problems %}
+  <p class="notice">Not saved:<br>
+    {% for problem in problems %}{{ problem }}<br>{% endfor %}</p>
+{% endif %}
+{% if busy %}
+  <p class="notice">A run is in progress. Changes saved now apply to the
+  <em>next</em> one — the running episode keeps the settings it started with.</p>
+{% endif %}
+
+<form method="post" action="{{ url_for('settings_page') }}">
+  {% for group in groups %}
+    <fieldset>
+      <legend>{{ group.title }}</legend>
+      {% if group.blurb %}<p class="dim">{{ group.blurb }}</p>{% endif %}
+      {% for name, label, hint in group.fields %}
+        {% set field = spec(name) %}
+        <input type="hidden" name="present" value="{{ name }}">
+        <div class="row">
+          <label for="{{ name }}">{{ label }}</label>
+          {% if field.kind == "flag" %}
+            <div>
+              <input type="checkbox" id="{{ name }}" name="{{ name }}" value="1"
+                     {% if values[name] == "1" %}checked{% endif %}>
+              {% if name in saved %}<span class="dim">· changed</span>{% endif %}
+            </div>
+          {% elif field.kind == "choice" %}
+            <select id="{{ name }}" name="{{ name }}">
+              {% for option in field.choices %}
+                <option value="{{ option }}"
+                  {% if values[name] == option %}selected{% endif %}>{{ option }}</option>
+              {% endfor %}
+            </select>
+          {% else %}
+            <input type="text" id="{{ name }}" name="{{ name }}"
+                   value="{{ values[name] }}">
+          {% endif %}
+          {% if hint or name in saved %}
+            <p class="hint">
+              {{ hint }}{% if hint and name in saved %} · {% endif %}
+              {% if name in saved %}changed from the default
+                <code>{{ field.default }}</code>{% endif %}
+            </p>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </fieldset>
+  {% endfor %}
+
+  <button class="primary" type="submit">Save</button>
+</form>
+
+<form method="post" action="{{ url_for('settings_reset') }}"
+      style="margin-top:.6rem">
+  <button type="submit">Reset everything to defaults</button>
+</form>
+
+<h2>Not on this page</h2>
+<p class="dim">
+  Three kinds of setting are deliberately absent. <strong>Paths</strong> are how
+  the container is wired to its volume, and a page that could rewrite them could
+  write anywhere. <strong>Filename conventions</strong> are unnecessary here —
+  the upload form asks for the episode and each participant and writes the names
+  itself. <strong>API keys</strong> would be stored in clear on the volume; set
+  them in the environment, or point the <code>_FILE</code> variants at a file you
+  control.
+</p>
+<p class="dim">
+  Only settings you have changed are stored. Anything untouched keeps following
+  the built-in default, so a later version with better defaults still reaches you.
+</p>
+{% endblock %}
