@@ -1,0 +1,21 @@
+# Recordings never belong in an image. .gitignore keeps them out of the
+# checkout root for the same reason; this keeps them out of the build context
+# even when someone has them lying there.
+*.flac
+*.wav
+*.m4a
+*.mp3
+/incoming/
+/output/
+/work/
+/failed/
+/data/
+
+.git/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Machine-specific; the image deliberately ships no config file so that the
+# environment is what configures a container.
+podcast-cleanup.conf

@@ -1,0 +1,40 @@
+# Bring the interface up against models you are already running.
+#
+#   docker compose up --build
+#   open http://127.0.0.1:8000
+#
+# Neither model is in this image. Point the two endpoints at wherever they are;
+# if that is this same machine, see the note under `network_mode` below.
+
+services:
+  cleanup:
+    build:
+      context: .
+      target: runtime
+    # 127.0.0.1 on purpose. There is no authentication here and ffmpeg is handed
+    # whatever is uploaded, so this belongs on a machine you trust. Change it
+    # only if you know what is in front of it.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      # Both are required — there is no local model mode.
+      WHISPER_ENDPOINT: "${WHISPER_ENDPOINT:-http://host.docker.internal:8081}"
+      LLAMA_ENDPOINT: "${LLAMA_ENDPOINT:-http://host.docker.internal:8080}"
+      # A llama-server in router mode needs to be told which model to load.
+      LLAMA_MODEL_NAME: "${LLAMA_MODEL_NAME:-}"
+      WHISPER_LANG: "${WHISPER_LANG:-auto}"
+      # Without this Whisper returns fluent prose and the disfluencies never
+      # reach the detector. See DESIGN.md §6 — it matters more than it looks.
+      WHISPER_PROMPT: "${WHISPER_PROMPT:-Um, uh, so, like, you know, I mean — um, that's, that's the thing.}"
+      # Anything else is set on the Settings page and kept in data/settings.json.
+    # Lets the two host.docker.internal names above resolve on Linux, where they
+    # otherwise would not. If the models are on another machine, name it in the
+    # endpoints instead and this line does nothing.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+# The volume is a bind mount rather than a named volume so the finished episodes
+# are somewhere you can reach without docker: ./data/output/<episode>/.

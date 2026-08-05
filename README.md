@@ -1,16 +1,25 @@
 # Podcast-Cleanup-LLM
 
-Set of scripts for cleaning up a multi-track podcast recording using FFMPEG,
-Whisper and llama.cpp.
+Cleans up a multi-track podcast recording using ffmpeg, Whisper and llama.cpp.
 
 Takes the synchronised per-participant tracks of one episode, works out which
 stretches are dead air and which are speech disfluencies, and renders the tracks
 back out — still separate, still in sync, ready for mixing.
 
 ```sh
-clean-podcast.sh                      # uses ./incoming, creating it if need be
-clean-podcast.sh --root /srv/media/podcast
+docker compose up --build             # then http://127.0.0.1:8000
 ```
+
+or from a checkout, with no dependencies beyond ffmpeg and python3:
+
+```sh
+./clean-podcast.sh                    # uses ./incoming, creating it if need be
+./clean-podcast.sh --root /srv/media/podcast
+```
+
+Both drive the same pipeline. [Two ways to run it](#two-ways-to-run-it) has the
+detail; the short version is that the container adds a web interface and the
+checkout does not.
 
 ## What it does to the audio
 
@@ -37,11 +46,13 @@ entirely, so the edit keeps its breathing room instead of sounding gasped.
 
 | Tool | Needed for | Notes |
 | --- | --- | --- |
-| ffmpeg + ffprobe | everything | the only hard dependency |
-| python3 | everything | standard library only |
-| a whisper-server | the `transcribe` stage | reached over HTTP; not started here |
-| a llama-server | the `detect` stage | reached over HTTP; not started here |
+| ffmpeg + ffprobe | everything | the only hard dependency; in the image already |
+| python3 | everything | standard library only; the image pins 3.12 |
+| a whisper-server | the `transcribe` stage | reached over HTTP; not started here, and not in the image |
+| a llama-server | the `detect` stage | reached over HTTP; not started here, and not in the image |
 | a Silero VAD model | the `transcribe` stage | `ggml-silero-*.bin`, run by whisper.cpp itself — no Python package |
+| Flask + waitress | the web interface only | in the image; running from a checkout needs neither |
+| numpy + scipy | `tools/` only | for measuring a run against a hand edit; the `dev` image target has them |
 
 ## Where the models run
 
@@ -280,7 +291,53 @@ catches is otherwise invisible: a server that ignores `response_format` returns
 prose, every chunk is dropped as unparseable, and the run finishes reporting no
 edits at all — which looks exactly like a clean recording.
 
+## Two ways to run it
+
+**In a container, with a web interface.** This is the default and what most
+people want: upload the tracks, watch it work, download the result.
+
+```sh
+docker compose up --build
+# then open http://127.0.0.1:8000
+```
+
+Neither model is in the image — both are servers you already run, named by
+`WHISPER_ENDPOINT` and `LLAMA_ENDPOINT`. Everything else is on the Settings page
+and is kept in `data/settings.json`, so it survives a restart. Finished episodes
+land in `data/output/<episode>/`, which is a bind mount, so they are reachable
+without docker.
+
+The interface **has no authentication**, and it hands ffmpeg whatever is
+uploaded. `compose.yml` binds it to `127.0.0.1` for that reason. It is a tool for
+a machine you trust.
+
+One episode runs at a time and the upload form is closed while it does. That is
+not a placeholder for a queue: the single-job lock lives in the web process's
+memory, so the image must run **exactly one worker**, which is why it serves with
+waitress rather than gunicorn with several. Downloading a finished episode
+removes it from the server unless you pick *Download & keep*.
+
+The same image runs the CLI, and a `dev` target adds the test suites and the
+tools in `tools/`:
+
+```sh
+docker run --rm -v ./data:/data podcast-cleanup:runtime cli --help
+docker build --target dev -t podcast-cleanup:dev . && docker run --rm podcast-cleanup:dev
+```
+
+**From a checkout, on the command line.** No container, no dependencies beyond
+ffmpeg and python3 — the pipeline is standard library only. The web interface is
+container-only; Flask is not needed, or wanted, for this.
+
+```sh
+./clean-podcast.sh              # everything in incoming/
+```
+
 ## Setup
+
+The container takes its settings from the environment and the Settings page, and
+ships **no config file** deliberately: one inside the image would outrank every
+`-e` passed to it. What follows is for running from a checkout.
 
 ```sh
 cp podcast-cleanup.conf.example ~/.config/podcast-cleanup/config

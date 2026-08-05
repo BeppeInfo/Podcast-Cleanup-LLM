@@ -1,0 +1,4 @@
+# The web layer only. The pipeline underneath it is standard library, and
+# running from a checkout needs none of this — see the CLI-only note in README.
+Flask>=3.0,<4
+waitress>=3.0,<4
