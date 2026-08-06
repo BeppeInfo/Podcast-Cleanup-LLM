@@ -103,43 +103,6 @@ config_need_python() {
     log_debug "python: $PYTHON"
 }
 
-# config_dump — every effective setting, to the log (and to stderr at -v).
-#
-# API keys are reported as present or absent and never by value: this log is
-# copied into the output directory and kept after everything else is deleted.
-config_dump() {
-    local v
-    log_debug "config file: ${CONFIG_FILE:-<none, using defaults>}"
-    local secret
-    for v in WHISPER_API_KEY LLAMA_API_KEY; do
-        secret="${!v}"
-        if [[ -n "$secret" ]]; then
-            log_raw "  config $v=<set, ${#secret} chars, redacted>"
-        else
-            log_raw "  config $v=<unset>"
-        fi
-    done
-    for v in PODCAST_ROOT INPUT_DIR OUTPUT_DIR WORK_ROOT FAILED_DIR \
-             INPUT_EXTS TRACK_SEPARATOR \
-             OUTPUT_CODEC OUTPUT_EXT OUTPUT_EXTRA_ARGS RESAMPLE_TO \
-             WHISPER_ENDPOINT WHISPER_ENDPOINT_PATH WHISPER_CHUNK_SECONDS \
-             WHISPER_REQUEST_TIMEOUT \
-             WHISPER_LANG \
-             WHISPER_VAD WHISPER_VAD_THRESHOLD \
-             WHISPER_VAD_MIN_SPEECH_MS WHISPER_VAD_MIN_SILENCE_MS \
-             WHISPER_VAD_SPEECH_PAD_MS WHISPER_VAD_SAMPLES_OVERLAP \
-             WHISPER_RECOVER WHISPER_PROMPT WHISPER_REASK \
-             WHISPER_REASK_WORD_SECONDS WHISPER_REASK_WINDOW SPEECH_MAP_CLIP \
-             LLAMA_ENDPOINT \
-             LLAMA_MODEL_NAME LLM_API LLM_MAX_REPLY_TOKENS \
-             LLM_CHECK_SCHEMA LLM_CONCURRENCY \
-             SPLIT_SILENCE_THRESHOLD SPLIT_MIN_SILENCE SPEECH_PAD \
-             SILENCE_MIN_DURATION SILENCE_KEEP EDGE_KEEP CUT_PADDING MIN_CUT \
-             MUTE_FADE LLM_ENABLE LLM_CHUNK_WORDS LLM_CHUNK_OVERLAP \
-             LLM_MAX_EDIT_WORDS LLM_MAX_EDIT_SECONDS LLM_MIN_CONFIDENCE \
-             LLM_ACCEPT_KINDS MAX_CUT_FRACTION OUTPUT_COMPRESSION OUTPUT_SUFFIX \
-             RENDER_FRAME_SAMPLES FFMPEG_JOBS KEEP_WORK KEEP_INPUTS \
-             DURATION_TOLERANCE; do
-        log_raw "  config $v=${!v}"
-    done
-}
+# The dump of every effective setting is config.dump() on the Python side, run
+# from run_episode so the web front end gets it too. Keeping a second list of
+# setting names here is what let six of them go unlogged.

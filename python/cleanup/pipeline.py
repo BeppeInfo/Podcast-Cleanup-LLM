@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import time
 
+from . import config as cfg
 from . import intervals as iv
 from . import plan as planner
 from . import asr, discover as disco, llm, proc, render
@@ -309,6 +310,9 @@ def run_episode(settings, log, stages, *, episode_override: str = "",
     same failure handling.
     """
     keys = api_keys or {}
+    # First thing in the log, before anything can fail: what this run thinks
+    # it was told to do.
+    cfg.dump(settings, log)
     log.stage_total(len(stages))
     episode = None
 

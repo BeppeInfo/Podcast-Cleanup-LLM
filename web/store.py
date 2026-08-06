@@ -159,7 +159,13 @@ def effective(root: str, environ=None) -> dict[str, str]:
     for since, and that is the more specific statement.
     """
     settings = cfg.from_environment(environ)
-    settings.update(load(root))
+    saved = load(root)
+    settings.update(saved)
+    # So the run log names what the values came from, the way the CLI's dump
+    # names a config file. Only when the form has actually saved something —
+    # otherwise the file does not exist and the environment is the whole story.
+    if saved:
+        settings["_CONFIG_FILE"] = _path(root)
     return settings
 
 

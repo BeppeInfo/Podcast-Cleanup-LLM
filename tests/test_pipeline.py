@@ -2880,6 +2880,39 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(set(values), set(cfg.SETTINGS))
         self.assertTrue(values["FFMPEG_JOBS"].isdigit())
 
+    def _dumped(self, settings):
+        """The dump's log lines, as `name -> value`."""
+        path = os.path.join(tempfile.mkdtemp(), "run.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), True)
+        cfg.dump(settings, runlog.Log(path, level="error", stream=io.StringIO()))
+        with open(path, encoding="utf-8") as handle:
+            body = handle.read()
+        out = {}
+        for line in body.splitlines():
+            _, _, rest = line.partition("  config ")
+            if rest:
+                name, _, value = rest.partition("=")
+                out[name] = value
+        return out, body
+
+    def test_dump_covers_every_setting(self):
+        # The shell kept this list by hand and it fell six names behind, so a
+        # setting could change a run without the log showing it. Driven by
+        # SETTINGS now; this fails if that ever stops being true.
+        dumped, _ = self._dumped(cfg.defaults())
+        self.assertEqual(set(dumped), set(cfg.SETTINGS))
+
+    def test_dump_redacts_the_api_keys(self):
+        settings = cfg.defaults()
+        settings["WHISPER_API_KEY"] = "sk-secret-value"
+        dumped, body = self._dumped(settings)
+        # Present, and its length, but never the key: this log is copied into
+        # the output directory and outlives everything else in the run.
+        self.assertNotIn("sk-secret-value", body)
+        self.assertEqual(dumped["WHISPER_API_KEY"],
+                         f"<set, {len('sk-secret-value')} chars, redacted>")
+        self.assertEqual(dumped["LLAMA_API_KEY"], "<unset>")
+
     def test_config_file_is_sourced_by_bash(self):
         # Not parsed here: a value referencing another one has to keep working.
         path = self._conf('SILENCE_KEEP="0.2"\nOUTPUT_EXT="wav"\n'

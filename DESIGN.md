@@ -739,8 +739,16 @@ auth of its own, so its key is for whatever fronts it; llama.cpp's matches
 
 Where the key must *not* end up drove the design. It reaches Python through the
 environment, never argv, because a command line is readable by any process on
-the machine; and `config_dump` records only whether one was set, because the run
-log is copied into the output directory and outlives the episode.
+the machine; and `config.dump` records only whether one was set and how long it
+was, because the run log is copied into the output directory and outlives the
+episode.
+
+That dump is driven by `SETTINGS` rather than by a list maintained beside it.
+The shell kept such a list, and by the time the dump moved to Python it had
+fallen six names behind — six settings that could change a run without the log
+admitting it. It also lived on the CLI path only, so a web run produced the one
+artifact that survives delete-after-download with no record of what made it.
+`run_episode` calls it now, which is the point where both front ends meet.
 
 A refusal is treated as fatal rather than transient, which is the opposite of
 how this code treats most errors:

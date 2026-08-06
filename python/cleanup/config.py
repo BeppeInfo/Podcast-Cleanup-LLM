@@ -130,6 +130,10 @@ SETTINGS: dict[str, tuple] = {
     "DURATION_TOLERANCE": ("0.02", NUM, None),
 }
 
+# Never written to the log by value. That log is copied into the output
+# directory and outlives the work directory, the inputs and the container.
+SECRETS = ("WHISPER_API_KEY", "LLAMA_API_KEY")
+
 # Searched in order, first match wins. Mirrors the shell.
 CONF_CANDIDATES = (
     "$PODCAST_CLEANUP_CONF",
@@ -157,6 +161,9 @@ def from_environment(environ=None) -> dict[str, str]:
     for name in SETTINGS:
         if environ.get(name) is not None:
             settings[name] = environ[name]
+    # Only so the dump can name it; the file itself is not re-read here.
+    if environ.get("PODCAST_CONFIG_FILE"):
+        settings["_CONFIG_FILE"] = environ["PODCAST_CONFIG_FILE"]
     return settings
 
 
@@ -358,6 +365,30 @@ def validate(settings: dict, warn=None) -> None:
 
     if not settings["TRACK_SEPARATOR"]:
         raise ConfigError("TRACK_SEPARATOR must not be empty")
+
+
+def dump(settings: dict, log) -> None:
+    """Every effective setting, into the run log.
+
+    Driven by SETTINGS rather than by a list kept alongside it. The shell kept
+    such a list and it had drifted six names behind by the time this moved, so
+    six settings could change a run without the log admitting it.
+
+    run_episode calls this, which is what puts it on both front ends: a web
+    run's log is the only part of the job that survives the download, and it
+    was not saying what produced the audio.
+    """
+    log.debug("config file: "
+              f"{settings.get('_CONFIG_FILE') or '<none, using defaults>'}")
+    # Presence and length, never the value: enough to tell "the wrong key" from
+    # "no key at all" when reading the log of a run nobody can repeat.
+    for name in SECRETS:
+        value = str(settings.get(name) or "")
+        log.raw(f"  config {name}=" + (
+            f"<set, {len(value)} chars, redacted>" if value else "<unset>"))
+    for name in SETTINGS:
+        if name not in SECRETS:
+            log.raw(f"  config {name}={settings.get(name, '')}")
 
 
 def to_shell(settings: dict) -> str:

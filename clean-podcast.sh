@@ -141,7 +141,6 @@ main() {
     # resolved and checked on the Python side, and come back as assignments.
     config_load "$CONFIG_FILE"
     config_export
-    config_dump
     config_make_tree
     config_need_ffmpeg
 
@@ -161,8 +160,11 @@ main() {
         args+=(--file "$file")
     done
 
+    # PODCAST_CONFIG_FILE is for the config dump alone — which file was read,
+    # not a request to read it again; config_export already carried the values.
     PODCAST_WHISPER_API_KEY="$WHISPER_API_KEY" \
         PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
+        PODCAST_CONFIG_FILE="${CONFIG_FILE:-}" \
         PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" \
         exec "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}"
 }
