@@ -17,10 +17,70 @@ per completion instead. That was the shell's rule and it was the right one.
 
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 import subprocess
 
 TAIL_LINES = 20
+
+
+class ToolError(Exception):
+    """A tool the run needs is missing, or cannot do what the run needs."""
+
+
+def require_bin(label: str, candidate: str) -> str:
+    """The resolved path to a tool. Raises ToolError rather than exiting.
+
+    An explicit path is taken as given; a bare name is looked up on PATH. The
+    shell's version could not raise and so returned a status its callers had to
+    remember to check — twice, in a `$(...)` where an exit would only have ended
+    the subshell.
+    """
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    found = shutil.which(candidate)
+    if found:
+        return found
+    raise ToolError(
+        f"{label} not found: '{candidate}' is neither an executable path "
+        "nor on PATH")
+
+
+def has_encoder(ffmpeg: str, codec: str) -> bool:
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-h", f"encoder={codec}"],
+            capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    return f"Encoder {codec}" in result.stdout
+
+
+def resolve_ffmpeg(settings, log, ffmpeg: str = "", ffprobe: str = "",
+                   environ=None) -> tuple[str, str]:
+    """ffmpeg and ffprobe, resolved and checked against OUTPUT_CODEC.
+
+    The encoder check is up here, before the first stage, rather than at render
+    time where the failure would actually happen. Render is last: an ffmpeg that
+    cannot build the configured codec would otherwise be discovered after the
+    whole episode had been decoded, sent to whisper and analysed.
+
+    FFMPEG_BIN and FFPROBE_BIN name a build to use instead of whatever is on
+    PATH. They are read from the environment, not from the settings — they say
+    which tool runs this pipeline, not how it should edit.
+    """
+    environ = os.environ if environ is None else environ
+    ffmpeg = require_bin("ffmpeg", ffmpeg or environ.get("FFMPEG_BIN") or "ffmpeg")
+    ffprobe = require_bin(
+        "ffprobe", ffprobe or environ.get("FFPROBE_BIN") or "ffprobe")
+    log.debug(f"ffmpeg: {ffmpeg}")
+
+    codec = str(settings.get("OUTPUT_CODEC", ""))
+    if not has_encoder(ffmpeg, codec):
+        raise ToolError(
+            f"this ffmpeg has no '{codec}' encoder (see: ffmpeg -encoders)")
+    return ffmpeg, ffprobe
 
 
 def run(argv, log, on_line=None, dry_run: bool = False) -> int:

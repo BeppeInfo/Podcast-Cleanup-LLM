@@ -2039,6 +2039,42 @@ class TestProc(unittest.TestCase):
         proc.ffmpeg_progress(log, 0, "x")("out_time_ms=5000000")
         self.assertEqual(buf.getvalue(), "")
 
+    def test_require_bin_finds_a_name_on_the_path(self):
+        found = proc.require_bin("sh", "sh")
+        self.assertTrue(os.path.isabs(found))
+        self.assertTrue(os.access(found, os.X_OK))
+
+    def test_require_bin_takes_an_explicit_path_as_given(self):
+        explicit = shutil.which("sh")
+        self.assertEqual(proc.require_bin("sh", explicit), explicit)
+
+    def test_require_bin_raises_rather_than_returning_a_status(self):
+        # The shell version could only return 1, which every caller had to
+        # remember to check inside a $(...) where exit would not have worked.
+        with self.assertRaises(proc.ToolError) as caught:
+            proc.require_bin("nosuchtool", "definitely-not-installed-xyz")
+        self.assertIn("nosuchtool not found", str(caught.exception))
+
+    def test_an_unbuildable_codec_is_refused_before_any_stage(self):
+        # The point of checking up front: render is last, so without this the
+        # missing encoder surfaces after the episode has been transcribed.
+        log, buf = self._log()
+        settings = cfg.defaults()
+        settings["OUTPUT_CODEC"] = "not_a_real_encoder"
+        status = pipeline.run_episode(
+            settings, log, ["discover"], input_files=("nowhere.flac",))
+        self.assertEqual(status, 1)
+        self.assertIn("no 'not_a_real_encoder' encoder", buf.getvalue())
+        # Nothing began: the discover stage never announced itself.
+        self.assertNotIn("locating the episode", buf.getvalue())
+
+    def test_ffmpeg_bin_names_the_build_to_use(self):
+        log, _ = self._log()
+        real = shutil.which("ffmpeg")
+        ffmpeg, _probe = proc.resolve_ffmpeg(
+            cfg.defaults(), log, environ={"FFMPEG_BIN": real})
+        self.assertEqual(ffmpeg, real)
+
 
 class TestPipelineTranscribeStage(unittest.TestCase):
     """The level scan, and what the transcript summary reports."""

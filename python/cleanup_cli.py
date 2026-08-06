@@ -82,8 +82,6 @@ def cmd_run(args):
         input_files=args.file or (),
         dry_run=args.dry_run,
         force=args.force,
-        ffmpeg=args.ffmpeg,
-        ffprobe=args.ffprobe,
         program=args.program,
         api_keys={"whisper": _api_key(WHISPER_KEY_ENV),
                   "llama": _api_key(LLAMA_KEY_ENV)},
@@ -359,8 +357,6 @@ def build_parser():
                    help="explicit input track; repeatable, skips the scan")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true")
-    p.add_argument("--ffmpeg", default="ffmpeg")
-    p.add_argument("--ffprobe", default="ffprobe")
     p.add_argument("--program", default="",
                    help="how this run was invoked, for the resume hint")
     p.set_defaults(func=cmd_run)

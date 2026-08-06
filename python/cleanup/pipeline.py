@@ -301,7 +301,7 @@ def report_failure(episode, settings, log, program: str, dry_run: bool) -> None:
 
 def run_episode(settings, log, stages, *, episode_override: str = "",
                 input_files=(), dry_run: bool = False, force: bool = False,
-                ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe",
+                ffmpeg: str = "", ffprobe: str = "",
                 program: str = "", api_keys=None) -> int:
     """Run the selected stages in order. Returns a process exit status.
 
@@ -311,8 +311,15 @@ def run_episode(settings, log, stages, *, episode_override: str = "",
     """
     keys = api_keys or {}
     # First thing in the log, before anything can fail: what this run thinks
-    # it was told to do.
+    # it was told to do. The tool check comes after it, so a run that dies for
+    # want of an encoder still leaves the settings that asked for it.
     cfg.dump(settings, log)
+    try:
+        ffmpeg, ffprobe = proc.resolve_ffmpeg(settings, log, ffmpeg, ffprobe)
+    except proc.ToolError as exc:
+        log.error(str(exc))
+        return 1
+
     log.stage_total(len(stages))
     episode = None
 

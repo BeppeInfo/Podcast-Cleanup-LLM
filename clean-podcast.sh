@@ -142,12 +142,11 @@ main() {
     config_load "$CONFIG_FILE"
     config_export
     config_make_tree
-    config_need_ffmpeg
 
     # And from here it is Python's run: the stage sequence, the resume
     # behaviour and the failure handling all live in cleanup/pipeline.py, so
     # anything else driving this pipeline gets them too.
-    local -a args=(run --ffmpeg "$FFMPEG" --ffprobe "$FFPROBE")
+    local -a args=(run)
     [[ -n "$FROM_STAGE" ]] && args+=(--from "$FROM_STAGE")
     [[ -n "$TO_STAGE" ]] && args+=(--to "$TO_STAGE")
     [[ -n "$EXPLICIT_STAGES" ]] && args+=(--stages "$EXPLICIT_STAGES")

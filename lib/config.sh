@@ -67,19 +67,9 @@ config_make_tree() {
     return 0
 }
 
-config_need_ffmpeg() {
-    [[ -n "${FFMPEG:-}" ]] && return 0
-    FFMPEG=$(require_bin ffmpeg "${FFMPEG_BIN:-ffmpeg}") || exit 1
-    FFPROBE=$(require_bin ffprobe "${FFPROBE_BIN:-ffprobe}") || exit 1
-    log_debug "ffmpeg: $FFMPEG"
-
-    # Catch an unbuildable output format now rather than after transcribing two
-    # hours of audio.
-    if ! "$FFMPEG" -hide_banner -h "encoder=$OUTPUT_CODEC" 2>/dev/null \
-        | grep -q "Encoder $OUTPUT_CODEC"; then
-        die "this ffmpeg has no '$OUTPUT_CODEC' encoder (see: ffmpeg -encoders)"
-    fi
-}
+# Finding ffmpeg, and checking it can build OUTPUT_CODEC, is proc.resolve_ffmpeg
+# on the Python side — called from run_episode, so the web front end gets the
+# check too rather than meeting the missing encoder at render time.
 
 config_need_whisper() {
     [[ -n "$WHISPER_ENDPOINT" ]] \

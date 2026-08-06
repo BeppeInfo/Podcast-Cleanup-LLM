@@ -781,6 +781,12 @@ command to resume with.
 - Rejected up front: mismatched sample rates, tracks from two episodes,
   duplicate participants, unparseable filenames. A missing input directory is
   *not* an error — it is created, and an empty one simply means nothing to do.
+- Also up front, before the first stage: ffmpeg is located and asked whether it
+  can build `OUTPUT_CODEC`. The failure it prevents belongs to render, which is
+  last, so the natural place to discover it is after the episode has been
+  decoded, transcribed and analysed — an hour of work to learn that the format
+  was never available. `proc.resolve_ffmpeg` is called from `run_episode` rather
+  than from the launcher, so the web front end is covered by the same check.
 - Outputs are rendered into `output/<episode>/.staging/` and moved into place
   only once all are verified — a rename within one filesystem, so it is atomic
   and not a second copy of a gigabyte.
