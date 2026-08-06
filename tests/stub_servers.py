@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Stand-ins for whisper-server and llama-server, for the self-test.
+"""A stand-in for llama-server, for the self-test.
 
-Neither model is available in a test environment, but the *clients* are worth
-testing against something that speaks the same HTTP: multipart upload, response
-shape, endpoint probing, and the stage wiring around them.
+llama-server is not available in a test environment, but the *client* is worth
+testing against something that speaks the same HTTP: response shape, endpoint
+probing, and the stage wiring around them.
 
-    stub_servers.py whisper --responses r.json --port-file port.txt
-    stub_servers.py llama   --responses r.json --port-file port.txt
+    stub_servers.py llama --responses r.json --port-file port.txt
 
 `--responses` is a JSON array handed out one entry per POST, in order. Requests
 past the end of the list get the final entry again. Each request is appended to
 `--request-log` as one JSON line, so the test can assert on what was sent.
 
-For the whisper role it may instead be a JSON object keyed by uploaded filename
-("alice.wav"), which is what the end-to-end test wants: each track gets the
-transcript that matches its own audio, whatever order the stages ask in and
-however many times a resumed run asks again.
+There was a whisper role here too, until transcription stopped being a server.
+Its replacement is tests/fake_whisperx/, which is imported rather than dialled.
 """
 
 from __future__ import annotations
@@ -165,7 +162,7 @@ def build_handler(role, responses, request_log, api_key=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("role", choices=["whisper", "llama"])
+    parser.add_argument("role", choices=["llama"])
     parser.add_argument("--responses", help="JSON array of canned replies")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--port-file", required=True)

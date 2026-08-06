@@ -21,7 +21,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cleanup import intervals as iv  # noqa: E402
-from cleanup import asr, config as cfg, discover, llm, plan as planner  # noqa: E402
+from cleanup import config as cfg, discover, llm, plan as planner  # noqa: E402
 from cleanup import pipeline, render, runlog, silence, transcript as tr  # noqa: E402
 
 
@@ -41,7 +41,6 @@ def _progress(done, total):
 # API keys arrive through the environment, never through argv: a command line is
 # readable by any process on the machine, and the shell logs every command it
 # runs into a file that outlives the episode.
-WHISPER_KEY_ENV = "PODCAST_WHISPER_API_KEY"
 LLAMA_KEY_ENV = "PODCAST_LLAMA_API_KEY"
 
 
@@ -79,8 +78,8 @@ def cmd_run(args):
     log.line("")
     log.line(f"{log.c.bold}Podcast cleanup{log.c.reset}"
              f"{log.c.dim} — stages: {' '.join(stages)}{log.c.reset}")
-    log.info(f"Whisper: {settings['WHISPER_ENDPOINT']}   "
-             f"LLM: {settings['LLAMA_ENDPOINT']}")
+    log.info(f"Whisper: whisperx {settings['WHISPER_MODEL']} on "
+             f"{settings['WHISPER_DEVICE']}   LLM: {settings['LLAMA_ENDPOINT']}")
     if args.dry_run:
         log.warn("dry run: no files will be written or removed")
 
@@ -91,8 +90,7 @@ def cmd_run(args):
         dry_run=args.dry_run,
         force=args.force,
         program=args.program,
-        api_keys={"whisper": _api_key(WHISPER_KEY_ENV),
-                  "llama": _api_key(LLAMA_KEY_ENV)},
+        api_keys={"llama": _api_key(LLAMA_KEY_ENV)},
     ))
 
 
@@ -122,6 +120,8 @@ def cmd_meta_shell(args):
             for t in tracks
         )
         print(f"{key}=({pairs})")
+
+
 def cmd_config(args):
     """Resolve every setting and emit it as shell assignments.
 
@@ -157,22 +157,6 @@ def cmd_config_names(args):
 
 
 # --- detection ----------------------------------------------------------------
-
-
-VAD_REQUEST_FIELDS = (
-    ("vad_threshold", "vad_threshold"),
-    ("vad_min_speech_duration_ms", "vad_min_speech_ms"),
-    ("vad_min_silence_duration_ms", "vad_min_silence_ms"),
-    ("vad_speech_pad_ms", "vad_speech_pad_ms"),
-    ("vad_samples_overlap", "vad_samples_overlap"),
-)
-def cmd_whisper_wait(args):
-    client = asr.WhisperClient(
-        args.endpoint, path=args.path, api_key=_api_key(WHISPER_KEY_ENV)
-    )
-    if not client.wait_until_ready(args.timeout):
-        raise SystemExit(1)
-    print("whisper endpoint reachable")
 
 
 def cmd_llm_wait(args):
@@ -388,11 +372,6 @@ def build_parser():
         "config-names", help="the setting names, for the launcher to export")
     p.set_defaults(func=cmd_config_names)
 
-    p = sub.add_parser("whisper-wait", help="check a whisper endpoint is reachable")
-    p.add_argument("--endpoint", required=True)
-    p.add_argument("--timeout", type=float, default=60.0)
-    p.add_argument("--path", default="/inference")
-    p.set_defaults(func=cmd_whisper_wait)
 
     p = sub.add_parser("llm-wait", help="block until the llama endpoint is ready")
     p.add_argument("--endpoint", required=True)

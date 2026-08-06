@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from cleanup import intervals as iv
 from cleanup import runlog
-from cleanup import asr, config as cfg, discover, llm, pipeline, proc  # noqa: E501
+from cleanup import config as cfg, discover, llm, pipeline, proc  # noqa: E501
 from cleanup import plan as planner, render, silence, transcript as tr
 from cleanup import whisperx_asr as wx
 # The CLI itself, for the exit codes the shell branches on. Importing is safe:
@@ -314,476 +314,6 @@ class TestLlmValidation(unittest.TestCase):
         self.assertIn("at most 6 words", prompt)
         # Only the enabled kinds are described.
         self.assertNotIn("hesitation sound", prompt)
-
-
-class TestRemoteAsrTimeParsing(unittest.TestCase):
-    def test_numbers_and_numeric_strings(self):
-        self.assertEqual(asr.to_seconds(12), 12.0)
-        self.assertEqual(asr.to_seconds(12.5), 12.5)
-        self.assertEqual(asr.to_seconds("12.5"), 12.5)
-        self.assertEqual(asr.to_seconds(" 12.5 "), 12.5)
-
-    def test_clock_strings(self):
-        self.assertAlmostEqual(asr.to_seconds("00:00:01.500"), 1.5)
-        self.assertAlmostEqual(asr.to_seconds("00:00:01,500"), 1.5)
-        self.assertAlmostEqual(asr.to_seconds("01:02:03.250"), 3723.25)
-        self.assertAlmostEqual(asr.to_seconds("02:03"), 123.0)
-
-    def test_rejects_junk(self):
-        for value in (None, "", "  ", "abc", True, [], {}, "1:2:3:4"):
-            self.assertIsNone(asr.to_seconds(value), repr(value))
-
-
-class TestRemoteAsrNormalization(unittest.TestCase):
-    def test_openai_style_segments(self):
-        payload = {
-            "text": " hello there",
-            "segments": [
-                {"id": 0, "start": 1.0, "end": 1.5, "text": " hello"},
-                {"id": 1, "start": 1.5, "end": 2.25, "text": " there"},
-            ],
-        }
-        segments = asr.normalize_response(payload)
-        self.assertEqual(
-            [(s["offsets"]["from"], s["offsets"]["to"]) for s in segments],
-            [(1000, 1500), (1500, 2250)],
-        )
-        self.assertEqual([s["text"] for s in segments], ["hello", "there"])
-
-    def test_offset_shifts_a_chunk_onto_the_episode_timeline(self):
-        payload = {"segments": [{"start": 2.0, "end": 3.0, "text": "x"}]}
-        segments = asr.normalize_response(payload, offset=600.0)
-        self.assertEqual(segments[0]["offsets"], {"from": 602000, "to": 603000})
-
-    def test_whisper_cli_shape_is_accepted_too(self):
-        payload = {
-            "transcription": [
-                {"text": " word", "offsets": {"from": 500, "to": 900}}
-            ]
-        }
-        segments = asr.normalize_response(payload)
-        self.assertEqual(segments[0]["offsets"], {"from": 500, "to": 900})
-
-    def test_clock_string_timings(self):
-        payload = {
-            "segments": [
-                {"start": "00:00:01.250", "end": "00:00:02.000", "text": "a"}
-            ]
-        }
-        segments = asr.normalize_response(payload)
-        self.assertEqual(segments[0]["offsets"], {"from": 1250, "to": 2000})
-
-    def test_token_ids_are_discarded_rather_than_crashing(self):
-        """whisper-server's verbose_json lists tokens as bare ids."""
-        payload = {
-            "segments": [
-                {"start": 1.0, "end": 2.0, "text": "hi there",
-                 "tokens": [50364, 2088, 616]}
-            ]
-        }
-        segments = asr.normalize_response(payload)
-        self.assertNotIn("tokens", segments[0])
-        # And the words still come out, interpolated across the segment.
-        parsed = tr.build_from_segments(segments, "alice")
-        self.assertEqual([w["text"] for w in parsed["words"]], ["hi", "there"])
-        self.assertEqual(parsed["approximated_segments"], 1)
-
-    def test_token_objects_with_timings_are_kept_and_shifted(self):
-        payload = {
-            "segments": [{
-                "start": 1.0, "end": 2.0, "text": "hi there",
-                "tokens": [
-                    {"text": " hi", "offsets": {"from": 1000, "to": 1400}},
-                    {"text": " there", "offsets": {"from": 1400, "to": 2000}},
-                ],
-            }]
-        }
-        segments = asr.normalize_response(payload, offset=10.0)
-        self.assertEqual(len(segments[0]["tokens"]), 2)
-        self.assertEqual(segments[0]["tokens"][0]["offsets"]["from"], 11000)
-        parsed = tr.build_from_segments(segments, "alice")
-        self.assertEqual(parsed["approximated_segments"], 0)
-        self.assertAlmostEqual(parsed["words"][0]["start"], 11.0)
-
-    def test_text_without_timings_is_a_clear_error(self):
-        with self.assertRaises(ValueError) as caught:
-            asr.normalize_response({"text": "just a transcript"})
-        self.assertIn("verbose_json", str(caught.exception))
-
-    def test_segments_missing_timings_are_skipped(self):
-        payload = {
-            "segments": [
-                {"text": "no timing here"},
-                {"start": 1.0, "end": 2.0, "text": "good"},
-            ]
-        }
-        segments = asr.normalize_response(payload)
-        self.assertEqual([s["text"] for s in segments], ["good"])
-
-    def test_a_silent_chunk_is_an_answer_not_an_error(self):
-        """The failure this replaces cost a whole track.
-
-        With the server running Silero first, a chunk holding no speech comes
-        back as 200 with an empty segment list, and that is the truth about that
-        chunk. On a two-mic recording one participant is silent for minutes at a
-        time, so treating it as a failure killed the track the moment chunking
-        met one of those stretches.
-        """
-        self.assertEqual(asr.normalize_response({"segments": []}), [])
-        self.assertEqual(asr.normalize_response({"transcription": []}), [])
-        self.assertEqual(
-            asr.normalize_response({"text": "", "segments": []}), []
-        )
-        # Silence sometimes arrives as an item with empty text rather than none.
-        self.assertEqual(
-            asr.normalize_response(
-                {"segments": [{"text": "", "start": 0.0, "end": 0.0}]}
-            ),
-            [],
-        )
-
-    def test_text_without_a_usable_timing_is_still_an_error(self):
-        """Words with nowhere to put them must not pass as silence."""
-        with self.assertRaises(ValueError) as caught:
-            asr.normalize_response({"segments": [{"text": "hello"}]})
-        self.assertIn("usable timing", str(caught.exception))
-        with self.assertRaises(ValueError):
-            asr.normalize_response({"nothing": True})
-
-    def test_accepts_a_json_string(self):
-        segments = asr.normalize_response(
-            '{"segments": [{"start": 0, "end": 1, "text": "x"}]}'
-        )
-        self.assertEqual(len(segments), 1)
-
-
-class TestRemoteAsrChunking(unittest.TestCase):
-    def test_short_track_is_one_chunk(self):
-        self.assertEqual(asr.plan_audio_chunks(300.0, 600.0, []), [(0.0, 300.0)])
-
-    def test_zero_target_disables_chunking(self):
-        self.assertEqual(asr.plan_audio_chunks(7200.0, 0, []), [(0.0, 7200.0)])
-
-    def test_chunks_cover_the_track_without_gaps_or_overlap(self):
-        for duration in (601.0, 1000.0, 3600.0, 7231.5):
-            chunks = asr.plan_audio_chunks(duration, 600.0, [])
-            self.assertEqual(chunks[0][0], 0.0)
-            self.assertAlmostEqual(chunks[-1][1], duration)
-            for before, after in zip(chunks, chunks[1:]):
-                self.assertAlmostEqual(before[1], after[0])
-            for start, end in chunks:
-                self.assertGreater(end - start, 0)
-
-    def test_boundaries_move_into_silence(self):
-        # Speech everywhere except a gap at 590-610, straddling the ideal 600 s
-        # boundary. The split should land in the middle of that gap.
-        speech = [(0.0, 590.0), (610.0, 1200.0)]
-        chunks = asr.plan_audio_chunks(1200.0, 600.0, speech)
-        self.assertEqual(len(chunks), 2)
-        self.assertAlmostEqual(chunks[0][1], 600.0, places=3)
-
-    def test_boundary_prefers_nearby_silence_over_the_exact_target(self):
-        speech = [(0.0, 500.0), (530.0, 1200.0)]
-        chunks = asr.plan_audio_chunks(1200.0, 600.0, speech)
-        # The gap's midpoint is 515 s, well inside the quarter-target window,
-        # so it is chosen over cutting a word at 600 s.
-        self.assertAlmostEqual(chunks[0][1], 515.0, places=3)
-
-    def test_distant_silence_is_not_worth_the_detour(self):
-        # The only silence is at the very start, far from the 600 s mark.
-        speech = [(0.0, 10.0), (20.0, 1200.0)]
-        chunks = asr.plan_audio_chunks(1200.0, 600.0, speech)
-        self.assertAlmostEqual(chunks[0][1], 600.0, places=3)
-
-    def test_no_runt_final_chunk(self):
-        # 605 s with a 600 s target would leave a 5 s tail; it stays whole.
-        chunks = asr.plan_audio_chunks(605.0, 600.0, [])
-        self.assertEqual(chunks, [(0.0, 605.0)])
-        for start, end in asr.plan_audio_chunks(1900.0, 600.0, []):
-            self.assertGreaterEqual(end - start, asr.MIN_CHUNK_SECONDS)
-
-
-class TestWavSlicing(unittest.TestCase):
-    def _make_wav(self, path, seconds, rate=16000):
-        import struct
-        import wave as wavemod
-
-        with wavemod.open(path, "wb") as handle:
-            handle.setnchannels(1)
-            handle.setsampwidth(2)
-            handle.setframerate(rate)
-            # A ramp, so a slice can be identified by its content.
-            handle.writeframes(
-                b"".join(
-                    struct.pack("<h", (index % 1000) - 500)
-                    for index in range(int(seconds * rate))
-                )
-            )
-
-    def test_slice_is_sample_accurate(self):
-        directory = tempfile.mkdtemp()
-        source = os.path.join(directory, "src.wav")
-        target = os.path.join(directory, "cut.wav")
-        self._make_wav(source, 3.0)
-
-        duration, rate = asr.wav_info(source)
-        self.assertAlmostEqual(duration, 3.0)
-        self.assertEqual(rate, 16000)
-
-        asr.slice_wav(source, 1.0, 2.5, target)
-        sliced, _ = asr.wav_info(target)
-        self.assertAlmostEqual(sliced, 1.5, places=6)
-
-    def test_slice_clamps_to_the_file(self):
-        directory = tempfile.mkdtemp()
-        source = os.path.join(directory, "src.wav")
-        target = os.path.join(directory, "cut.wav")
-        self._make_wav(source, 1.0)
-        asr.slice_wav(source, 0.5, 99.0, target)
-        sliced, _ = asr.wav_info(target)
-        self.assertAlmostEqual(sliced, 0.5, places=6)
-
-
-class TestServerSideVadRequest(unittest.TestCase):
-    """What the transcribe request actually asks the server to do.
-
-    Worth pinning precisely, because a build that does not parse these fields
-    ignores them silently — httplib drops what it does not recognise — and the
-    only symptom is a transcript with invented speech in it. Nothing here can
-    detect that, so the least this can do is guarantee the request is right.
-    """
-
-    class _Recorder:
-        def __init__(self):
-            self.sent = []
-
-        def transcribe_file(self, path, fields):
-            self.sent.append(dict(fields))
-            return {"transcription": [{
-                "text": "hello",
-                "offsets": {"from": 0, "to": 500},
-            }]}
-
-    def _wav(self, seconds=2.0):
-        import struct
-        import wave as wavemod
-
-        path = os.path.join(tempfile.mkdtemp(), "track.wav")
-        with wavemod.open(path, "wb") as handle:
-            handle.setnchannels(1)
-            handle.setsampwidth(2)
-            handle.setframerate(16000)
-            handle.writeframes(struct.pack("<h", 0) * int(seconds * 16000))
-        return path
-
-    def _fields(self, **kwargs):
-        recorder = self._Recorder()
-        asr.transcribe(recorder, self._wav(), "a", **kwargs)
-        return recorder.sent[0]
-
-    def test_vad_is_requested_by_default(self):
-        self.assertEqual(self._fields()["vad"], "true")
-
-    def test_the_tuning_parameters_travel_with_the_request(self):
-        fields = self._fields(vad_options={
-            "vad_threshold": 0.5,
-            "vad_min_speech_duration_ms": 250,
-            "vad_min_silence_duration_ms": 1000,
-            "vad_speech_pad_ms": 300,
-            "vad_samples_overlap": 0.1,
-        })
-        # Names are whisper-server's, spelled its way; a typo is a silent no-op.
-        self.assertEqual(fields["vad_threshold"], "0.5")
-        self.assertEqual(fields["vad_min_speech_duration_ms"], "250")
-        self.assertEqual(fields["vad_min_silence_duration_ms"], "1000")
-        self.assertEqual(fields["vad_speech_pad_ms"], "300")
-        self.assertEqual(fields["vad_samples_overlap"], "0.1")
-
-    def test_no_vad_sends_no_vad_field_at_all(self):
-        """Rather than vad=false, which an old build would also ignore."""
-        fields = self._fields(vad=False, vad_options={"vad_threshold": 0.5})
-        self.assertNotIn("vad", fields)
-        self.assertNotIn("vad_threshold", fields)
-
-    def test_word_timings_are_still_asked_for(self):
-        fields = self._fields()
-        self.assertEqual(fields["max_len"], "1")
-        self.assertEqual(fields["split_on_word"], "true")
-        self.assertEqual(fields["response_format"], "verbose_json")
-
-    def test_the_result_records_whether_vad_ran(self):
-        recorder = self._Recorder()
-        parsed = asr.transcribe(recorder, self._wav(), "a", vad=True)
-        self.assertTrue(parsed["server_vad"])
-        self.assertEqual(parsed["audio_seconds"], 2.0)
-
-
-class TestSkippedWindowRecovery(unittest.TestCase):
-    """Re-asking about a decode window Whisper threw away.
-
-    Whisper works in 30-second windows and discards one whose decode ends on a
-    lone timestamp token, saying nothing about it. Re-sending that span on its own
-    changes the window alignment, so the audio no longer falls in a discarded
-    window — which is the only thing that gets those words back, and is what the
-    level scan makes possible by saying where to look.
-    """
-
-    class _Recorder:
-        """A server that omits one span from the first (long) request only."""
-
-        def __init__(self, hole=(40.0, 62.0), recover=True):
-            self.hole = hole
-            self.recover = recover
-            self.requests = []
-
-        def _words(self, base, length):
-            out = []
-            moment = 0.0
-            while moment < length - 1e-9:
-                at = base + moment
-                # The hole exists only when the whole track is asked for at once.
-                blind = self.hole[0] <= at < self.hole[1] and length > 30.0
-                if not blind:
-                    out.append({
-                        "text": f"w{int(at * 10)}",
-                        "offsets": {"from": int(at * 1000),
-                                    "to": int((at + 0.4) * 1000)},
-                    })
-                moment += 0.5
-            return out
-
-        def transcribe_file(self, path, fields):
-            import wave as wavemod
-            with wavemod.open(path, "rb") as handle:
-                length = handle.getnframes() / float(handle.getframerate())
-            # The offset is applied by the caller, so answer in local time and
-            # let asr shift it. Recovery slices start at their own zero.
-            base = 0.0
-            self.requests.append((round(length, 2), dict(fields)))
-            if not self.recover and len(self.requests) > 1:
-                return {"segments": []}
-            return {"transcription": self._words(base, length)}
-
-    def _wav(self, seconds=120.0):
-        import struct
-        import wave as wavemod
-
-        path = os.path.join(tempfile.mkdtemp(), "track.wav")
-        with wavemod.open(path, "wb") as handle:
-            handle.setnchannels(1)
-            handle.setsampwidth(2)
-            handle.setframerate(16000)
-            handle.writeframes(struct.pack("<h", 1000) * int(seconds * 16000))
-        return path
-
-    def test_missing_spans_are_found_from_the_level_scan(self):
-        segments = [
-            {"text": "a", "offsets": {"from": 0, "to": 5000}},
-            {"text": "b", "offsets": {"from": 70000, "to": 75000}},
-        ]
-        loud = [(0.0, 5.0), (40.0, 62.0), (70.0, 75.0)]
-        spans = asr.missing_spans(segments, loud, 120.0, 0.25)
-        self.assertEqual(len(spans), 1)
-        self.assertAlmostEqual(spans[0][0], 40.0, places=2)
-        self.assertAlmostEqual(spans[0][1], 62.0, places=2)
-
-    def test_neighbouring_gaps_are_asked_about_as_one(self):
-        """Split spans lose the words on the seam, each retry dropping the other's
-        edge as already known. Observed doing exactly that on a real episode."""
-        segments = [{"text": "a", "offsets": {"from": 0, "to": 5000}}]
-        # A brief dip below the level threshold at 47s and 52s splits one skipped
-        # window into three.
-        loud = [(0.0, 5.0), (41.0, 47.0), (47.2, 52.0), (52.3, 62.0)]
-        spans = asr.missing_spans(segments, loud, 120.0, 0.25)
-        self.assertEqual(len(spans), 1, spans)
-        self.assertAlmostEqual(spans[0][0], 41.0, places=2)
-        self.assertAlmostEqual(spans[0][1], 62.0, places=2)
-
-    def test_short_gaps_are_not_chased(self):
-        """One request per stretch, so it must not chase a timing artefact."""
-        segments = [{"text": "a", "offsets": {"from": 0, "to": 5000}}]
-        loud = [(0.0, 5.0), (6.0, 7.5)]
-        self.assertEqual(asr.missing_spans(segments, loud, 120.0, 0.25), [])
-
-    def test_ordinary_inter_word_gaps_are_not_a_missing_span(self):
-        """The trap the merge above walks into if it fuses the wrong thing.
-
-        A transcribed track is a run of short word spans with small gaps between
-        them. Fusing *gaps* across those words would make the whole track read as
-        missing; the fusing has to happen on the loud spans instead.
-        """
-        segments = [
-            {"text": f"w{i}", "offsets": {"from": i * 500, "to": i * 500 + 400}}
-            for i in range(40)
-        ]
-        self.assertEqual(asr.missing_spans(segments, [(0.0, 20.0)], 20.0, 0.0), [])
-
-    def test_the_words_come_back(self):
-        recorder = self._Recorder()
-        loud = [(0.0, 120.0)]
-        parsed = asr.transcribe(
-            recorder, self._wav(), "host", loud=loud, chunk_seconds=0,
-            speech_pad=0.25,
-        )
-        # The first request covered the whole track and dropped 40-62s.
-        self.assertGreater(recorder.requests[0][0], 100.0)
-        self.assertGreater(len(recorder.requests), 1)
-        # A recovery request is short, which is the entire point.
-        for length, _ in recorder.requests[1:]:
-            self.assertLess(length, asr.RECOVERY_CHUNK_SECONDS + 5.0)
-        covered = tr.speech_from_words(parsed["words"], 120.0, pad=0.25)
-        hole = iv.intersect(covered, [(40.0, 62.0)])
-        self.assertGreater(iv.total(hole), 20.0, "the hole was not filled")
-        self.assertEqual(parsed["recovery"]["recovered_spans"], 1)
-        self.assertGreater(parsed["recovery"]["recovered_segments"], 30)
-
-    def test_recovery_asks_for_vad_too(self):
-        """Otherwise a retry over a cough invents speech where there was none."""
-        recorder = self._Recorder()
-        asr.transcribe(
-            recorder, self._wav(), "host", loud=[(0.0, 120.0)],
-            chunk_seconds=0, speech_pad=0.25, vad=True,
-        )
-        for _, fields in recorder.requests[1:]:
-            self.assertEqual(fields["vad"], "true")
-
-    def test_a_span_that_stays_empty_is_left_to_the_plan_stage(self):
-        recorder = self._Recorder(recover=False)
-        parsed = asr.transcribe(
-            recorder, self._wav(), "host", loud=[(0.0, 120.0)],
-            chunk_seconds=0, speech_pad=0.25,
-        )
-        self.assertEqual(parsed["recovery"]["recovered_spans"], 0)
-        self.assertGreaterEqual(parsed["recovery"]["attempted"], 1)
-        # And the words that did arrive are untouched.
-        self.assertTrue(parsed["words"])
-
-    def test_no_level_scan_means_no_recovery(self):
-        recorder = self._Recorder()
-        asr.transcribe(
-            recorder, self._wav(), "host", loud=None, chunk_seconds=0,
-            speech_pad=0.25,
-        )
-        self.assertEqual(len(recorder.requests), 1)
-
-    def test_recovery_can_be_turned_off(self):
-        recorder = self._Recorder()
-        asr.transcribe(
-            recorder, self._wav(), "host", loud=[(0.0, 120.0)],
-            chunk_seconds=0, speech_pad=0.25, recover=False,
-        )
-        self.assertEqual(len(recorder.requests), 1)
-
-    def test_recovered_words_are_not_duplicated(self):
-        """The retry is padded, so it re-transcribes what borders the span."""
-        recorder = self._Recorder()
-        parsed = asr.transcribe(
-            recorder, self._wav(), "host", loud=[(0.0, 120.0)],
-            chunk_seconds=0, speech_pad=0.25,
-        )
-        starts = [w["start"] for w in parsed["words"]]
-        self.assertEqual(len(starts), len(set(starts)), "a word was added twice")
-        self.assertEqual(starts, sorted(starts), "words are out of order")
 
 
 class _StubLlamaServer:
@@ -1684,38 +1214,6 @@ class TestApiKeyAuth(unittest.TestCase):
         with open(audit, encoding="utf-8") as handle:
             self.assertNotIn(self.KEY, handle.read())
 
-    # --- whisper client -------------------------------------------------------
-
-    def test_whisper_sends_the_bearer_header(self):
-        server = self._server([{"segments": []}], api_key=self.KEY)
-        client = asr.WhisperClient(server.endpoint, timeout=10, path="/health",
-                                   api_key=self.KEY)
-        self.assertTrue(client.wait_until_ready(timeout=5))
-        self.assertIn(f"Bearer {self.KEY}", server.seen_auth)
-
-    def test_whisper_probe_distinguishes_401_from_alive(self):
-        """A 405 means the route exists; a 401 means it will refuse the upload.
-
-        Treating both as "alive" would defer the failure to mid-episode.
-        """
-        server = self._server([], api_key=self.KEY)
-        good = asr.WhisperClient(server.endpoint, path="/health", api_key=self.KEY)
-        self.assertTrue(good.wait_until_ready(timeout=5))
-
-        bad = asr.WhisperClient(server.endpoint, path="/health", api_key="wrong")
-        self.assertFalse(bad.wait_until_ready(timeout=3, poll=0.5))
-
-    def test_whisper_upload_raises_auth_rejected(self):
-        server = self._server([{"segments": []}], api_key=self.KEY)
-        directory = tempfile.mkdtemp()
-        audio = os.path.join(directory, "chunk.wav")
-        with open(audio, "wb") as handle:
-            handle.write(b"RIFF....WAVEfmt ")
-        client = asr.WhisperClient(server.endpoint, timeout=10, api_key=None)
-        with self.assertRaises(llm.AuthRejected) as caught:
-            client.transcribe_file(audio, {"response_format": "verbose_json"})
-        self.assertIn("WHISPER_API_KEY", str(caught.exception))
-
 
 PARAMS = {
     "silence_min_duration": 1.5,
@@ -1863,7 +1361,7 @@ class TestLoopingTranscript(unittest.TestCase):
         warning = " ".join(plan["warnings"])
         self.assertIn("host's transcript repeats", warning)
         self.assertIn("i lost my train of thought here again", warning)
-        self.assertIn("WHISPER_VAD", warning)
+        self.assertIn("WHISPER_VAD_ONSET", warning)
 
         record = plan["looping_transcripts"]["host"]
         self.assertEqual(record["repeats"], 40)
@@ -1957,7 +1455,7 @@ class TestUntranscribedAudio(unittest.TestCase):
         result = self._plan(words, {"a": [(2.0, 2.5), (30.0, 45.0), (50.0, 50.5)]})
         self.assertTrue(result["blocking"], result["warnings"])
         self.assertIn("no transcript accounts for", " ".join(result["blocking"]))
-        self.assertIn("WHISPER_CHUNK_SECONDS", " ".join(result["blocking"]))
+        self.assertIn("WHISPER_VAD_ONSET", " ".join(result["blocking"]))
         self.assertGreater(result["stats"]["untranscribed_in_cuts"], 5.0)
 
     def test_short_stretches_are_not_worth_a_warning(self):
@@ -2215,6 +1713,24 @@ class TestWhisperXTranscriber(unittest.TestCase):
         self.assertEqual(kwargs["asr_options"], {"initial_prompt": "Um, uh, so"})
         self.assertNotIn("initial_prompt", fake.transcribe_options[0])
 
+    def test_the_vad_settings_reach_the_model(self):
+        # They used to be form fields on an HTTP request the self-test could
+        # read back. Now they are constructor arguments, so this is where the
+        # property lives.
+        fake, loader = self._fake(segments=[])
+        wx.Transcriber(loader=loader,
+                       vad_options={"vad_onset": 0.4, "vad_offset": 0.3})
+        _name, kwargs = fake.load_model_calls[0]
+        self.assertEqual(kwargs["vad_options"], {"vad_onset": 0.4, "vad_offset": 0.3})
+
+    def test_the_settings_map_onto_whisperx_names(self):
+        # WHISPER_VAD_ONSET/OFFSET are what pyannote takes. The old Silero
+        # threshold and its four durations had no honest translation, which is
+        # why they went rather than being renamed onto something else.
+        got = pipeline.vad_options(
+            cfg.defaults() | {"WHISPER_VAD_ONSET": "0.6", "WHISPER_VAD_OFFSET": "0.2"})
+        self.assertEqual(got, {"vad_onset": 0.6, "vad_offset": 0.2})
+
     def test_silence_is_an_answer_not_a_failure(self):
         # One participant is silent for minutes while the other talks; a track
         # with nothing in it must not look like a broken run.
@@ -2246,13 +1762,6 @@ class TestEndpointsAreRequired(unittest.TestCase):
     def _log(self):
         return runlog.Log(stream=io.StringIO(), colour=False)
 
-    def test_transcribe_names_the_setting_and_suggests_a_value(self):
-        settings = cfg.defaults()
-        with self.assertRaises(pipeline.StageError) as caught:
-            pipeline.stage_transcribe("/nonexistent", settings, self._log())
-        self.assertIn("WHISPER_ENDPOINT is required", str(caught.exception))
-        self.assertIn("127.0.0.1:8081", str(caught.exception))
-
     def test_detect_points_at_the_way_out(self):
         settings = cfg.defaults()
         with self.assertRaises(pipeline.StageError) as caught:
@@ -2260,6 +1769,13 @@ class TestEndpointsAreRequired(unittest.TestCase):
         self.assertIn("LLAMA_ENDPOINT is required", str(caught.exception))
         # The other answer is not to run the stage at all.
         self.assertIn("LLM_ENABLE=0", str(caught.exception))
+
+
+class _NullTranscriber:
+    """Answers every track with silence. For the paths that never get that far."""
+
+    def transcribe(self, wav_path, *, batch_size=8):
+        return [], "en"
 
 
 class TestPipelineTranscribeStage(unittest.TestCase):
@@ -2317,23 +1833,22 @@ class TestPipelineTranscribeStage(unittest.TestCase):
         self.assertIsNone(loud)
         self.assertIn("could not scan alice", buf.getvalue())
 
-    def test_notes_reach_the_log_and_warnings_reach_the_console(self):
+    def test_the_summary_is_a_note_not_a_console_line(self):
+        # It goes to the log only, as it did when bash read it off a pipe.
         log, buf = self._log()
-        parsed = {
-            "words": [], "segments": [], "chunks": 4,
-            "recovery": {"spans": 2, "attempted": 2, "recovered_segments": 7,
-                         "recovered_spans": 1, "skipped": 3},
-            "collapsed": {"spans": 0},
-            "chunks_without_speech": 4,
-        }
+        parsed = {"words": [{"i": 0}, {"i": 1}], "segments": [{"i": 0}]}
         pipeline.describe_transcript(parsed, self._settings(), log)
-        written = open(log.path, encoding="utf-8").read()
-        # The detail is a note: log only, as it was when bash read it off a pipe.
-        self.assertIn("recovered 7 word(s)", written)
-        self.assertNotIn("recovered 7 word(s)", buf.getvalue())
-        # The two "that many is not the occasional..." cases are warnings.
-        self.assertIn("left unasked", buf.getvalue())
-        self.assertIn("no speech at all", buf.getvalue())
+        self.assertIn("2 words in 1 segments",
+                      open(log.path, encoding="utf-8").read())
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_a_track_with_no_speech_says_so(self):
+        # Normal on a two-mic recording; the plan stage is what refuses if that
+        # silence turns out to have been audible speech.
+        log, _ = self._log()
+        pipeline.describe_transcript({"words": [], "segments": []},
+                                     self._settings(), log)
+        self.assertIn("no speech at all", open(log.path, encoding="utf-8").read())
 
     def test_a_missing_prepared_track_is_refused_by_path(self):
         root, _ = self._work()
@@ -2344,12 +1859,12 @@ class TestPipelineTranscribeStage(unittest.TestCase):
                                    "sample_rate": 16000, "sample_fmt": "s16"}]},
                       handle)
         log, _ = self._log()
-        # Endpoint unreachable, so it stops before that — which is itself the
-        # first thing the stage checks.
-        settings = self._settings(WHISPER_ENDPOINT="http://127.0.0.1:1")
+        # A transcriber is injected so the stage gets as far as the missing
+        # file rather than trying to load three gigabytes of model first.
         with self.assertRaises(pipeline.StageError) as caught:
-            pipeline.stage_transcribe(root, settings, log, ready_timeout=0.1)
-        self.assertIn("not usable", str(caught.exception))
+            pipeline.stage_transcribe(root, self._settings(), log,
+                                      transcriber=_NullTranscriber())
+        self.assertIn("missing prepared track", str(caught.exception))
 
 
 class TestPipelineDetectStage(unittest.TestCase):
@@ -3111,15 +2626,18 @@ class TestConfig(unittest.TestCase):
         dumped, _ = self._dumped(cfg.defaults())
         self.assertEqual(set(dumped), set(cfg.SETTINGS))
 
-    def test_dump_redacts_the_api_keys(self):
+    def test_dump_redacts_the_api_key(self):
         settings = cfg.defaults()
-        settings["WHISPER_API_KEY"] = "sk-secret-value"
+        settings["LLAMA_API_KEY"] = "sk-secret-value"
         dumped, body = self._dumped(settings)
         # Present, and its length, but never the key: this log is copied into
         # the output directory and outlives everything else in the run.
         self.assertNotIn("sk-secret-value", body)
-        self.assertEqual(dumped["WHISPER_API_KEY"],
+        self.assertEqual(dumped["LLAMA_API_KEY"],
                          f"<set, {len('sk-secret-value')} chars, redacted>")
+
+    def test_dump_says_so_when_no_key_is_set(self):
+        dumped, _ = self._dumped(cfg.defaults())
         self.assertEqual(dumped["LLAMA_API_KEY"], "<unset>")
 
     def test_config_file_is_sourced_by_bash(self):
@@ -3194,9 +2712,9 @@ class TestConfig(unittest.TestCase):
 
     def test_key_file_is_read_and_trimmed(self):
         path = self._conf("  s3cret  \n")
-        values = cfg.load(environ={}, overrides={"WHISPER_API_KEY_FILE": path})
+        values = cfg.load(environ={}, overrides={"LLAMA_API_KEY_FILE": path})
         cfg.resolve_api_keys(values)
-        self.assertEqual(values["WHISPER_API_KEY"], "s3cret")
+        self.assertEqual(values["LLAMA_API_KEY"], "s3cret")
 
     def test_empty_key_file_is_an_error(self):
         path = self._conf("\n")

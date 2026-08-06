@@ -34,8 +34,8 @@ config_load() {
                --set "WORK_ROOT=" --set "FAILED_DIR=")
     fi
     local name
-    for name in INPUT_DIR OUTPUT_DIR WORK_ROOT WHISPER_VAD LLM_ENABLE \
-                WHISPER_ENDPOINT LLAMA_ENDPOINT FFMPEG_JOBS KEEP_INPUTS KEEP_WORK; do
+    for name in INPUT_DIR OUTPUT_DIR WORK_ROOT LLM_ENABLE \
+                LLAMA_ENDPOINT FFMPEG_JOBS KEEP_INPUTS KEEP_WORK; do
         local -n value="ARG_$name"
         [[ -n "${value:-}" ]] && args+=(--set "$name=$value")
     done

@@ -341,11 +341,11 @@ def build_plan(meta, speech, edits, words, params, loud=None) -> dict:
     if cut_unheard >= UNTRANSCRIBED_BLOCK_SECONDS:
         blocking.append(
             f"cuts remove {cut_unheard:.0f}s of audio that is loud enough to be "
-            "speech and that no transcript accounts for. Either Whisper skipped a "
-            "decode window, which lowering WHISPER_CHUNK_SECONDS makes smaller but "
-            "cannot prevent, or it declined to transcribe non-speech, which "
-            "SPLIT_SILENCE_THRESHOLD can be raised to stop reporting. Listen to "
-            "the spans in plan.json before overriding"
+            "speech and that no transcript accounts for. Either Whisper skipped "
+            "it — a smaller WHISPER_VAD_ONSET makes it likelier to be heard — or "
+            "it declined to transcribe non-speech, which SPLIT_SILENCE_THRESHOLD "
+            "can be raised to stop reporting. Listen to the spans in plan.json "
+            "before overriding"
         )
 
     looping = looping_words(participants, words)
@@ -357,8 +357,9 @@ def build_plan(meta, speech, edits, words, params, loud=None) -> dict:
             f"{detail['words']} words. That is what Whisper does when handed "
             "something that is not speech; treat this transcript, the speech map "
             "derived from it, and every edit built on it as unreliable until the "
-            "audio is checked. If the server is not running Silero over the "
-            "audio first, WHISPER_VAD is what turns that on"
+            "audio is checked. If it is being handed silence, raising "
+            "WHISPER_VAD_ONSET makes the detector stricter about what it calls "
+            "speech"
         )
 
     # A muted stretch inside a cut is moot; trim mutes down to what survives,

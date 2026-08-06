@@ -3,8 +3,9 @@
 #   docker compose up --build
 #   open http://127.0.0.1:8000
 #
-# Neither model is in this image. Point the two endpoints at wherever they are;
-# if that is this same machine, see the note under `network_mode` below.
+# Transcription runs in this image; WhisperX is installed here and needs no
+# server. The detector is not — point LLAMA_ENDPOINT at wherever it runs, and
+# if that is this same machine see the note under `extra_hosts` below.
 
 services:
   cleanup:
@@ -18,10 +19,15 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/data
+      # Model weights, downloaded on first use and worth keeping: the aligner
+      # alone is 360 MB and the whisper model is on top of that. Without this
+      # every rebuilt container re-downloads them before it can transcribe.
+      - ./models:/models
     environment:
-      # Both are required — there is no local model mode.
-      WHISPER_ENDPOINT: "${WHISPER_ENDPOINT:-http://host.docker.internal:8081}"
+      # The one server left. Transcription is local to this container.
       LLAMA_ENDPOINT: "${LLAMA_ENDPOINT:-http://host.docker.internal:8080}"
+      # Bigger is a better transcript and, with no CUDA, a much longer wait.
+      WHISPER_MODEL: "${WHISPER_MODEL:-small}"
       # A llama-server in router mode needs to be told which model to load.
       LLAMA_MODEL_NAME: "${LLAMA_MODEL_NAME:-}"
       WHISPER_LANG: "${WHISPER_LANG:-auto}"
@@ -29,9 +35,9 @@ services:
       # reach the detector. See DESIGN.md §6 — it matters more than it looks.
       WHISPER_PROMPT: "${WHISPER_PROMPT:-Um, uh, so, like, you know, I mean — um, that's, that's the thing.}"
       # Anything else is set on the Settings page and kept in data/settings.json.
-    # Lets the two host.docker.internal names above resolve on Linux, where they
-    # otherwise would not. If the models are on another machine, name it in the
-    # endpoints instead and this line does nothing.
+    # Lets the host.docker.internal name above resolve on Linux, where it
+    # otherwise would not. If the detector is on another machine, name it in the
+    # endpoint instead and this line does nothing.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

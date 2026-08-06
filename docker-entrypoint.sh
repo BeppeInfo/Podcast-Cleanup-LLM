@@ -24,7 +24,7 @@ warn_if_unset() {
 
 case "${1:-web}" in
     web)
-        warn_if_unset WHISPER_ENDPOINT
+        # Transcription is in this image; only the detector is somewhere else.
         [[ "${LLM_ENABLE:-1}" == 1 ]] && warn_if_unset LLAMA_ENDPOINT
         # One process, on purpose. The single-job lock lives in this process's
         # memory, so a second worker would be a second lock and two episodes

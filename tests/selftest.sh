@@ -182,52 +182,28 @@ with open(target, "w", encoding="utf-8") as handle:
 PY
 }
 
-WHISPER_STUB_PID=""
-WHISPER_STUB_ENDPOINT=""
-
-start_whisper_stub() {
-    local responses="$1"
-    stop_whisper_stub
-    local port_file="$SANDBOX/whisper-port-$$-$CHECKS"
-    rm -f "$port_file"
-    python3 "$ROOT/tests/stub_servers.py" whisper \
-        --responses "$responses" --port-file "$port_file" \
-        ${2:+--request-log "$2"} >/dev/null 2>&1 &
-    WHISPER_STUB_PID=$!
-    local waited=0
-    while [[ ! -f "$port_file" ]]; do
-        sleep 0.05
-        waited=$(( waited + 1 ))
-        if (( waited > 200 )); then
-            printf 'stub whisper server did not start\n' >&2
-            return 1
-        fi
-    done
-    WHISPER_STUB_ENDPOINT="http://127.0.0.1:$(cat "$port_file")"
+# Transcription runs in the pipeline's own process now, so there is no server to
+# start and nothing to wait for a port on. tests/fake_whisperx/ goes on
+# PYTHONPATH and is imported in place of the real package, answering from the
+# same fixture files the stub server used to serve.
+use_whisper_responses() {
+    export FAKE_WHISPERX_RESPONSES="$1"
+    export PYTHONPATH="$ROOT/tests/fake_whisperx${PYTHONPATH:+:$PYTHONPATH}"
 }
 
-stop_whisper_stub() {
-    if [[ -n "$WHISPER_STUB_PID" ]]; then
-        kill "$WHISPER_STUB_PID" 2>/dev/null || true
-        wait "$WHISPER_STUB_PID" 2>/dev/null || true
-        WHISPER_STUB_PID=""
-    fi
-}
-
-trap 'stop_whisper_stub; cleanup' EXIT
+trap 'cleanup' EXIT
 
 run_pipeline() {
     local incoming="$1" output="$2" work="$3"; shift 3
     # llama.cpp is out of scope here, so the detect stage is left out of the list
     # entirely rather than stubbed. Transcription cannot be: the speech map comes
-    # from the transcript now, so the stub whisper server is part of the pipeline
-    # under test rather than a convenience.
+    # from the transcript now, so the fake whisperx is part of the pipeline under
+    # test rather than a convenience.
     # --root keeps everything this run might write inside the sandbox, including
     # the directories the three explicit options do not name — FAILED_DIR, which
     # the cases that fail on purpose write their logs to.
     "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
         --input "$incoming" --output "$output" --work "$work" \
-        --whisper-endpoint "$WHISPER_STUB_ENDPOINT" \
         --stages discover,prepare,transcribe,plan,render,finalize \
         --no-llm --quiet "$@"
 }
@@ -247,7 +223,7 @@ B_WINDOWS="$(windows_expr "$B_SPEECH")"
 build_episode ep001 "$CASE1/incoming" "$A_WINDOWS" "$B_WINDOWS" 30
 whisper_responses "$SANDBOX/case1.words.json" \
     "alice=$A_SPEECH" "bob=$B_SPEECH"
-start_whisper_stub "$SANDBOX/case1.words.json" "$SANDBOX/case1.requests.jsonl"
+use_whisper_responses "$SANDBOX/case1.words.json"
 
 CONF="$SANDBOX/case1.conf"
 cat >"$CONF" <<'EOF'
@@ -308,20 +284,9 @@ for cut in plan["cuts"]:
 ' "$PLAN1" "$CASE1/work/ep001/words/alice.words.json" \
   "$CASE1/work/ep001/words/bob.words.json"
 
-    check "server-side VAD was actually requested" python3 -c '
-import json, sys
-for line in open(sys.argv[1], encoding="utf-8"):
-    record = json.loads(line)
-    values = record.get("values") or {}
-    if values.get("vad") != "true":
-        print("request", record["index"], "did not ask for VAD:", values)
-        sys.exit(1)
-    for field in ("vad_threshold", "vad_min_silence_duration_ms",
-                  "vad_speech_pad_ms"):
-        if field not in values:
-            print("request", record["index"], "left out", field, ":", values)
-            sys.exit(1)
-' "$SANDBOX/case1.requests.jsonl"
+    # That the VAD settings reach the model is a unit test now
+    # (TestWhisperXTranscriber): there is no request to inspect, and the fake
+    # here answers from a file rather than recording what it was asked.
 fi
 
 if [[ -s "$OUT1/alice.flac" && -s "$OUT1/bob.flac" ]]; then
@@ -349,7 +314,7 @@ build_episode ep002 "$CASE2/incoming" \
     "$(windows_expr "$A2_SPEECH")" "$(windows_expr "$B2_SPEECH")" 30
 whisper_responses "$SANDBOX/case2.words.json" \
     "alice=$A2_SPEECH" "bob=$B2_SPEECH"
-start_whisper_stub "$SANDBOX/case2.words.json"
+use_whisper_responses "$SANDBOX/case2.words.json"
 
 if run_pipeline "$CASE2/incoming" "$CASE2/output" "$CASE2/work" \
     --config "$CONF" --keep-work >"$SANDBOX/case2.stdout" 2>&1
@@ -398,7 +363,7 @@ CASE3="$SANDBOX/case3"
 build_episode ep003 "$CASE3/incoming" \
     "$(windows_expr '1,2')" "$(windows_expr '58,59')" 60
 whisper_responses "$SANDBOX/case3.words.json" "alice=1,2" "bob=58,59"
-start_whisper_stub "$SANDBOX/case3.words.json"
+use_whisper_responses "$SANDBOX/case3.words.json"
 
 if run_pipeline "$CASE3/incoming" "$CASE3/output" "$CASE3/work" \
     --config "$CONF" --keep-work >"$SANDBOX/case3.stdout" 2>&1
@@ -431,7 +396,7 @@ CASE4="$SANDBOX/case4"
 build_episode ep004 "$CASE4/incoming" "$A_WINDOWS" "$B_WINDOWS" 30
 # A dry run sends nothing, so the case 1 replies serve; the stub is restarted
 # only so a failure here cannot be blamed on case 3's leftovers.
-start_whisper_stub "$SANDBOX/case1.words.json"
+use_whisper_responses "$SANDBOX/case1.words.json"
 
 if run_pipeline "$CASE4/incoming" "$CASE4/output" "$CASE4/work" \
     --config "$CONF" --dry-run >"$SANDBOX/case4.stdout" 2>&1
@@ -638,7 +603,7 @@ if "w0" not in alice.split():
 fi
 
 # ============================================================================
-printf '\n%sCase 7: the full pipeline against remote Whisper and remote LLM%s\n' \
+printf '\n%sCase 7: the full pipeline, transcribing here and detecting remotely%s\n' \
     "$BOLD" "$RESET"
 # ============================================================================
 #
@@ -687,12 +652,10 @@ bob = [
 ]
 
 with open(os.path.join(sandbox, "whisper-replies.json"), "w") as handle:
-    json.dump([
-        {"task": "transcribe", "language": "pt", "duration": 20.0,
-         "text": " ".join(s["text"].strip() for s in alice), "segments": alice},
-        {"task": "transcribe", "language": "pt", "duration": 20.0,
-         "text": " ".join(s["text"].strip() for s in bob), "segments": bob},
-    ], handle)
+    json.dump({
+        "alice.wav": {"language": "pt", "segments": alice},
+        "bob.wav": {"language": "pt", "segments": bob},
+    }, handle)
 
 # The model's replies. The first is consumed by the startup schema check, which
 # sends one tiny constrained request before any track is analysed; the rest are
@@ -727,30 +690,29 @@ wait_for_port_file() {
     [[ -f "$file" ]]
 }
 
-W_PORT_FILE="$SANDBOX/whisper.port"
 L_PORT_FILE="$SANDBOX/llama.port"
-W_PID=$(start_stub whisper "$SANDBOX/whisper-replies.json" "$W_PORT_FILE" "$SANDBOX/whisper-requests.jsonl")
 L_PID=$(start_stub llama "$SANDBOX/llama-replies.json" "$L_PORT_FILE" "$SANDBOX/llama-requests.jsonl")
-stop_stubs() { kill "$W_PID" "$L_PID" 2>/dev/null || true; }
-trap 'stop_stubs; stop_whisper_stub; cleanup' EXIT
+stop_stubs() { kill "$L_PID" 2>/dev/null || true; }
+trap 'stop_stubs; cleanup' EXIT
 
-if wait_for_port_file "$W_PORT_FILE" && wait_for_port_file "$L_PORT_FILE"; then
-    check "stub servers started" true
+# Only one server left to wait for. Transcription is in-process.
+if wait_for_port_file "$L_PORT_FILE"; then
+    check "stub llama server started" true
 else
-    check "stub servers started" false
+    check "stub llama server started" false
     fail_note "$(cat "$SANDBOX/stubs.log" 2>/dev/null)"
 fi
 
-WHISPER_URL="http://127.0.0.1:$(cat "$W_PORT_FILE")"
+use_whisper_responses "$SANDBOX/whisper-replies.json"
 LLAMA_URL="http://127.0.0.1:$(cat "$L_PORT_FILE")"
 
 if "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
     --input "$CASE7/incoming" --output "$CASE7/output" --work "$CASE7/work" \
     --config "$CONF" --keep-work --quiet \
-    --whisper-endpoint "$WHISPER_URL" --llama-endpoint "$LLAMA_URL" \
+    --llama-endpoint "$LLAMA_URL" \
     >"$SANDBOX/case7.stdout" 2>&1
 then
-    check "pipeline completed with both models remote" true
+    check "pipeline completed with the detector remote" true
 else
     check "pipeline completed with both models remote" false
     fail_note "$(tail -n 30 "$SANDBOX/case7.stdout")"
@@ -763,30 +725,10 @@ check "no local whisper or llama process was needed" bash -c \
     '! grep -qE "whisper-cli not found|llama-server not found" "$1"' _ \
     "$SANDBOX/case7.stdout"
 
-check "audio was uploaded as multipart with a file part" python3 -c '
-import json, sys
-rows = [json.loads(line) for line in open(sys.argv[1])]
-if len(rows) != 2:
-    print(f"expected 2 uploads (one per track), got {len(rows)}")
-    sys.exit(1)
-for row in rows:
-    if "multipart/form-data" not in row["content_type"]:
-        print("not multipart:", row["content_type"])
-        sys.exit(1)
-    if not row["has_file_part"]:
-        print("no file part in upload", row)
-        sys.exit(1)
-    if "response_format" not in row["fields"]:
-        print("response_format was not sent:", row["fields"])
-        sys.exit(1)
-    # 20 s of 16 kHz mono 16-bit is ~640 KB; anything tiny means the audio
-    # never made it into the body.
-    if row["length"] < 500_000:
-        print("upload suspiciously small, bytes:", row["length"])
-        sys.exit(1)
-' "$SANDBOX/whisper-requests.jsonl"
+check "transcription needed no server at all" bash -c \
+    '! grep -qiE "whisper.?(endpoint|server)" "$1"' _ "$SANDBOX/case7.stdout"
 
-check "remote segments became word timings" python3 -c '
+check "aligned segments became word timings" python3 -c '
 import json, sys
 data = json.load(open(sys.argv[1]))
 first, last = (int(v) for v in sys.argv[2:4])
@@ -862,7 +804,7 @@ if [[ -s "$OUT7/alice.flac" && -s "$OUT7/bob.flac" ]]; then
 fi
 
 stop_stubs
-trap 'stop_whisper_stub; cleanup' EXIT
+trap 'cleanup' EXIT
 
 # ============================================================================
 printf '\n%sCase 8: input format is independent of output format%s\n' "$BOLD" "$RESET"
@@ -894,7 +836,7 @@ fi
 fail_note "alice=wav bob=$BOB_KIND, output requested as flac"
 
 # Same speech windows as case 1, so the same canned transcript fits.
-start_whisper_stub "$SANDBOX/case1.words.json"
+use_whisper_responses "$SANDBOX/case1.words.json"
 
 CONF8="$SANDBOX/case8.conf"
 cat "$CONF" >"$CONF8"
@@ -1056,7 +998,7 @@ mkdir -p "$CASE10/incoming"
 make_track "$CASE10/incoming/ep010_alice.flac" 48000 30 "$A_WINDOWS"
 make_track "$CASE10/incoming/ep010_bob.flac"   44100 30 "$B_WINDOWS"
 # Case 1's windows again, so its transcript fits both tracks.
-start_whisper_stub "$SANDBOX/case1.words.json"
+use_whisper_responses "$SANDBOX/case1.words.json"
 
 if run_pipeline "$CASE10/incoming" "$CASE10/output" "$CASE10/work" \
     --config "$CONF" >"$SANDBOX/case10a.stdout" 2>&1
@@ -1113,7 +1055,7 @@ A11_SPEECH='0,10'
 B11_SPEECH='11.8,20'
 whisper_responses "$SANDBOX/case11.words.json" \
     "alice=$A11_SPEECH" "bob=$B11_SPEECH"
-start_whisper_stub "$SANDBOX/case11.words.json"
+use_whisper_responses "$SANDBOX/case11.words.json"
 
 internal_cuts() {  # internal_cuts <plan.json>
     python3 -c '
@@ -1170,7 +1112,7 @@ build_episode ep012 "$CASE12/incoming" \
     "$(windows_expr "$A12_AUDIO")" "$(windows_expr "$B12_SPEECH")" 30
 whisper_responses "$SANDBOX/case12.words.json" \
     "alice=$A12_WORDS" "bob=$B12_SPEECH"
-start_whisper_stub "$SANDBOX/case12.words.json"
+use_whisper_responses "$SANDBOX/case12.words.json"
 
 if run_pipeline "$CASE12/incoming" "$CASE12/output" "$CASE12/work" \
     --config "$CONF" --keep-work >"$SANDBOX/case12.stdout" 2>&1
@@ -1183,7 +1125,7 @@ fi
 check "the refusal says what it found" \
     grep -qi "no transcript accounts for" "$SANDBOX/case12.stdout"
 check "the refusal names the setting that shrinks the loss" \
-    grep -q "WHISPER_CHUNK_SECONDS" "$SANDBOX/case12.stdout"
+    grep -q "WHISPER_VAD_ONSET" "$SANDBOX/case12.stdout"
 
 PLAN12="$CASE12/work/ep012/plan.json"
 if [[ -f "$PLAN12" ]]; then
@@ -1220,102 +1162,13 @@ else
 fi
 
 # ============================================================================
-printf '\n%sCase 13: a skipped decode window is recovered by re-asking%s\n' \
-    "$BOLD" "$RESET"
+# Case 13 used to live here: "a skipped decode window is recovered by
+# re-asking". The recovery it exercised was whisper.cpp's problem, and it was
+# deliberately not carried across to WhisperX — whether forced alignment has
+# the same hole is what this branch is meant to find out, and case 12 is the
+# instrument. If a real episode trips case 12's refusal, the answer is to bring
+# recovery back rather than to raise the threshold.
 # ============================================================================
-#
-# Case 12 with the other half of the answer. The same audio and the same hole in
-# the first reply, but now the stub also answers the follow-up request for the
-# missing span — which is what a real server does, because re-sending a span on
-# its own puts it at a different offset in Whisper's 30-second windows.
-#
-# The recovery slice is keyed by the filename asr.py gives it, and its timings are
-# local to that slice: the span is 20-30s, padded outwards to start at 19s, so
-# words at 1-11s in the slice land at 20-30s on the timeline.
-
-CASE13="$SANDBOX/case13"
-A13_AUDIO='0,10 20,30'
-A13_WORDS='0,10'
-B13_SPEECH='10,20'
-build_episode ep013 "$CASE13/incoming" \
-    "$(windows_expr "$A13_AUDIO")" "$(windows_expr "$B13_SPEECH")" 30
-whisper_responses "$SANDBOX/case13.words.json" \
-    "alice=$A13_WORDS" "bob=$B13_SPEECH" "recover000_00=1,11"
-start_whisper_stub "$SANDBOX/case13.words.json" "$SANDBOX/case13.requests.jsonl"
-
-if run_pipeline "$CASE13/incoming" "$CASE13/output" "$CASE13/work" \
-    --config "$CONF" --keep-work >"$SANDBOX/case13.stdout" 2>&1
-then
-    check "the run completes once the words are recovered" true
-else
-    check "the run completes once the words are recovered" false
-    fail_note "$(tail -n 25 "$SANDBOX/case13.stdout")"
-fi
-
-# --quiet keeps per-track notes out of stdout, so look where they are kept.
-check "the recovery was reported in the run log" \
-    grep -qi "recovered" "$CASE13/work/ep013/logs/run.log"
-
-check "a second request really was sent for the missing span" python3 -c '
-import json, sys
-rows = [json.loads(line) for line in open(sys.argv[1])]
-names = [r.get("filename", "") for r in rows]
-retries = [n for n in names if n.startswith("recover")]
-if not retries:
-    print("no recovery request was sent; uploads were:", names)
-    sys.exit(1)
-print("recovery requests:", retries)
-' "$SANDBOX/case13.requests.jsonl"
-
-WORDS13="$CASE13/work/ep013/words/alice.words.json"
-if [[ -f "$WORDS13" ]]; then
-    check "the recovered words are in the transcript, in order" python3 -c '
-import json, sys
-data = json.load(open(sys.argv[1]))
-words = data["words"]
-late = [w for w in words if w["start"] >= 20.0]
-if not late:
-    print("nothing recovered past 20s; words end at", words[-1]["end"])
-    sys.exit(1)
-starts = [w["start"] for w in words]
-if starts != sorted(starts):
-    print("words are out of order after the merge")
-    sys.exit(1)
-if len(starts) != len(set(starts)):
-    print("a word was merged twice")
-    sys.exit(1)
-print(len(late), "recovered word(s), transcript spans",
-      round(words[0]["start"], 2), "-", round(words[-1]["end"], 2))
-' "$WORDS13"
-    check "the recovery is recorded in the words file" python3 -c '
-import json, sys
-r = json.load(open(sys.argv[1]))["recovery"]
-if r["recovered_spans"] != 1 or not r["recovered_segments"]:
-    print("recovery summary looks wrong:", r)
-    sys.exit(1)
-' "$WORDS13"
-fi
-
-PLAN13="$CASE13/work/ep013/plan.json"
-if [[ -f "$PLAN13" ]]; then
-    # The point of the whole exercise: nothing left to refuse over, and the audio
-    # that case 12 would have cut is now protected by words.
-    check "no untranscribed audio remains" python3 -c '
-import json, sys
-plan = json.load(open(sys.argv[1]))
-if plan["untranscribed_audio"] or plan["blocking"]:
-    print("still unhappy:", plan["untranscribed_audio"], plan["blocking"])
-    sys.exit(1)
-' "$PLAN13"
-    check "the 20-30s audio is no longer cut" python3 -c '
-import json, sys
-plan = json.load(open(sys.argv[1]))
-for cut in plan["cuts"]:
-    if cut["end"] > 21.0 and cut["start"] < 29.0:
-        print("a cut still lands in the recovered speech:", cut)
-        sys.exit(1)
-' "$PLAN13"
-fi
 
 # ============================================================================
 
@@ -1347,21 +1200,19 @@ words = [{"text": f"w{i}", "offsets": {"from": int(at * 1000),
                                        "to": int((at + 0.4) * 1000)}}
          for i, at in enumerate(moments)]
 with open(os.path.join(sandbox, "w14.json"), "w") as handle:
-    json.dump([{"segments": words}], handle)
+    json.dump({"alice.wav": {"transcription": words}}, handle)
 with open(os.path.join(sandbox, "l14.json"), "w") as handle:
     json.dump([{"edits": []}], handle)
 REPLIES14
 
-W14="$SANDBOX/w14.port"
 L14="$SANDBOX/l14.port"
-W14_PID=$(start_stub whisper "$SANDBOX/w14.json" "$W14" "$SANDBOX/w14-req.jsonl")
 L14_PID=$(start_stub llama "$SANDBOX/l14.json" "$L14" "$SANDBOX/l14-req.jsonl")
+use_whisper_responses "$SANDBOX/w14.json"
 
-if wait_for_port_file "$W14" && wait_for_port_file "$L14"; then
+if wait_for_port_file "$L14"; then
     if "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
         --input "$CASE14/incoming" --output "$CASE14/output" \
         --work "$CASE14/work" --config "$CONF" --quiet \
-        --whisper-endpoint "http://127.0.0.1:$(cat "$W14")" \
         --llama-endpoint "http://127.0.0.1:$(cat "$L14")" \
         >"$SANDBOX/case14.stdout" 2>&1
     then
@@ -1382,7 +1233,7 @@ if wait_for_port_file "$W14" && wait_for_port_file "$L14"; then
     check "the run finished rather than merely published" \
         bash -c "grep -q 'finished ep014' '$CASE14/output/ep014/logs/run.log'"
 fi
-kill "$W14_PID" "$L14_PID" 2>/dev/null || true
+kill "$L14_PID" 2>/dev/null || true
 
 
 if (( FAILURES == 0 )); then

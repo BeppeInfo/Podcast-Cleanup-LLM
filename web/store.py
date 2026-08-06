@@ -11,10 +11,10 @@ a directory and have them understood. The upload form asks for the episode and
 each participant by name and writes the filenames itself, so the convention never
 reaches the user and nothing would be served by letting them change it.
 
-**Secrets.** `WHISPER_API_KEY` and `LLAMA_API_KEY` are not here. Saving them
-would write them in clear to the volume, and there is already a better route:
-the `_FILE` variants, or the environment. A form that quietly makes a secret less
-safe is worse than no form.
+**Secrets.** `LLAMA_API_KEY` is not here. Saving it would write it in clear to
+the volume, and there is already a better route: the `_FILE` variant, or the
+environment. A form that quietly makes a secret less safe is worse than no form.
+There is no whisper key any more — transcription is not a server.
 
 What is left is the tuning: what counts as silence, how bold the disfluency
 detection is, what the servers are, and what comes out. Those are the ones worth
@@ -74,28 +74,26 @@ GROUPS = [
     ]),
     Group("transcribe", "Transcription",
           "What reaches the detector at all — see the note below the prompt.", [
+        ("WHISPER_MODEL", "Model",
+         "tiny, base, small, medium, large-v3 — bigger is a better transcript "
+         "and, on a CPU, a much longer wait"),
+        ("WHISPER_DEVICE", "Device", "cuda needs an NVIDIA card; Radeon means cpu"),
+        ("WHISPER_COMPUTE_TYPE", "Precision", "int8 on a CPU; float16 needs cuda"),
+        ("WHISPER_BATCH_SIZE", "Batch size", "speed against memory"),
+        ("WHISPER_THREADS", "Threads", "0 lets the runtime decide"),
         ("WHISPER_LANG", "Language", "a code, or auto"),
         ("WHISPER_PROMPT", "Initial prompt",
          "conditioning text, not an instruction; empty means Whisper returns "
          "fluent prose and the disfluencies never reach the detector"),
-        ("WHISPER_VAD", "Silero speech detection",
-         "off means silence is transcribed too, and whatever is invented there "
-         "becomes speech in the plan"),
-        ("WHISPER_VAD_THRESHOLD", "Speech probability threshold", "0 to 1"),
-        ("WHISPER_VAD_MIN_SILENCE_MS", "Silence that ends a segment", "ms"),
-        ("WHISPER_VAD_SPEECH_PAD_MS", "Segment padding", "ms"),
+        ("WHISPER_VAD_METHOD", "Speech detection", "pyannote or silero"),
+        ("WHISPER_VAD_ONSET", "Speech starts above", "0 to 1"),
+        ("WHISPER_VAD_OFFSET", "Speech ends below", "0 to 1"),
         ("SPEECH_MAP_CLIP", "Bound word timings by the level scan",
          "off means a word stretched across silence protects all of it"),
-        ("WHISPER_RECOVER", "Re-ask about audio that returned no words", ""),
-        ("WHISPER_REASK", "Re-ask where one word swallowed the audio", ""),
-        ("WHISPER_REASK_WORD_SECONDS", "A word carrying more speech than",
-         "seconds, is asked about again"),
-        ("WHISPER_CHUNK_SECONDS", "Audio per request", "seconds; 0 sends it whole"),
     ]),
-    Group("servers", "Servers", "Both are reached over HTTP and neither is started here.", [
-        ("WHISPER_ENDPOINT", "Whisper endpoint", "e.g. http://127.0.0.1:8081"),
-        ("WHISPER_ENDPOINT_PATH", "Whisper path", ""),
-        ("WHISPER_REQUEST_TIMEOUT", "Whisper timeout", "seconds"),
+    Group("servers", "Server",
+          "The detector is reached over HTTP and is not started here. "
+          "Transcription runs in this process and needs no server at all.", [
         ("LLAMA_ENDPOINT", "Llama endpoint", "e.g. http://127.0.0.1:8080"),
         ("LLAMA_MODEL_NAME", "Model name", "required by a router-mode server"),
         ("LLM_API", "API", ""),

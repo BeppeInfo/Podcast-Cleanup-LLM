@@ -55,29 +55,25 @@ SETTINGS: dict[str, tuple] = {
     # Deprecated: an input filter only. validate() folds it into INPUT_EXTS.
     "TRACK_EXT": ("", STR, None),
 
-    # Whisper. The endpoint is required — there is no local mode.
-    "WHISPER_ENDPOINT": ("", STR, None),
-    "WHISPER_ENDPOINT_PATH": ("/inference", STR, None),
-    "WHISPER_API_KEY": ("", STR, None),
-    "WHISPER_API_KEY_FILE": ("", STR, None),
-    "WHISPER_CHUNK_SECONDS": ("120", NUM, None),
-    "WHISPER_REQUEST_TIMEOUT": ("1800", NUM, None),
+    # WhisperX, in this process. No endpoint: transcription is not a server any
+    # more, so there is nothing to point at and nothing to authenticate to.
+    "WHISPER_MODEL": ("small", STR, None),
+    "WHISPER_DEVICE": ("cpu", CHOICE, ("cpu", "cuda")),
+    # int8 is the CPU answer; float16 is meaningless without CUDA.
+    "WHISPER_COMPUTE_TYPE": ("int8", CHOICE, ("int8", "float16", "float32")),
+    "WHISPER_BATCH_SIZE": ("8", INT, None),
+    "WHISPER_THREADS": ("4", INT, None),
     "WHISPER_LANG": ("auto", STR, None),
 
-    # Whisper's own Silero pass — the only speech detection there is.
-    "WHISPER_VAD": ("1", FLAG, None),
-    "WHISPER_VAD_THRESHOLD": ("0.5", NUM, None),
-    "WHISPER_VAD_MIN_SPEECH_MS": ("250", INT, None),
-    "WHISPER_VAD_MIN_SILENCE_MS": ("1000", INT, None),
-    "WHISPER_VAD_SPEECH_PAD_MS": ("300", INT, None),
-    "WHISPER_VAD_SAMPLES_OVERLAP": ("0.1", NUM, None),
+    # WhisperX always runs a VAD — it is how the audio is batched, not an
+    # option — so there is no longer anything to turn off. What is left is
+    # which detector and where its thresholds sit.
+    "WHISPER_VAD_METHOD": ("pyannote", CHOICE, ("pyannote", "silero")),
+    "WHISPER_VAD_ONSET": ("0.500", NUM, None),
+    "WHISPER_VAD_OFFSET": ("0.363", NUM, None),
 
-    "WHISPER_RECOVER": ("1", FLAG, None),
     "SPEECH_MAP_CLIP": ("1", FLAG, None),
     "WHISPER_PROMPT": ("", STR, None),
-    "WHISPER_REASK": ("1", FLAG, None),
-    "WHISPER_REASK_WORD_SECONDS": ("1.2", NUM, None),
-    "WHISPER_REASK_WINDOW": ("5.0", NUM, None),
 
     # llama.cpp. Also an endpoint, also required unless LLM_ENABLE=0.
     "LLAMA_ENDPOINT": ("", STR, None),
@@ -132,7 +128,10 @@ SETTINGS: dict[str, tuple] = {
 
 # Never written to the log by value. That log is copied into the output
 # directory and outlives the work directory, the inputs and the container.
-SECRETS = ("WHISPER_API_KEY", "LLAMA_API_KEY")
+# Only the LLM is a server now, so only its key exists. Still a tuple: the dump
+# and resolve_api_keys both iterate it, and one of them is the reason this
+# distinction matters at all.
+SECRETS = ("LLAMA_API_KEY",)
 
 # Searched in order, first match wins. Mirrors the shell.
 CONF_CANDIDATES = (
@@ -283,7 +282,7 @@ def read_key_file(label: str, path: str, warn=None) -> str:
 
 
 def resolve_api_keys(settings: dict, warn=None) -> None:
-    for label in ("WHISPER_API_KEY", "LLAMA_API_KEY"):
+    for label in SECRETS:
         path = settings.get(f"{label}_FILE") or ""
         if path:
             settings[label] = read_key_file(label, path, warn)

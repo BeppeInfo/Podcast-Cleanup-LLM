@@ -194,8 +194,7 @@ class Runner:
                 settings, log, stages,
                 episode_override=episode,
                 input_files=written,
-                api_keys={"whisper": os.environ.get("PODCAST_WHISPER_API_KEY"),
-                          "llama": os.environ.get("PODCAST_LLAMA_API_KEY")},
+                api_keys={"llama": os.environ.get("PODCAST_LLAMA_API_KEY")},
             )
             failed = status != 0
             message = "the run failed; the log has the detail" if failed else ""

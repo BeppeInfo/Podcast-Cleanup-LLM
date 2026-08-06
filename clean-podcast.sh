@@ -6,8 +6,8 @@
 # stretches are dead air and which are speech disfluencies, and renders the
 # tracks back out — still separate, still in sync, ready for mixing.
 #
-# The pipeline runs as ordered stages; see --list-stages. Both models are
-# reached over HTTP; neither process is managed here.
+# The pipeline runs as ordered stages; see --list-stages. Transcription runs in
+# this process; the detector is reached over HTTP and is not managed here.
 #
 # Usage: clean-podcast.sh [options] [TRACK...]
 #        clean-podcast.sh --help
@@ -94,17 +94,13 @@ Options:
       --stages A,B,C    run exactly these stages, in this order
       --list-stages     show the stages and exit
 
-      --no-whisper-vad  do not have Whisper run Silero over the audio first.
-                        Silence then gets transcribed too, and since the speech
-                        map is derived from the transcript, anything invented
-                        there becomes speech in the plan
       --no-llm          silence editing only; skip the LLM stage entirely
   -j, --jobs N          parallel ffmpeg jobs
       --force           proceed even when the plan trips a safety limit
 
-  Both models are servers someone else runs; nothing is started or stopped
-  here. Point these at 127.0.0.1 when they happen to be on this machine.
-      --whisper-endpoint URL    transcribe via this whisper-server
+  Transcription runs here, in this process. The detector is a server someone
+  else runs; nothing is started or stopped here. Point it at 127.0.0.1 when it
+  happens to be on this machine.
       --llama-endpoint URL      detect via this llama-server
 
       --keep-inputs     do not delete the originals after a successful run
@@ -142,9 +138,7 @@ parse_args() {
                 printf 'Stages, in order:\n'
                 "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" list-stages
                 exit 0 ;;
-            --no-whisper-vad) ARG_WHISPER_VAD=0; shift ;;
             --no-llm)      ARG_LLM_ENABLE=0; shift ;;
-            --whisper-endpoint) ARG_WHISPER_ENDPOINT="${2:?--whisper-endpoint needs a URL}"; shift 2 ;;
             --llama-endpoint)   ARG_LLAMA_ENDPOINT="${2:?--llama-endpoint needs a URL}"; shift 2 ;;
             -j|--jobs)     ARG_FFMPEG_JOBS="${2:?--jobs needs a number}"; shift 2 ;;
             --force)       FORCE=1; shift ;;
@@ -191,8 +185,7 @@ main() {
 
     # PODCAST_CONFIG_FILE is for the config dump alone — which file was read,
     # not a request to read it again; config_export already carried the values.
-    PODCAST_WHISPER_API_KEY="$WHISPER_API_KEY" \
-        PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
+    PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
         PODCAST_CONFIG_FILE="${CONFIG_FILE:-}" \
         LOG_LEVEL="$LOG_LEVEL" \
         exec "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}"

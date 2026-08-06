@@ -23,7 +23,8 @@ import time
 from . import config as cfg
 from . import intervals as iv
 from . import plan as planner
-from . import asr, discover as disco, llm, proc, render
+from . import discover as disco, llm, proc, render
+from . import whisperx_asr as wx
 from . import silence, transcript as tr
 
 
@@ -347,13 +348,13 @@ def run_episode(settings, log, stages, *, episode_override: str = "",
 
             elif stage == "transcribe":
                 log.stage_begin(
-                    "transcribe", f"transcribing via {settings['WHISPER_ENDPOINT']}")
+                    "transcribe",
+                    f"transcribing with whisperx {settings['WHISPER_MODEL']}")
                 if dry_run:
                     log.info(f"would transcribe {len(episode.tracks)} tracks")
                 else:
-                    stage_transcribe(episode.work, settings, log, ffmpeg=ffmpeg,
-                                     api_key=keys.get("whisper"))
-                log.stage_end(f"{len(episode.tracks)} tracks transcribed remotely")
+                    stage_transcribe(episode.work, settings, log, ffmpeg=ffmpeg)
+                log.stage_end(f"{len(episode.tracks)} tracks transcribed")
 
             elif stage == "detect":
                 if settings["LLM_ENABLE"] != "1":
@@ -648,13 +649,18 @@ def stage_prepare(work: str, settings, log, ffmpeg: str = "ffmpeg") -> None:
     refresh_durations(work, log)
 
 
-VAD_REQUEST_FIELDS = (
-    ("vad_threshold", "WHISPER_VAD_THRESHOLD"),
-    ("vad_min_speech_duration_ms", "WHISPER_VAD_MIN_SPEECH_MS"),
-    ("vad_min_silence_duration_ms", "WHISPER_VAD_MIN_SILENCE_MS"),
-    ("vad_speech_pad_ms", "WHISPER_VAD_SPEECH_PAD_MS"),
-    ("vad_samples_overlap", "WHISPER_VAD_SAMPLES_OVERLAP"),
-)
+def vad_options(settings) -> dict:
+    """WhisperX's VAD knobs. Not the same two numbers as whisper-server's.
+
+    The old server ran Silero and took a threshold in speech probability plus
+    four durations in milliseconds. WhisperX's pyannote VAD takes an onset and
+    an offset — the probabilities at which speech is declared to start and to
+    stop — and does its own segment assembly. There is no honest translation
+    between the two, so the old names went rather than being mapped onto
+    something they do not mean.
+    """
+    return {"vad_onset": float(settings["WHISPER_VAD_ONSET"]),
+            "vad_offset": float(settings["WHISPER_VAD_OFFSET"])}
 
 
 def scan_levels(work: str, participant: str, wav: str, duration: float,
@@ -694,76 +700,52 @@ def scan_levels(work: str, participant: str, wav: str, duration: float,
 
 
 def describe_transcript(parsed, settings, log) -> None:
-    """What the transcription found, and what it had to work around.
+    """What the transcription found.
+
+    Much shorter than it was. The recovery and re-ask reports counted work that
+    only existed because whisper.cpp threw decode windows away and because its
+    word timings were interpolated; forced alignment is the answer to the
+    second, and whether it is also the answer to the first is the thing this
+    branch is here to find out. If it is not, the plan stage says so — it
+    refuses cuts over audio no transcript accounts for, and that check never
+    depended on which engine produced the words.
 
     The `note:` lines go to the run log only, which is where they went when the
-    shell was reading this off a pipe — its parser matched PROGRESS and WARN and
-    let everything else fall through to the log. Worth knowing that the comment
-    in the old code calling one of these "worth saying out loud" was not actually
-    achieved; changing that is a decision, not part of a port.
+    shell was reading this off a pipe.
     """
-    log.raw(f"{len(parsed['words'])} words in {len(parsed['segments'])} segments "
-            f"over {parsed['chunks']} chunk(s)")
+    log.raw(f"{len(parsed['words'])} words in {len(parsed['segments'])} segments")
 
-    recovery = parsed.get("recovery") or {}
-    if recovery.get("spans"):
-        detail = (f"{recovery['spans']} stretch(es) of loud audio came back with "
-                  f"no words; re-asked about {recovery['attempted']} and recovered "
-                  f"{recovery['recovered_segments']} word(s) from "
-                  f"{recovery['recovered_spans']}")
-        log.raw("note: " + detail
-                + ("" if recovery["recovered_spans"] else " — probably not speech, then"))
-        if recovery.get("skipped"):
-            log.warn(f"{recovery['skipped']} further stretch(es) were left unasked; "
-                     "that many is not the occasional skipped window")
-
-    collapsed = parsed.get("collapsed") or {}
-    if collapsed.get("spans"):
-        log.raw(f"note: {collapsed['spans']} word(s) sat on more than "
-                f"{settings['WHISPER_REASK_WORD_SECONDS']}s of speech; asked again "
-                f"in {settings['WHISPER_REASK_WINDOW']}s windows and replaced "
-                f"{collapsed['replaced_spans']}, turning "
-                f"{collapsed['words_before']} word(s) into "
-                f"{collapsed['words_after']}")
-        if collapsed.get("skipped"):
-            log.warn(f"{collapsed['skipped']} further collapsed word(s) were left "
-                     "unasked; that many is not the occasional fluent reading")
-
-    empty = parsed.get("chunks_without_speech") or 0
-    if empty:
-        # Normal on a two-mic recording; total silence is not.
-        detail = f"{empty}/{parsed['chunks']} chunk(s) held no speech at all"
-        if empty == parsed["chunks"]:
-            log.warn(f"{detail}, so this track has no transcript. If it really was "
-                     "talking, the server is dropping it — check that vad_* is "
-                     "honoured and lower WHISPER_CHUNK_SECONDS")
-        else:
-            log.raw(f"note: {detail}")
+    if not parsed["words"]:
+        # Normal on a two-mic recording — one participant is silent for minutes
+        # while the other talks — but a track that was talking and came back
+        # empty is a misconfiguration, and the plan stage will refuse over it.
+        log.raw("note: no speech at all on this track")
 
 
 def stage_transcribe(work: str, settings, log, ffmpeg: str = "ffmpeg",
-                     api_key=None, ready_timeout: float = 60.0) -> None:
+                     transcriber=None) -> None:
     """Transcribe every track, and scan each one's levels while we are here."""
-    # Before the work tree is touched: this is a fault in the configuration,
-    # not in anything the run has produced.
-    endpoint = settings["WHISPER_ENDPOINT"]
-    if not endpoint:
-        raise StageError(
-            "WHISPER_ENDPOINT is required: transcription is always sent to a "
-            "whisper-server. Point it at one — http://127.0.0.1:8081 if it "
-            "runs on this machine.")
     meta = read_json(os.path.join(work, "meta.json"))
     state = os.path.join(work, "state")
 
-    client = asr.WhisperClient(
-        endpoint, timeout=float(settings["WHISPER_REQUEST_TIMEOUT"]),
-        path=settings["WHISPER_ENDPOINT_PATH"], api_key=api_key,
-    )
-    if not client.wait_until_ready(ready_timeout):
-        raise StageError(f"the whisper endpoint at {endpoint} is not usable")
-
-    vad = settings["WHISPER_VAD"] == "1"
-    vad_options = {field: settings[name] for field, name in VAD_REQUEST_FIELDS}
+    # Built once for the episode, not once per track: loading the model costs
+    # tens of seconds on a CPU and there are several tracks. Injectable so a
+    # test can drive the stage without three gigabytes of torch behind it.
+    if transcriber is None:
+        log.info(f"loading {settings['WHISPER_MODEL']} on "
+                 f"{settings['WHISPER_DEVICE']} ({settings['WHISPER_COMPUTE_TYPE']})")
+        try:
+            transcriber = wx.Transcriber(
+                model=settings["WHISPER_MODEL"],
+                device=settings["WHISPER_DEVICE"],
+                compute_type=settings["WHISPER_COMPUTE_TYPE"],
+                language=settings["WHISPER_LANG"],
+                prompt=settings["WHISPER_PROMPT"],
+                vad_options=vad_options(settings),
+                threads=int(settings["WHISPER_THREADS"]),
+            )
+        except wx.WhisperXMissing as exc:
+            raise StageError(str(exc)) from None
 
     total = len(meta["tracks"])
     for index, track in enumerate(meta["tracks"], start=1):
@@ -779,35 +761,24 @@ def stage_transcribe(work: str, settings, log, ffmpeg: str = "ffmpeg",
         if not (os.path.isfile(wav) and os.path.getsize(wav) > 0):
             raise StageError(f"missing prepared track: {wav}")
 
-        log.info(f"whisper (remote): {participant} ({index}/{total})")
+        log.info(f"whisper: {participant} ({index}/{total})")
         duration = float(track["duration"])
-        loud = scan_levels(work, participant, wav, duration, settings, log, ffmpeg)
+        # Kept even though nothing consumes it here any more. It is the only
+        # opinion about the audio that is not Whisper's, and it is what the
+        # plan stage measures the transcript against — which is how we will
+        # find out whether WhisperX drops decode windows the way whisper.cpp
+        # did. If it does not, this and SPEECH_MAP_CLIP can go.
+        scan_levels(work, participant, wav, duration, settings, log, ffmpeg)
 
-        parsed = asr.transcribe(
-            client, wav, participant,
-            language=settings["WHISPER_LANG"],
-            chunk_seconds=float(settings["WHISPER_CHUNK_SECONDS"]),
-            loud=loud,
-            temperature=0.0,
-            on_progress=lambda done, count, name=participant: log.progress(
-                done, count, name),
-            on_note=lambda message: log.raw(f"note: {message}"),
-            vad=vad,
-            vad_options=vad_options,
-            recover=settings["WHISPER_RECOVER"] == "1",
-            speech_pad=float(settings["SPEECH_PAD"]),
-            prompt=settings["WHISPER_PROMPT"],
-            reask=settings["WHISPER_REASK"] == "1",
-            reask_word_seconds=float(settings["WHISPER_REASK_WORD_SECONDS"]),
-            reask_window=float(settings["WHISPER_REASK_WINDOW"]),
-        )
+        segments, language = transcriber.transcribe(
+            wav, batch_size=int(settings["WHISPER_BATCH_SIZE"]))
+        parsed = tr.build_from_segments(segments, participant, language=language)
+        parsed["audio_seconds"] = round(duration, 3)
+        parsed["model"] = settings["WHISPER_MODEL"]
+
         log.progress_done()
         render.write_json(target, parsed)
         describe_transcript(parsed, settings, log)
-
-        if not vad:
-            log.warn("server-side VAD is off, so silence was transcribed as well; "
-                     "anything invented there becomes speech in the plan")
         open(marker, "w").close()
 
 
