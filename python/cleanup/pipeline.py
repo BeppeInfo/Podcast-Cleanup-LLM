@@ -744,9 +744,16 @@ def describe_transcript(parsed, settings, log) -> None:
 def stage_transcribe(work: str, settings, log, ffmpeg: str = "ffmpeg",
                      api_key=None, ready_timeout: float = 60.0) -> None:
     """Transcribe every track, and scan each one's levels while we are here."""
+    # Before the work tree is touched: this is a fault in the configuration,
+    # not in anything the run has produced.
+    endpoint = settings["WHISPER_ENDPOINT"]
+    if not endpoint:
+        raise StageError(
+            "WHISPER_ENDPOINT is required: transcription is always sent to a "
+            "whisper-server. Point it at one — http://127.0.0.1:8081 if it "
+            "runs on this machine.")
     meta = read_json(os.path.join(work, "meta.json"))
     state = os.path.join(work, "state")
-    endpoint = settings["WHISPER_ENDPOINT"]
 
     client = asr.WhisperClient(
         endpoint, timeout=float(settings["WHISPER_REQUEST_TIMEOUT"]),
@@ -850,9 +857,14 @@ def stage_detect(work: str, settings, log, api_key=None, resume_hint: str = "",
     server with no model loaded. Every remaining track would fail identically,
     and an episode that quietly found no edits at all looks like clean speech.
     """
+    endpoint = settings["LLAMA_ENDPOINT"]
+    if not endpoint:
+        raise StageError(
+            "LLAMA_ENDPOINT is required: edit detection is always sent to a "
+            "llama-server. Point it at one, or set LLM_ENABLE=0 to do silence "
+            "editing only.")
     meta = read_json(os.path.join(work, "meta.json"))
     state = os.path.join(work, "state")
-    endpoint = settings["LLAMA_ENDPOINT"]
 
     kinds = [k.strip() for k in settings["LLM_ACCEPT_KINDS"].split(",") if k.strip()]
     unknown = [k for k in kinds if k not in llm.KINDS]

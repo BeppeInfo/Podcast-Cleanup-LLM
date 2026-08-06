@@ -2076,6 +2076,34 @@ class TestProc(unittest.TestCase):
         self.assertEqual(ffmpeg, real)
 
 
+class TestEndpointsAreRequired(unittest.TestCase):
+    """A missing endpoint is a sentence, not a traceback.
+
+    The shell refused these before the stage ran, in config_need_whisper and
+    config_need_llama. The port left them behind: nothing called those functions
+    once the stages moved, so an unset WHISPER_ENDPOINT reached urllib and came
+    back as `ValueError: unknown url type: '/inference'`.
+    """
+
+    def _log(self):
+        return runlog.Log(stream=io.StringIO(), colour=False)
+
+    def test_transcribe_names_the_setting_and_suggests_a_value(self):
+        settings = cfg.defaults()
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_transcribe("/nonexistent", settings, self._log())
+        self.assertIn("WHISPER_ENDPOINT is required", str(caught.exception))
+        self.assertIn("127.0.0.1:8081", str(caught.exception))
+
+    def test_detect_points_at_the_way_out(self):
+        settings = cfg.defaults()
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_detect("/nonexistent", settings, self._log())
+        self.assertIn("LLAMA_ENDPOINT is required", str(caught.exception))
+        # The other answer is not to run the stage at all.
+        self.assertIn("LLM_ENABLE=0", str(caught.exception))
+
+
 class TestPipelineTranscribeStage(unittest.TestCase):
     """The level scan, and what the transcript summary reports."""
 
