@@ -1773,6 +1773,58 @@ class TestWhisperXTranscriber(unittest.TestCase):
         self.assertIn("container image", str(caught.exception))
 
 
+class TestRunComparison(unittest.TestCase):
+    """Scoring one finished render against another, for tools/compare_runs.py.
+
+    The recovery half needs numpy, scipy and real audio and is not exercised
+    here. What is exercised is the arithmetic that turns two recovered cut lists
+    into a verdict, which is the part that would silently mislead.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+        import compare_runs
+        self.cr = compare_runs
+
+    def _recovered(self, removed, duration=60.0):
+        return {"original_duration": duration, "edit_duration": duration - sum(
+            end - start for start, end in removed),
+            "removed": [list(r) for r in removed], "envelope_error": 0.01}
+
+    def test_an_identical_edit_scores_perfectly(self):
+        ref = self._recovered([(10.0, 12.0), (30.0, 33.0)])
+        stats = self.cr.score(self.cr.as_plan(ref), "host", ref)
+        self.assertAlmostEqual(stats["f1"], 1.0, places=6)
+
+    def test_removing_nothing_scores_zero_without_dividing_by_zero(self):
+        ref = self._recovered([(10.0, 12.0)])
+        stats = self.cr.score(self.cr.as_plan(self._recovered([])), "host", ref)
+        self.assertEqual(stats["f1"], 0.0)
+        self.assertEqual(stats["recall"], 0.0)
+
+    def test_cutting_everything_is_caught_by_precision(self):
+        # The failure the score exists to catch: a candidate that removes the
+        # whole track overlaps every reference cut, so recall is perfect. Only
+        # precision says it destroyed the episode.
+        ref = self._recovered([(10.0, 12.0), (30.0, 33.0)])
+        stats = self.cr.score(self.cr.as_plan(self._recovered([(0.0, 60.0)])),
+                              "host", ref)
+        self.assertAlmostEqual(stats["recall"], 1.0, places=6)
+        self.assertLess(stats["precision"], 0.1)
+
+    def test_what_was_missed_is_reported_in_seconds(self):
+        ref = self._recovered([(10.0, 12.0), (30.0, 33.0)])
+        got = self._recovered([(10.0, 12.0)])
+        stats = self.cr.score(self.cr.as_plan(got), "host", ref)
+        missed = iv.total(iv.subtract(stats["reference"], stats["cuts"]))
+        self.assertAlmostEqual(missed, 3.0, places=6)
+
+    def test_a_reference_that_did_not_align_is_not_silently_scored(self):
+        # tools/README.md is explicit: above this the cut list is wrong and
+        # nothing computed from it means anything.
+        self.assertEqual(self.cr.MAX_ENVELOPE_ERROR, 0.1)
+
+
 class TestEndpointsAreRequired(unittest.TestCase):
     """A missing endpoint is a sentence, not a traceback.
 

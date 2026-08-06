@@ -14,6 +14,13 @@ scorer. Nothing under `python/cleanup/` does — the pipeline stays on the
 standard library, and that is deliberate. Install them for the measuring, not
 for the running.
 
+**Steps 2 and 5 still POST to a whisper-server.** The pipeline stopped needing
+one when transcription moved to WhisperX, but these two only ever wanted *a*
+transcript of some audio, and they were not ported along with it. They work
+against any whisper-server you still have; if you have none, transcribe the
+audio however you like and read the text — the tool is a convenience, the
+comparison is the point.
+
 ## The workflow
 
 Edit an episode by hand, keep the originals, and the difference between them is
@@ -62,6 +69,25 @@ tools/sweep_params.py /tmp/eval/work/EPISODE host=ref-host.json \
     --vary silence_min_duration=1.5,0.5,0.3 \
     --vary silence_keep=0.4,0.25,0.15
 ```
+
+**4b. Compare against what the pipeline used to produce.** After a change big
+enough to be worth doubting — a new transcription engine, a different model — the
+question is not only "how close to the hand edit" but "closer than before". This
+takes rendered audio, so any previous release, export or experiment can be a
+candidate.
+
+```
+tools/compare_runs.py --track host \
+    --original sample-host.flac --reference sample-host-result.flac \
+    --candidate bash=result-whisperhost.flac \
+    --candidate whisperx=/tmp/eval/output/ep001/host.flac
+```
+
+It reuses `score_plan.py`'s metric rather than defining a second one, so its
+numbers can be read beside that tool's. Recovered cut lists are cached, because
+recovery is the slow part and it is usually the candidate that changed, not the
+reference. Every warning in "Reading the numbers honestly" applies here too, and
+the last one especially: a candidate can win on F1 and be worse to listen to.
 
 **5. Read the output.** Transcribe the rendered track and compare it to the
 hand edit as text. This is not optional politeness — it is the step that catches
