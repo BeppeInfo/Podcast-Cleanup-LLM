@@ -1713,6 +1713,28 @@ class TestWhisperXTranscriber(unittest.TestCase):
         self.assertEqual(kwargs["asr_options"], {"initial_prompt": "Um, uh, so"})
         self.assertNotIn("initial_prompt", fake.transcribe_options[0])
 
+    def test_the_vad_method_is_stated_not_defaulted(self):
+        # It was defined as a setting and wired to nothing, so WhisperX fell
+        # back to pyannote while the config, the form and the run log all said
+        # whatever the operator had chosen. whisper-server ran Silero, so the
+        # silent default was also a change of detector.
+        fake, loader = self._fake(segments=[])
+        wx.Transcriber(loader=loader, vad_method="silero")
+        _name, kwargs = fake.load_model_calls[0]
+        self.assertEqual(kwargs["vad_method"], "silero")
+
+    def test_the_vad_method_is_never_left_unsaid(self):
+        # Even with nothing asked for, something is stated: the failure mode
+        # being guarded is WhisperX silently choosing for us.
+        fake, loader = self._fake(segments=[])
+        wx.Transcriber(loader=loader)
+        self.assertEqual(fake.load_model_calls[0][1]["vad_method"], "pyannote")
+
+    def test_the_default_setting_matches_the_old_detector(self):
+        # whisper-server ran Silero. The comparison this branch exists for is
+        # only honest if the detector is not changing at the same time.
+        self.assertEqual(cfg.defaults()["WHISPER_VAD_METHOD"], "silero")
+
     def test_the_vad_settings_reach_the_model(self):
         # They used to be form fields on an HTTP request the self-test could
         # read back. Now they are constructor arguments, so this is where the

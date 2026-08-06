@@ -144,8 +144,8 @@ class Transcriber:
 
     def __init__(self, model: str = DEFAULT_MODEL, device: str = "cpu",
                  compute_type: str = DEFAULT_COMPUTE_TYPE, language: str = "",
-                 prompt: str = "", vad_options=None, threads: int = 4,
-                 loader=None):
+                 prompt: str = "", vad_method: str = "", vad_options=None,
+                 threads: int = 4, loader=None):
         self.device = device
         self.language = language if language and language != "auto" else ""
         self._whisperx = (loader or _load_whisperx)()
@@ -157,9 +157,16 @@ class Transcriber:
         # silently ignored means fluent prose, no fillers, and nothing for the
         # detector to find. See DESIGN.md §6.
         asr_options = {"initial_prompt": prompt} if prompt else None
+        # vad_method is passed explicitly rather than left to default. WhisperX
+        # picks pyannote when it is not told, and whisper-server ran Silero —
+        # so leaving this out does not keep the old behaviour, it quietly
+        # changes which detector decides what counts as speech. That decision
+        # is upstream of everything: the speech map comes from the words, and
+        # the words come from whatever the VAD passed through.
         self._model = self._whisperx.load_model(
             model, device=device, compute_type=compute_type,
             language=self.language or None, threads=threads,
+            vad_method=vad_method or "pyannote",
             **({"asr_options": asr_options} if asr_options else {}),
             **({"vad_options": vad_options} if vad_options else {}),
         )

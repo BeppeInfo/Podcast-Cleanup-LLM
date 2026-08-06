@@ -1,6 +1,6 @@
 """Which settings the web interface offers, and where its answers are kept.
 
-Not all 66 settings belong on a form. Three kinds are deliberately absent:
+Not all 58 settings belong on a form. Three kinds are deliberately absent:
 
 **Paths.** `PODCAST_ROOT` and the four directories under it are how the container
 is wired to its volume. Letting a page rewrite them would let a page write
@@ -85,9 +85,12 @@ GROUPS = [
         ("WHISPER_PROMPT", "Initial prompt",
          "conditioning text, not an instruction; empty means Whisper returns "
          "fluent prose and the disfluencies never reach the detector"),
-        ("WHISPER_VAD_METHOD", "Speech detection", "pyannote or silero"),
+        ("WHISPER_VAD_METHOD", "Speech detection",
+         "silero is what whisper-server used; pyannote needs no runtime "
+         "download but is a different detector"),
         ("WHISPER_VAD_ONSET", "Speech starts above", "0 to 1"),
-        ("WHISPER_VAD_OFFSET", "Speech ends below", "0 to 1"),
+        ("WHISPER_VAD_OFFSET", "Speech ends below",
+         "0 to 1; pyannote only, silero uses the onset alone"),
         ("SPEECH_MAP_CLIP", "Bound word timings by the level scan",
          "off means a word stretched across silence protects all of it"),
     ]),

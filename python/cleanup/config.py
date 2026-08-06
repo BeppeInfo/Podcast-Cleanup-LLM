@@ -68,7 +68,14 @@ SETTINGS: dict[str, tuple] = {
     # WhisperX always runs a VAD — it is how the audio is batched, not an
     # option — so there is no longer anything to turn off. What is left is
     # which detector and where its thresholds sit.
-    "WHISPER_VAD_METHOD": ("pyannote", CHOICE, ("pyannote", "silero")),
+    #
+    # Silero, not WhisperX's own pyannote default, because whisper-server ran
+    # Silero and this branch exists to find out what forced alignment is worth.
+    # Changing the detector at the same time would confound that: any
+    # difference in the result could be either. Once the comparison is settled,
+    # pyannote is worth trying on its merits — it needs no runtime download,
+    # where Silero fetches its model from torch.hub on first use.
+    "WHISPER_VAD_METHOD": ("silero", CHOICE, ("pyannote", "silero")),
     "WHISPER_VAD_ONSET": ("0.500", NUM, None),
     "WHISPER_VAD_OFFSET": ("0.363", NUM, None),
 
