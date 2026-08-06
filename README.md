@@ -48,79 +48,63 @@ entirely, so the edit keeps its breathing room instead of sounding gasped.
 | --- | --- | --- |
 | ffmpeg + ffprobe | everything | the only hard dependency; in the image already |
 | python3 | everything | standard library only; the image pins 3.13 |
-| a whisper-server | the `transcribe` stage | reached over HTTP; not started here, and not in the image |
+| whisperx | the `transcribe` stage | in the image, with CPU-only torch; runs in this process, not as a server |
 | a llama-server | the `detect` stage | reached over HTTP; not started here, and not in the image |
-| a Silero VAD model | the `transcribe` stage | `ggml-silero-*.bin`, run by whisper.cpp itself — no Python package |
 | Flask + waitress | the web interface only | in the image; running from a checkout needs neither |
 | numpy + scipy | `tools/` only | for measuring a run against a hand edit; the `dev` image target has them |
 
 ## Where the models run
 
-Both are servers you run yourself, reached over HTTP. `WHISPER_ENDPOINT` is
-required, and `LLAMA_ENDPOINT` too unless `LLM_ENABLE=0`. Nothing here starts,
-stops or waits on a model process, and every run prints the two URLs it is
-using. `--whisper-endpoint` and `--llama-endpoint` override them for one run.
+**Transcription runs here.** WhisperX is a library, not a server: the audio
+never leaves the machine doing the editing, there is no endpoint to configure,
+nothing to authenticate to, and nothing to be unreachable. It is installed in
+the image; a checkout has it only if you install it there, because
+`python/cleanup/` is deliberately dependency-free.
 
-On one machine, point both at `127.0.0.1`. That is a deployment choice and this
-side cannot tell the difference — which also means **it will not keep the two
-models out of each other's memory.** Earlier versions ran both as subprocesses
-and sequenced them so peak usage was the larger model rather than the sum; that
-went away with the local mode. If both servers share a machine that cannot hold
-both, sequence them yourself.
+**Detection is still a server you run yourself.** `LLAMA_ENDPOINT` is required
+unless `LLM_ENABLE=0`. Nothing here starts, stops or waits on that process, and
+`--llama-endpoint` overrides it for one run.
 
-**One caveat on word timings.** They are are only as good as what the
-server returns. A build honouring `max_len=1` returns one word per segment and
-the timings are exact; one that ignores it returns sentence segments, and word
-positions inside them are interpolated, which makes stutter cuts less tight. The
-run warns when that happens.
-Audio is uploaded in chunks (`WHISPER_CHUNK_SECONDS`, default 120, 0 for one
-request), with boundaries nudged onto a quiet spot ffmpeg found so no chunk edge
-lands inside a word.
+### On the CPU, and why
 
-**Whisper discards decode windows, and this is the one to know about.** It works
-in 30-second windows, and a window whose decode ends on a lone timestamp token is
-skipped whole — `"single timestamp ending - skip entire chunk"` in
-`src/whisper.cpp`. On a real 600s track that silently cost 33 seconds of clear
-speech: with VAD the windows are cut from *filtered* audio, so one skipped 30s
-window spanned 33s of the original once the silence inside it is counted back.
-Which window a passage lands in depends on how much speech precedes it, so
-request length shuffles the alignment rather than curing anything — the same
-passage survived a 100s request and vanished from a 300s and a 600s one. Nothing
-in the response reports it, and since the speech map is derived from the
-transcript, the loss reads as silence and gets cut. `WHISPER_CHUNK_SECONDS=120`
-keeps any single loss small, `WHISPER_RECOVER=1` re-asks about the missing span on
-its own — which recovers it, because the window alignment is then different — and
-the audio cross-check below refuses to cut whatever still cannot be recovered.
+WhisperX accelerates on CUDA only. faster-whisper is built on CTranslate2,
+which has no AMD backend, so an AMD card transcribes on the machine's cores like
+any other — there is no ROCm path to switch on. `WHISPER_DEVICE=cuda` is there
+for anyone with an NVIDIA card; the image ships CPU-only torch, because the CUDA
+build pulls several gigabytes of `nvidia-*` wheels that a machine without one
+can never run.
 
-**And one that matters more.** The words that come back are also the speech map —
-silence is where the transcript has none — so the server must be running Silero
-over the audio first, or it will transcribe the silence too and whatever it
-invents there will read as speech. `WHISPER_VAD=1` asks for that per request;
-what the server needs at launch is `-vm` (see below). A build too old to parse
-the `vad_*` form fields ignores them silently, and nothing on this side can tell:
-check `whisper-server --help | grep -c vad` reports 8.
+The practical consequence is that `WHISPER_MODEL` decides how long a run takes.
+`small` is the balance point; `medium` is roughly three to four times its
+runtime, and on a long episode that is the difference between minutes and hours.
 
-## Running the servers
+### Model weights
 
-If you serve either model remotely, these are the settings that matter to this
-pipeline. Both projects' flags drift between versions — check `--help` before
-copying.
+Two downloads on first use: the Whisper model itself, and a wav2vec2 aligner of
+about 360 MB per language. They land under `/models`, which `compose.yml` mounts
+as a volume so a rebuilt container does not fetch them again. The first run
+therefore needs network and takes longer than the ones after it.
+
+`WHISPER_VAD_METHOD=silero` adds a third, fetched from `torch.hub`; the default
+`pyannote` detector's weights ship inside the whisperx package.
+
+## Running the detector
+
+llama-server is the only model this pipeline talks to over HTTP. Its flags drift
+between versions — check `--help` before copying anything below.
 
 ### Authentication
 
-Neither server requires a key by default, and on a trusted LAN neither needs
-one. If an endpoint is behind something that does — a reverse proxy in front of
-whisper-server, or `llama-server --api-key` — set the matching pair:
-
-| | inline | from a file |
-| --- | --- | --- |
-| **Whisper** | `WHISPER_API_KEY` | `WHISPER_API_KEY_FILE` |
-| **LLM** | `LLAMA_API_KEY` | `LLAMA_API_KEY_FILE` |
+llama-server requires no key by default, and on a trusted LAN it needs none. If
+the endpoint is behind something that does — `llama-server --api-key`, or a
+reverse proxy — set either `LLAMA_API_KEY` or `LLAMA_API_KEY_FILE`.
 
 Either form sends `Authorization: Bearer <key>`. Prefer the `_FILE` form: a key
 in the config file is also a key in your editor's backups, and readable by anyone
 who can read the config, whereas a key in its own file can be `chmod 600`. A file
 readable beyond its owner draws a warning.
+
+There is no Whisper key any more, because there is no Whisper server.
 
 The key is never passed as a command-line argument, since argv is readable by
 every process on the machine, and the config dump records only whether one was
@@ -131,61 +115,6 @@ reports it before the episode starts instead of polling out its timeout, and the
 detection stage stops the whole run on the first refusal. Retrying cannot help,
 and since that stage drops a chunk it cannot process, carrying on would otherwise
 deliver an episode that had quietly found no edits at all.
-
-### whisper-server
-
-```sh
-whisper-server \
-    -m /srv/llm/models/whisper/ggml-large-v3-turbo.bin \
-    --host 0.0.0.0 --port 8080 \
-    -vm /srv/llm/models/whisper/ggml-silero-v6.2.0.bin \
-    -t "$(nproc)" \
-    -ml 1 -sow \
-    -fa
-```
-
-- **`--host 0.0.0.0`** — the default binds to localhost, which is the usual
-  reason a "remote" server cannot be reached.
-- **`-vm <silero model>`** is the one this pipeline cannot work properly without.
-  It points at the Silero VAD model so the server can transcribe speech only;
-  fetch one with whisper.cpp's `models/download-vad-model.sh silero-v6.2.0`.
-  Everything *else* about the VAD travels per request, so nothing here needs
-  `--vad` at launch and other clients of the same server are unaffected:
-
-  | request field | set from | default here | whisper.cpp default |
-  | --- | --- | --- | --- |
-  | `vad` | `WHISPER_VAD` | `true` | `false` |
-  | `vad_threshold` | `WHISPER_VAD_THRESHOLD` | `0.5` | `0.5` |
-  | `vad_min_speech_duration_ms` | `WHISPER_VAD_MIN_SPEECH_MS` | `250` | `250` |
-  | `vad_min_silence_duration_ms` | `WHISPER_VAD_MIN_SILENCE_MS` | `1000` | `100` |
-  | `vad_speech_pad_ms` | `WHISPER_VAD_SPEECH_PAD_MS` | `300` | `30` |
-  | `vad_samples_overlap` | `WHISPER_VAD_SAMPLES_OVERLAP` | `0.1` | `0.1` |
-
-  The two that differ from upstream do so for the same reason in opposite
-  directions. `min_silence` is raised because 100 ms ends a segment at every
-  breath, and each segment then reaches Whisper with less of the context it
-  punctuates from. `speech_pad` is raised because a word's opening consonant is
-  quieter than the vowel behind it, so segment edges are where Silero errs — and
-  a clipped edge is a word that never reaches the transcript at all.
-
-  A build too old to parse those fields ignores them without complaint, and the
-  symptom is a transcript with invented speech in it. `whisper-server --help |
-  grep -c vad` should report 8.
-- **`-ml 1 -sow`** is the one that affects output quality. It makes every
-  returned segment a single word, so word timings are exact rather than
-  interpolated across a sentence, which is what decides how tightly a stutter
-  can be cut. The client asks for `max_len=1` per request as well, but not every
-  build honours per-request parameters — setting it on the server removes the
-  doubt. The run reports which it got; look for a line about interpolated
-  timings.
-- **`-fa`** (flash attention) on CUDA builds; `-t` matters mainly on CPU ones.
-- Uploads are **19.2 MB per request** at the default `WHISPER_CHUNK_SECONDS=600`
-  (16 kHz mono 16-bit). If your build rejects bodies that size, lower the
-  setting rather than raising a limit — `300` halves it. `0` sends a whole 2 h
-  track as one ~230 MB request, which is rarely a good idea.
-- No `-cv/--convert` needed: the audio is already 16 kHz mono WAV.
-- Requests are sent one at a time, since a single model instance serialises
-  them anyway.
 
 ### llama-server
 
@@ -257,11 +186,11 @@ Nothing here is tied to the models in the examples. Which model each server has
 loaded is that server's business — swap either, or upgrade to a new version of
 the same one, and the pipeline does not need to know.
 
-**Whisper.** Any ggml model `whisper-cli` or `whisper-server` accepts. Bigger
-models transcribe better and are slower; what matters most downstream is word
-timing precision, which is why `-ml 1 -sow` is worth more than model size for
-this job. Remote responses are parsed tolerantly, so server versions that shape
-their JSON differently are handled.
+**Whisper.** Whatever `WHISPER_MODEL` names — tiny through large-v3, or a path.
+Bigger transcribes better and is slower, and on a CPU that second half dominates.
+Word timing precision used to depend on the model and on asking the server for
+`-ml 1 -sow`; it no longer does, because forced alignment measures every word
+against the audio regardless of which model produced it.
 
 **The LLM.** Any instruct model llama-server can load. Requests go to
 `/v1/chat/completions`, so the server applies that model's own chat template —
@@ -301,8 +230,8 @@ docker compose up --build
 # then open http://127.0.0.1:8000
 ```
 
-Neither model is in the image — both are servers you already run, named by
-`WHISPER_ENDPOINT` and `LLAMA_ENDPOINT`. Everything else is on the Settings page
+Transcription is in the image; the detector is the server you already run, named
+by `LLAMA_ENDPOINT`. Everything else is on the Settings page
 and is kept in `data/settings.json`, so it survives a restart. Finished episodes
 land in `data/output/<episode>/`, which is a bind mount, so they are reachable
 without docker.
@@ -545,10 +474,11 @@ other things it confirms that a stutter over crosstalk leaves both tracks exactl
 their original length, that the affected track is silent across the muted span,
 and that the *other* speaker's audio at that same instant is untouched.
 
-Its last case runs all eight stages against stub HTTP servers standing in for
-whisper-server and llama-server, which covers the remote clients, the multipart
-upload, and the response handling. Real models are still never exercised, so run
-one real episode with `--keep-work` the first time.
+Its last cases run every stage against a stub llama-server and a fake whisperx
+module, which covers the client, the stage wiring and the response handling.
+Real models are never exercised — the fake is on `PYTHONPATH` and is imported in
+place of the real package — so run one real episode with `--keep-work` the first
+time.
 
 ## Layout
 
@@ -565,8 +495,7 @@ python/cleanup/intervals.py   interval algebra and timeline remapping
 python/cleanup/silence.py     silencedetect parsing: chunk boundaries, and the
                               only opinion about the audio that is not Whisper's
 python/cleanup/transcript.py  Whisper tokens to words, and the speech map
-python/cleanup/asr.py         remote whisper-server client, chunking, and
-                              recovering a skipped decode window
+python/cleanup/whisperx_asr.py  transcription and forced alignment, in process
 python/cleanup/llm.py         chunking, prompting, response validation
 python/cleanup/plan.py        the cut-versus-mute decision
 python/cleanup/render.py      ffmpeg expressions, duration prediction, transcript
@@ -592,9 +521,13 @@ touch audio — everything else reads and writes JSON.
   `SILENCE_MIN_DURATION` plus twice it before anything is removed. Raise it for
   rarer, safer cuts; lower it for tighter ones. Read `ep042_edit-report.txt`
   before trusting a run.
-- `WHISPER_VAD_THRESHOLD` is the other end of the same question, and it acts
-  earlier: it decides what Whisper transcribes at all, and therefore what exists
-  to be protected. Lower it if quiet speech is going missing from the transcript.
+- `WHISPER_VAD_ONSET` is the other end of the same question, and it acts earlier:
+  it decides what Whisper transcribes at all, and therefore what exists to be
+  protected. Lower it if quiet speech is going missing from the transcript; raise
+  it if the transcript loops, which is what Whisper does when handed non-speech.
+- `WHISPER_MODEL` is upstream of both. A bigger model finds disfluencies a
+  smaller one smooths over, and no threshold can recover what was never
+  transcribed.
 - `SPLIT_SILENCE_THRESHOLD` decides how much the audio cross-check complains
   about. Raise it toward `-35dB` if it keeps reporting non-speech you are content
   to lose; lower it to hear about more. It has no effect on what gets cut.

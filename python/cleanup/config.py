@@ -69,13 +69,13 @@ SETTINGS: dict[str, tuple] = {
     # option — so there is no longer anything to turn off. What is left is
     # which detector and where its thresholds sit.
     #
-    # Silero, not WhisperX's own pyannote default, because whisper-server ran
-    # Silero and this branch exists to find out what forced alignment is worth.
-    # Changing the detector at the same time would confound that: any
-    # difference in the result could be either. Once the comparison is settled,
-    # pyannote is worth trying on its merits — it needs no runtime download,
-    # where Silero fetches its model from torch.hub on first use.
-    "WHISPER_VAD_METHOD": ("silero", CHOICE, ("pyannote", "silero")),
+    # pyannote, which is what WhisperX intends and ships the weights for.
+    # Silero is what whisper-server ran, so it is the like-for-like setting when
+    # comparing against the old results, and it stays one setting away — but it
+    # fetches its model from torch.hub on first use, where pyannote's is inside
+    # the package. Note WHISPER_VAD_OFFSET is pyannote's alone: Silero reads the
+    # onset and the chunk size and ignores it.
+    "WHISPER_VAD_METHOD": ("pyannote", CHOICE, ("pyannote", "silero")),
     "WHISPER_VAD_ONSET": ("0.500", NUM, None),
     "WHISPER_VAD_OFFSET": ("0.363", NUM, None),
 

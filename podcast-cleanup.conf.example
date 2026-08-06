@@ -55,111 +55,80 @@ INPUT_EXTS="flac wav wave aiff aif m4a mp4 mka mkv mp3 ogg oga opus wv ape alac"
 # (TRACK_EXT is the old name for this and still works, but it only filters
 # inputs now — the output format is set below.)
 
-# ------------------------------------------------------------------- whisper --
+# ----------------------------------------------------------------- whisperx --
 
-# Where transcription is sent. Required — there is no local Whisper any more, so
-# a run without it stops at the transcribe stage. Point it at 127.0.0.1 when the
-# server happens to be on this machine: it is still a server someone else runs,
-# and nothing here starts, stops or waits on that process.
+# Transcription runs in this process. There is no endpoint, no key and no
+# timeout, because there is no server: WhisperX is a library, it is installed in
+# the image, and the audio never leaves the machine doing the editing.
 #
-# One caveat: word timings are only as good as what the server returns. A build
-# that honours max_len=1 returns one word per segment and the timings are exact;
-# one that ignores it returns sentence segments, and word positions inside them
-# are interpolated, which makes stutter cuts less tight. The run warns when that
-# happens.
-WHISPER_ENDPOINT="http://127.0.0.1:8081"
-#WHISPER_ENDPOINT="http://gpu-box.lan:8081"
-WHISPER_ENDPOINT_PATH="/inference"
+# What it buys over sending the audio to whisper-server is *word timings*.
+# Whisper interpolates them from token positions; WhisperX aligns the transcript
+# against the audio with wav2vec2 and returns a measured start and end for every
+# word. Everything downstream is decided in seconds — which stretches are
+# speech, where a cut may start, how long the result should be — so this is the
+# number the pipeline has always actually wanted.
 
-# Sent as "Authorization: Bearer <key>". whisper.cpp's own server has no
-# authentication, so this is for whatever you have put in front of it — a
-# reverse proxy, or a hosted endpoint that speaks the same API.
+# Which Whisper model. tiny, base, small, medium, large-v3, or a path.
 #
-# Prefer the _FILE form. A key written here is also a key in your editor's
-# backups, and readable by anyone who can read this file; a key in its own file
-# can be chmod 600, and one that is readable more widely draws a warning. Either
-# way the key never reaches the run log or a command line.
-WHISPER_API_KEY=""
-#WHISPER_API_KEY_FILE="/etc/podcast-cleanup/whisper.key"
+# On a CPU this is the setting that decides how long a run takes, and there is
+# no way around it: WhisperX accelerates on CUDA only, so a machine with a
+# Radeon card transcribes on its cores like any other. Bigger is a better
+# transcript and a longer wait, more or less linearly. small is the balance
+# point; medium is roughly three to four times its runtime.
+WHISPER_MODEL="small"
 
-# Audio is uploaded in chunks of this many seconds; 0 sends the whole track in
-# one request. Boundaries are nudged onto the middle of a quiet spot ffmpeg
-# found, so a chunk edge does not land inside a word. Chunking also means
-# progress is reported as the run goes rather than only at the end.
-#
-# It is not only an upload-size knob, and it is not a fix for what it mitigates.
-# Whisper decodes in 30-second windows, and a window whose decode ends on a lone
-# timestamp token is discarded whole — "single timestamp ending - skip entire
-# chunk" in whisper.cpp. On a real 600s track that cost 33 seconds of clear
-# speech with nothing in the response to say so, and since the speech map is
-# derived from the transcript, that audio then read as silence and was cut.
-#
-# Which window a passage lands in depends on how much speech precedes it, so
-# request length shuffles the alignment rather than curing anything: the same
-# passage survived a 100s request and vanished from a 300s and a 600s one. 120
-# keeps any single loss small; the check that actually catches it is the audio
-# cross-check in the plan stage, which refuses to cut audio no transcript
-# accounts for.
-WHISPER_CHUNK_SECONDS="120"
-WHISPER_REQUEST_TIMEOUT="1800"
+# cpu, or cuda if there is an NVIDIA card. There is no ROCm path — faster-whisper
+# is built on CTranslate2, which has no AMD backend, so Radeon means cpu.
+WHISPER_DEVICE="cpu"
+
+# int8 on a CPU. float16 needs cuda and is ignored without it; float32 is slower
+# for no gain here.
+WHISPER_COMPUTE_TYPE="int8"
+
+# How many VAD segments are decoded at once, and how many cores to use. Batch
+# size trades memory for speed. Threads at 0 lets CTranslate2 decide.
+WHISPER_BATCH_SIZE="8"
+WHISPER_THREADS="4"
 
 # Language code, or "auto" to detect. Setting it explicitly is both faster and
 # more accurate than detection on a two-hour recording.
 WHISPER_LANG="auto"
 #WHISPER_LANG="pt"
 
-# --------------------------------------------------- Whisper's Silero pass --
+# ------------------------------------------------------------ speech detection --
 
-# This is the only speech detection in the pipeline, and it does two jobs at
-# once. Whisper transcribes only what Silero calls speech — handed silence it
-# invents text, and loops a phrase while doing it — and the plan then derives its
-# speech map from the words that come back. So what is silence to cut, and what
-# is speech to protect, is decided here.
+# WhisperX always runs a voice activity detector — it is how the audio is cut
+# into batches, not an option — so unlike whisper-server there is nothing to turn
+# off. What is left is which detector, and where its thresholds sit.
 #
-# Turning this off means silence is transcribed too, and whatever Whisper invents
-# over it becomes speech in the plan, because nothing else looks at the audio.
-WHISPER_VAD="1"
-
-# The server is given its Silero model at launch and cannot be told which one
-# per request, so start it with -vm:
+# It still does the same two jobs it always did, and they are still the reason
+# this matters more than it looks. Whisper transcribes only what the VAD calls
+# speech, and handed silence it invents text and loops a phrase while doing it;
+# the plan then derives its speech map from the words that come back. So what is
+# silence to cut, and what is speech to protect, is decided here.
 #
-#     whisper-server -m <model> --host 0.0.0.0 --port 8081 \
-#         -vm /srv/llm/models/whisper/ggml-silero-v6.2.0.bin
+# pyannote is WhisperX's own default and ships its weights inside the package.
+# silero is what whisper-server ran, which makes it the like-for-like setting
+# when comparing a run against results from that era; it fetches its model from
+# torch.hub the first time it is used.
+WHISPER_VAD_METHOD="pyannote"
+
+# The probabilities at which speech is declared to start and to stop. These
+# replace whisper-server's Silero threshold and its four durations in
+# milliseconds, and they are not the same knobs under new names: pyannote takes
+# an onset and an offset and assembles its own segments. Translating the old
+# values onto these would have been a guess dressed as a setting, so the old
+# names were removed rather than mapped.
 #
-# Fetch one with whisper.cpp's models/download-vad-model.sh silero-v6.2.0. Every
-# other setting below travels with each request, so the same server serves runs
-# that want different values, and other clients of it are unaffected.
+# Raise the onset to make the detector stricter about what it calls speech —
+# which is the lever when a transcript comes back looping, since that is what
+# Whisper does when handed something that is not speech.
+WHISPER_VAD_ONSET="0.500"
 
-# Speech probability above which Silero calls a frame speech. whisper.cpp's own
-# default.
-WHISPER_VAD_THRESHOLD="0.5"
-WHISPER_VAD_MIN_SPEECH_MS="250"
+# pyannote only. Silero reads the onset and the chunk size and ignores this.
+WHISPER_VAD_OFFSET="0.363"
 
-# How long silence must last before it ends a speech segment. whisper.cpp
-# defaults to 100 ms, which splits on every breath: each segment then reaches
-# Whisper with less of its surroundings, and Whisper punctuates from context. So
-# this sits well past a natural pause instead. It is also the knob that decides
-# how finely the derived speech map is broken up.
-WHISPER_VAD_MIN_SILENCE_MS="1000"
-
-# Margin added to each end of a speech segment. whisper.cpp defaults to 30 ms; a
-# word's opening consonant is quieter than the vowel behind it, so segment edges
-# are exactly where Silero errs, and a clipped edge here is a word that never
-# reaches the transcript at all.
-WHISPER_VAD_SPEECH_PAD_MS="300"
-WHISPER_VAD_SAMPLES_OVERLAP="0.1"
-
-# Re-ask about any loud stretch the first pass returned no words for, one span at
-# a time. This is the only thing that recovers a decode window Whisper discarded:
-# re-sending the span on its own puts it at a different offset in the 30-second
-# windows, so the audio no longer falls in a thrown-away one. On the episode this
-# was written for, 33 seconds lost from a 600s request came back intact.
-#
-# Costs one extra request per missing stretch and nothing at all on a clean track.
-# The retry asks for VAD too, so a stretch that is loud but not speech comes back
-# empty rather than hallucinated — and a stretch that stays empty is left for the
-# plan stage to refuse over.
-WHISPER_RECOVER="1"
+# ------------------------------------------------------- what reaches the LLM --
 
 # Whisper's initial prompt. This is conditioning text, not an instruction: it is
 # seeded into the decoder as though it were the transcript preceding the audio,
@@ -175,10 +144,16 @@ WHISPER_RECOVER="1"
 # Measured on a two-track sample: of six disfluencies removed by hand, an empty
 # prompt left five of them absent from the transcript entirely.
 #
+# Alignment does not change this. WhisperX re-times the words Whisper chose; it
+# does not choose different words, so a fluent decode stays fluent and the
+# fillers stay gone. The prompt is still the only thing that keeps them.
+#
 # The cost is the mirror image: a decode biased towards fillers can invent one in
 # silence, and since the speech map is derived from these words, an invented
-# filler becomes speech in the plan. Keep the Silero pass on (WHISPER_VAD) and the
-# invented ones have no silence to appear in.
+# filler becomes speech in the plan. The VAD above is what leaves it no silence
+# to appear in.
+WHISPER_PROMPT="Um, uh, so, like, you know, I mean — um, that's, that's the thing."
+
 # Bound each word's span by the level scan when building the speech map.
 #
 # Whisper's word timings run past the audio as a matter of course — a word
@@ -191,26 +166,12 @@ WHISPER_RECOVER="1"
 # This trims and never extends. The scan is not asked whether something is speech
 # — it cannot tell speech from a cough — only when the audio actually happened. A
 # track with no scan keeps its timings as they are.
-SPEECH_MAP_CLIP="1"
-
-WHISPER_PROMPT="Um, uh, so, like, you know, I mean — um, that's, that's the thing."
-
-# A prompt does not reach everything. Where one word still sits on seconds of
-# continuous speech, Whisper read a whole passage fluently and hung it on that
-# word; asked again in a short window it comes back verbatim, because there is no
-# fluent context left to smooth into. Sending the same span as a long request does
-# not work — the *length of the window* is the mechanism, not the re-asking.
 #
-# Costs one request per collapsed word, and nothing on a track with none. Turn it
-# off to have the transcript be exactly what the first pass said.
-WHISPER_REASK="1"
-# A word carrying more speech than this had something else inside it. Measured
-# against the level scan, so the pause around a word is not counted: no ordinary
-# word reaches a second of speech. Lower it to question more, at one request each.
-WHISPER_REASK_WORD_SECONDS="1.2"
-# How long those windows are. Five seconds was enough to recover a repetition that
-# nineteen seconds of the same audio did not; there is no gain in raising it.
-WHISPER_REASK_WINDOW="5.0"
+# Forced alignment is the reason this may no longer be needed: measured timings
+# should not run past the audio the way interpolated ones did. It is left on
+# because "should not" is not "does not", and turning it off is a measurement
+# rather than a guess — compare a run each way before deciding.
+SPEECH_MAP_CLIP="1"
 
 # ----------------------------------------------------------------- llama.cpp --
 

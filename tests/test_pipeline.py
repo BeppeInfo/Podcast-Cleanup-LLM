@@ -1730,10 +1730,11 @@ class TestWhisperXTranscriber(unittest.TestCase):
         wx.Transcriber(loader=loader)
         self.assertEqual(fake.load_model_calls[0][1]["vad_method"], "pyannote")
 
-    def test_the_default_setting_matches_the_old_detector(self):
-        # whisper-server ran Silero. The comparison this branch exists for is
-        # only honest if the detector is not changing at the same time.
-        self.assertEqual(cfg.defaults()["WHISPER_VAD_METHOD"], "silero")
+    def test_the_default_is_what_whisperx_intends(self):
+        # pyannote, whose weights ship in the package. Silero — what
+        # whisper-server ran — stays reachable for a like-for-like comparison.
+        self.assertEqual(cfg.defaults()["WHISPER_VAD_METHOD"], "pyannote")
+        self.assertIn("silero", cfg.SETTINGS["WHISPER_VAD_METHOD"][2])
 
     def test_the_vad_settings_reach_the_model(self):
         # They used to be form fields on an HTTP request the self-test could

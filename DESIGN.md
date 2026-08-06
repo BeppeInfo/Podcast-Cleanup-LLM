@@ -27,8 +27,8 @@ synchronised: sample 0 of each is the same instant. Wanted, per episode:
 3. the tracks still separate, still in sync, ready for mixing;
 4. everything else — inputs and intermediates — gone at the end, logs kept.
 
-Both models are reached over HTTP. Whether they fit in memory together is the
-business of whatever machine serves them; see §7 for what that gave up.
+Transcription runs in this process; the detector is reached over HTTP. See §7
+for how that arrangement was arrived at and what each step of it gave up.
 
 ## 2. Shape of the solution
 
@@ -44,7 +44,7 @@ business of whatever machine serves them; see §7 for what that gave up.
                   │ runs, via proc.py                 │ decides with
         ┌─────────▼──────────────────┐   ┌────────────▼──────────────────┐
         │ ffmpeg                     │   │ intervals · plan · transcript  │
-        │ asr.py  ──→ whisper-server │   │ render · discover · silence    │
+        │ whisperx_asr ──→ whisperx  │   │ render · discover · silence    │
         │ llm.py  ──→ llama-server   │   │ (no audio, no sockets, no      │
         │                            │   │  subprocesses — just judgement)│
         └────────────────────────────┘   └────────────────────────────────┘
@@ -73,13 +73,16 @@ them, so a test for what gets cut still needs nothing but python3. `pipeline.py`
 and `proc.py` are where subprocesses happen, and they are deliberately thin: they
 sequence and report, they do not decide.
 
-`asr.py` and `llm.py` sit outside that tidy split, and always have. Each is a
-client *and* a body of judgement — `llm._validate` decides which findings to
-trust, `asr.reask_collapsed` decides which words to question again — in the same
-file as the socket. That is why `tests/stub_servers.py` exists: standing up a fake
-HTTP server is the only way to reach those decisions, and it is a worse way than
-calling a function. Worth separating one day; not worth pretending is already
-done.
+`llm.py` sits outside that tidy split and always has: it is a client *and* a body
+of judgement — `llm._validate` decides which findings to trust — in the same file
+as the socket. That is why `tests/stub_servers.py` exists, and standing up a fake
+HTTP server is a worse way to reach a decision than calling a function. Worth
+separating one day; not worth pretending is already done.
+
+`whisperx_asr.py` used to be the other example, and is no longer. Replacing the
+remote client took the socket out of it, and the judgement it still carries —
+what to do about a word alignment could not time — is a pure function over a list
+that a test calls directly.
 
 The cost is real and worth stating. `lib/stages.sh` was 1010 lines of bash that
 one could read top to bottom; the same logic in Python is spread over functions
@@ -416,36 +419,32 @@ keeps that in check — with VAD on there is no silence for an invented filler t
 appear in. A prompt is a bias, not a switch, and it comes with no guarantees in
 either direction.
 
-### Re-asking where one word swallowed the audio
+### Re-asking where one word swallowed the audio, and why it is gone
 
-The recovery in §7 answers *"loud audio, no words at all"*. `WHISPER_REASK`
-answers the graded version: loud audio with implausibly *few* words on it. When
-Whisper reads a passage fluently it hangs the whole passage on one word, and that
-word ends up carrying seconds of continuous speech. Nothing in the response marks
-it, and both stages downstream go blind in the same spot — the LLM stage cannot
-cut what is not in the transcript, and the plan stage sees one long word where
-there was a pause, so the silence never becomes a gap either.
+`WHISPER_REASK` answered the graded version of the decode-window problem below:
+loud audio with implausibly *few* words on it. When Whisper read a passage
+fluently it hung the whole passage on one word, and that word ended up carrying
+seconds of continuous speech — invisible to the LLM stage, which cannot cut what
+is not in the transcript, and to the plan stage, which saw one long word where
+there was a pause.
 
-The trigger is the level scan, not the clock: a word is only questioned when more
-than `WHISPER_REASK_WORD_SECONDS` of *measured loud audio* sits inside it. A word
-stretched across silence is badly timestamped, not hiding anything, and asking
-about it would spend a request to be told the same thing.
-
-Asked again in a short window the same audio comes back verbatim, because there
-is no fluent context left to smooth into. The window length is the mechanism, not
-the re-asking: re-sending one span as a nineteen-second request returned the same
-cleaned-up reading, while five-second windows over the same audio returned
+Asked again in a short window the same audio came back verbatim, because there
+was no fluent context left to smooth into. The window length was the mechanism,
+not the re-asking: re-sending one span as a nineteen-second request returned the
+same cleaned-up reading, while five-second windows over the same audio returned
 *"Yeah, I wonder what Fairpunk, uh, would, would, would talk about this"*.
 
-A replacement is only accepted where the second pass found strictly more words
-than the first. Equal counts are the same reading spelled differently — proper
-nouns come back unstable from a short window, the same name arriving as
-*Shwereponk*, *SharePunk* and *Fairpunk* — and trading one spelling for another
-is churn, not recovery.
+**It was not carried across to WhisperX**, along with the recovery described
+below. Both were built for whisper.cpp's behaviour, and whether faster-whisper
+behaves the same way is a question rather than a known fact — porting them would
+have assumed the answer, and each cost a round of requests on every run to
+maintain that assumption. The symptom they treated is still detectable: a word
+carrying seconds of measured loud audio is exactly what `untranscribed_audio`
+and the level scan are positioned to notice.
 
-On the sample fixture this fired once and correctly declined to replace anything:
-with the prompt in place there was nothing left for it to find. It is kept for
-the case the prompt does not reach, which is the one it was written for.
+This is recorded rather than deleted because the finding it rests on — that
+*window length* is the lever, not repetition — is the kind of thing that is
+expensive to rediscover. If the problem recurs, that is where to start.
 
 ### Nothing here knows which model it is talking to
 
@@ -524,11 +523,14 @@ warns — but only for a server it starts itself, since a remote one's `-c` and
 
 ## 7. Model placement
 
-Both models are servers someone else runs. `WHISPER_ENDPOINT` and
-`LLAMA_ENDPOINT` are required — the second only when `LLM_ENABLE=1` — and
-nothing here starts, stops, waits on or otherwise manages a model process.
-Pointing them at `127.0.0.1` is how a single-machine install works; that is a
-deployment choice, and this side cannot tell the difference.
+**Transcription runs in this process.** WhisperX is a library; there is no
+endpoint, no key, no timeout and nothing to be unreachable. **Detection is still
+a server someone else runs** — `LLAMA_ENDPOINT`, required when `LLM_ENABLE=1` —
+and nothing here starts, stops, waits on or otherwise manages that process.
+
+That asymmetry is deliberate and it is the third arrangement this project has
+had. Both are worth recording, because the reasoning that killed each one is
+what justifies the current shape.
 
 **There used to be a local mode**, and most of §7 used to be about defending it.
 `whisper-cli` was run per track and `llama-server` was started and stopped inside
@@ -539,64 +541,102 @@ Whisper process had exited before `detect` began, `WHISPER_JOBS`, `LLAMA_NGL`,
 `LLAMA_CTX`, and a warning that computed whether `-c` divided by `--parallel`
 still left room for a chunk.
 
-All of it is gone. The reasoning: it was two ways to do one thing, and the
-second way is strictly more capable — a server on `127.0.0.1` does everything a
-subprocess did, and can be shared, restarted, swapped or moved to another
-machine without this script knowing. Keeping both meant every stage carrying a
-branch, fourteen settings existing only to construct command lines, and a
-process lifetime to get right on every failure path.
+All of it went, and the reasoning was that it was two ways to do one thing and
+the second way was strictly more capable — a server on `127.0.0.1` does
+everything a subprocess did, and can be shared, restarted, swapped or moved to
+another machine without this script knowing.
+
+**Then transcription came back in-process anyway**, which looks like a reversal
+and is not. What returned is not a subprocess with a lifetime to manage; it is a
+library call, with no port, no readiness probe and no failure mode where the
+model is running but unreachable. The argument that killed the local mode was
+about *managing another process*, and a library is not one.
+
+What brought it back was word timings. Whisper interpolates them from token
+positions; WhisperX aligns the transcript against the audio and measures them.
+Everything in this pipeline is decided in seconds, so that is not a refinement,
+it is the number the design has always wanted — see §5 on why cuts are
+frame-aligned and §6 on what the transcript is used for. WhisperX has no server
+mode, so having it at all means having it here.
+
+The second reason is that the hop bought nothing. Both available machines have
+Radeon cards, WhisperX accelerates on CUDA only, and faster-whisper's CTranslate2
+has no AMD backend — so transcription runs on a CPU wherever it is put. Sending
+audio across a network to reach a CPU identical to the local one is latency and
+a failure mode in exchange for nothing. The web interface was already the remote
+thing.
 
 **What was genuinely lost, and is worth stating plainly.** The memory constraint
-was previously enforced structurally, and now it is not enforced at all. If both
-servers share a machine that cannot hold both models, that machine will swap or
-OOM, and nothing here will prevent it or explain it. That was already true for
-anyone using two endpoints, which is why the old code warned about it; the
-change is that it is now the only mode. It is the right trade for this project —
-the models have lived on `choppaserver` for a while — but a single-machine user
-with tight RAM has to sequence the two servers themselves.
+that the local mode enforced structurally is still not enforced at all — but it
+now applies to one server rather than two, and the pipeline's own transcription
+holds its model for the length of the transcribe stage rather than negotiating
+with anything. A single-machine user with tight RAM has to sequence
+llama-server against whatever else they run; nothing here will prevent an OOM or
+explain it.
 
-The context-size check went the same way. It could compute `-c / --parallel`
-only because it was the thing passing those flags. Against a server it did not
-start, the arithmetic is unavailable, so the guidance moved into the config
-comment and the README sizing table. A chunk that does not fit is still refused
-silently and still shows up only as a track with suspiciously few edits — there
-is simply no longer anything positioned to warn first.
+The context-size check went with the local mode and has not come back. It could
+compute `-c / --parallel` only because it was the thing passing those flags.
+Against a server it did not start, the arithmetic is unavailable, so the guidance
+moved into the config comment and the README sizing table. A chunk that does not
+fit is still refused silently and still shows up only as a track with
+suspiciously few edits.
 
-### Remote transcription
+### Transcription, and what alignment changed
 
-`asr.py` POSTs the prepared 16 kHz WAV to `/inference` as multipart and converts
-the reply into the same segment shape `whisper-cli` produces, so
-`transcript.build_from_segments` reassembles words from one code path either way.
+`whisperx_asr.py` loads the model once for the episode — loading costs tens of
+seconds on a CPU and an episode is several tracks — transcribes each prepared
+16 kHz WAV, then aligns the result and emits **one segment per word**.
 
-Three wrinkles. **Server-side VAD**: the request asks the server to run Silero
-first and transcribe only what it calls speech, which is the whole reason this
-pipeline no longer detects speech itself — see below. **Chunking**: a 2 h track is
-~230 MB and one request means no progress for as long as it takes, so it is split,
-with boundaries nudged onto a quiet spot ffmpeg found so a split does not land
-mid-word. `WHISPER_CHUNK_SECONDS` is also the blast radius of a skipped decode
-window, which is a separate matter covered below. **Tolerant parsing**: whisper-server's response shape varies by
-version and `response_format`, so several are accepted (`segments` with float
-seconds, with clock strings, or whisper-cli's `transcription` with `offsets`;
-token lists are used when they carry timings and ignored when they are bare ids).
-What is *not* tolerated is a response with no timings at all — that raises rather
-than guessing.
+That shape was not invented for this. The remote client already asked
+whisper-server for `max_len=1` and `split_on_word` precisely so that segments
+arrived one word at a time with timings that were measured rather than
+interpolated, and `transcript.build_from_segments` has always reassembled words
+from exactly that. Alignment produces it natively, so nothing downstream of
+`transcript.py` had to learn that anything changed.
 
-Word timing quality differs: `max_len=1` is requested so each segment is one
-word and timings are exact, but a build that ignores it returns sentence
-segments whose word positions are interpolated. The run says which it got,
-because it decides how tightly a stutter can be cut.
+**Untimed words are the hazard.** Alignment leaves some words with no timings —
+numerals, mostly, which it cannot map to audio frames. Dropping them would be
+the worst thing this code could do, for the reason the next section gives: the
+speech map is derived from these words, silence is defined as their absence, and
+cuts happen where every track is silent. A dropped word is not a missing label,
+it is audio that has stopped defending itself and can be cut out from under the
+speaker. So an untimed run is spread across the gap its neighbours leave, the
+same interpolation `_segment_words_by_proportion` does for a segment with no
+token positions. The timing is a guess; the protection is not.
 
-**An empty answer is an answer.** A chunk holding no speech comes back as `200`
-with an empty segment list, and that is the truth about that chunk. Treating it as
-a failure cost a whole track the first time chunking met a silent stretch — on a
-two-mic recording each participant is silent for minutes while the other talks, so
-those stretches are the norm rather than the exception. What still raises is a
-response that had something to say and nowhere to put it: text without timings.
+**What was deliberately not carried across** is the recovery and re-ask
+machinery. Both existed because whisper.cpp discards a decode window whose decode
+ends on a lone timestamp token — see the section below on the level scan — and
+whether faster-whisper does the same is an open question rather than a known
+fact. Porting them would have assumed the answer. The instrument that settles it
+is already in place and never depended on which engine produced the words: the
+plan stage refuses to cut audio no transcript accounts for. If that refusal fires
+on a real episode, the answer is to bring recovery back, not to raise the
+threshold.
 
-**A word with timings is not evidence a word was spoken.** On the sample
-recording Whisper returned a final `right` spanning 9.94–11.34 s, over audio
-whose peak is −50.4 dB — the noise floor. The transcript is a model's output, not
-a measurement, and it will place words over near-silence.
+### Which detector decides what speech is
+
+WhisperX always runs a VAD — it is how audio is batched, not an option — so the
+question is no longer whether, as it was with whisper-server, but which.
+
+`WHISPER_VAD_METHOD` chooses. `pyannote` is WhisperX's own default and ships its
+weights in the package; `silero` is what whisper-server ran, which makes it the
+like-for-like setting when comparing against results from that era, and it
+fetches its model from `torch.hub` on first use.
+
+**This is passed explicitly and never left to default.** WhisperX picks pyannote
+when it is not told, so saying nothing would not have preserved the old
+behaviour — it would have quietly changed the detector that decides what counts
+as speech, which is upstream of everything in §6. It was wired to nothing at
+first, and the setting, the settings page and the run log all reported a choice
+that had no effect.
+
+The old Silero thresholds were removed rather than renamed. whisper-server took
+a speech probability and four durations in milliseconds; pyannote takes an onset
+and an offset and assembles its own segments. There is no honest translation, so
+mapping the old names onto the new numbers would have been a lie in the config
+file. `WHISPER_VAD_OFFSET` is pyannote's alone — Silero reads the onset and the
+chunk size and ignores it.
 
 ### The transcript is the speech map
 
@@ -688,54 +728,58 @@ the hand edit cut.
 
 ### Whisper throws away decode windows, and that is why the level scan survived
 
-The first real episode run under this design lost 33 seconds of clear speech from
-one track, and every part of the pipeline agreed that stretch was silent.
+The first real episode run under the remote design lost 33 seconds of clear
+speech from one track, and every part of the pipeline agreed that stretch was
+silent.
 
-Whisper decodes in 30-second windows (`WHISPER_CHUNK_SIZE`), and a window whose
-decode ends on a lone timestamp token is discarded whole — `"single timestamp
-ending - skip entire chunk"`, `src/whisper.cpp`. With VAD the windows are cut from
-*filtered* audio, so one skipped 30s window spanned 33s of original time once the
-silence inside it is counted back. The response says nothing about it. The
-transcript that came back was internally consistent, so the speech map derived
-from it was consistent too, and a silence cut removed the audio.
+Whisper decodes in 30-second windows, and a window whose decode ends on a lone
+timestamp token is discarded whole — `"single timestamp ending - skip entire
+chunk"`, `src/whisper.cpp`. With VAD the windows are cut from *filtered* audio, so
+one skipped 30s window spanned 33s of original time once the silence inside it is
+counted back. The response said nothing about it. The transcript that came back
+was internally consistent, so the speech map derived from it was consistent too,
+and a silence cut removed the audio.
 
-Request length does not fix this. Which window a passage lands in depends on how
-much speech precedes it, so length only reshuffles the alignment: the same passage
-survived a 100s request and vanished from a 300s and a 600s one. `120` is chosen
-to keep any single loss small, not because it is safe.
+Request length did not fix it. Which window a passage lands in depends on how
+much speech precedes it, so length only reshuffled the alignment: the same
+passage survived a 100s request and vanished from a 300s and a 600s one.
 
-Two things follow from it. The first is that the loss is *recoverable*: re-sending
-the missing span as a short request of its own puts it at a different offset in the
-windows, so it no longer falls in a discarded one. `asr.recover_missing` does that
-after the first pass — one request per stretch, VAD still on so a loud stretch that
-is not speech comes back empty rather than invented, and recovered words dropped
-where they overlap what is already known, since the retry is padded and
-re-transcribes its neighbours. It runs in `asr.py` rather than in the plan stage
-because the plan stage has no endpoint and touches no audio, and it runs before the
-words are written so nothing downstream ever sees the damaged transcript.
+**Whether faster-whisper has the same hole is an open question.** It is a
+different implementation of the same decoding, so the failure is plausible and
+not established. `WHISPER_RECOVER` — which re-sent each missing span as a short
+request of its own, putting it at a different offset in the windows — was
+deliberately not carried across, because porting it would have assumed the answer
+and then hidden it: a recovery that silently repairs the problem every run also
+prevents anyone from ever measuring whether it still exists.
 
-The second is that recovery cannot be trusted to succeed, so something still has to
-refuse. That is the level scan, which is why it now runs for every track rather than
-only the ones long enough to split. It is the only input in the whole
-pipeline that Whisper had no hand in. It cannot tell speech from a cough — that is
-precisely why it is not the speech map — but it can tell loud from silent, and
-`plan.untranscribed_audio` compares each transcript against its own track's loud
-stretches. Over 3s is reported; once cuts remove more than 5s of it the run
-refuses.
+**So the level scan stays, and it is now the instrument as well as the guard.**
+It runs for every track rather than only the ones long enough to split. It is
+the only input in the whole pipeline that Whisper had no hand in. It cannot tell
+speech from a cough — that is precisely why it is not the speech map — but it can
+tell loud from silent, and `plan.untranscribed_audio` compares each transcript
+against its own track's loud stretches. Over 3s is reported; once cuts remove
+more than 5s of it the run refuses.
 
-That restores, on a different footing, the independence the removed
-`_words_without_speech` check had. It does not need Silero, or any model: ffmpeg
-was already a hard dependency. The lesson worth keeping is narrower than "keep the
-old check" — it is that a transcript cannot be its own witness, and something in
-the pipeline has to look at the audio directly.
+That refusal is what will answer the question. If a real episode trips it under
+WhisperX, the hole is there and recovery should come back. If episodes run clean,
+recovery was whisper.cpp's problem and `SPEECH_MAP_CLIP` is the next thing that
+can probably go too. Either way the answer arrives as a refusal rather than as a
+quietly cut passage, which is the whole point of having something in the pipeline
+that looks at the audio directly.
+
+That independence is what the removed `_words_without_speech` check used to
+provide. It needs no Silero and no model: ffmpeg was already a hard dependency.
+The lesson worth keeping is narrower than "keep the old check" — it is that a
+transcript cannot be its own witness.
 
 ### Authenticating to either endpoint
 
-Both clients send `Authorization: Bearer <key>` when a key is configured, inline
-(`WHISPER_API_KEY`, `LLAMA_API_KEY`) or from a file (the `_FILE` variants, which
-are preferred and warn when readable beyond their owner). whisper.cpp has no
-auth of its own, so its key is for whatever fronts it; llama.cpp's matches
-`--api-key`.
+The llama client sends `Authorization: Bearer <key>` when a key is configured,
+inline (`LLAMA_API_KEY`) or from a file (the `_FILE` variant, preferred, which
+warns when readable beyond its owner). It matches llama.cpp's `--api-key`.
+
+There was a Whisper key too, for whatever fronted whisper-server. It went with
+the server: a library call has nothing to authenticate to.
 
 Where the key must *not* end up drove the design. It reaches Python through the
 environment, never argv, because a command line is readable by any process on
@@ -882,7 +926,7 @@ models, and nothing on the network.
 | Unit — `tests/test_pipeline.py` | the decision modules, and each stage | python3; ffmpeg and bash for some | wrong intervals, bad validation, malformed expressions, a stage skipping work or deleting too early | anything about what a model actually does |
 | Stubbed integration — same file + `tests/stub_servers.py` | real HTTP clients against fake servers | python3 | wrong request payloads, bad response handling, retry behaviour | whether a real server would answer that way |
 | End to end — `tests/selftest.sh` | the real pipeline over synthetic audio | ffmpeg | wrong rendered audio, wrong stage wiring, wrong file layout | model quality, real-world audio, long-file behaviour |
-| Manual — `tests/samples/` against real servers | the whole pipeline over a real recording | ffmpeg, a whisper-server, a llama-server | wire formats a stub would have accepted, quiet speech, invented words, a threshold in the wrong place | anything absent from one 11-second clip |
+| Manual — `tests/samples/` against the real models | the whole pipeline over a real recording | ffmpeg, whisperx and its weights, a llama-server | what a stand-in would have accepted, quiet speech, invented words, a threshold in the wrong place | anything absent from one 11-second clip |
 
 The first layer stopped being purely pure when the stages moved into Python, and
 that was worth accepting. Most of it still needs nothing but python3, but the
@@ -932,16 +976,24 @@ across the muted span the affected track reads −91 dB *and the other speaker
 reads −8 dB at that same instant*. A test comparing only durations would pass
 with entirely wrong audio, which is precisely the failure mode that matters.
 
-**3. Both models have stubs, so all eight stages can run.**
-`tests/stub_servers.py` impersonates `whisper-server` and `llama-server`: canned
-replies handed out in order, and a request log the test asserts against. That
-gives coverage of the whole pipeline including `transcribe` and `detect`, and
-lets the assertions reach the *payload* — that the multipart body really carries
-the audio, that the request went to the chat endpoint with the edit schema in
-`response_format`, that the transcript reached the message content — rather than
-only checking that nothing blew up. The stubs answer in the envelope matching
-the endpoint that was called, so a client posting to the wrong one is not
-rewarded with a well-formed reply.
+**3. Both models have stand-ins, so every stage can run.** They are different
+kinds of stand-in now, because the models are reached in different ways.
+
+`tests/stub_servers.py` impersonates `llama-server` over real HTTP: canned
+replies handed out in order, and a request log the test asserts against. The
+socket is the point — it lets the assertions reach the *payload*, that the
+request went to the chat endpoint with the edit schema in `response_format` and
+that the transcript reached the message content, rather than only checking that
+nothing blew up.
+
+`tests/fake_whisperx/` replaces the whisperx *package*, on `PYTHONPATH`, and is
+imported instead of the real one. There is no socket to impersonate, and the
+real thing is three gigabytes of torch that downloads weights on first use —
+neither belongs in a suite that has to run offline in under two minutes. It
+answers from the same fixture files the stub whisper-server served, which is why
+the cases did not have to be rewritten when transcription moved in-process. It
+declares `FasterWhisperPipeline.transcribe`'s real signature, so a keyword the
+real package rejects cannot quietly pass here.
 
 **4. Predict, then verify — no tolerances where an exact answer exists.**
 `expected_output_samples` replicates ffmpeg's per-frame decision, and the
@@ -997,12 +1049,13 @@ which of the two is wrong.
   first run against a real server remains the only evidence that the wire format
   is right, and the schema check is what makes that run fail loudly instead of
   silently.
-- **Silero's judgement** — it runs inside whisper.cpp now, so nothing here can
-  reach it and synthetic audio would have nothing for it to judge anyway. What is
-  covered is that the request asks for it and spells every field the way
-  whisper-server parses it (`TestServerSideVadRequest`, selftest case 1). Whether
-  the server on the other end honours those fields, or is old enough to drop them
-  without complaint, is not something this side can test — or detect at runtime.
+- **The VAD's judgement** — it runs inside whisperx, and synthetic audio would
+  have nothing for it to judge anyway. What is covered is that the chosen method
+  and its thresholds actually reach `load_model` (`TestWhisperXTranscriber`).
+  That test exists because the method once did *not* reach it: the setting was
+  defined, validated, shown on the settings page and written to the run log while
+  whisperx quietly used its own default. Whether the detector then judges well is
+  not something this side can test.
 - **Real audio.** Synthetic tracks are sine bursts against digital silence, so
   every level is unambiguous and every word is invented. Neither the `detect`
   stage nor anything depending on real acoustics can be reached that way. A
@@ -1129,10 +1182,10 @@ logs for inspection.
   claiming silence they ran across. Neither can tell speech from a cough, so
   neither turns the scan into a speech map; the shape of a looping transcript
   remains the only other signal.
-- **A whisper build that ignores the `vad_*` request fields is undetectable from
-  here.** It answers normally and transcribes the silence too, and what it invents
-  there becomes speech in the plan. `whisper-server --help | grep -c vad` should
-  report 8.
+- **Which VAD ran, and how well, is not visible after the fact.** The transcript
+  looks the same either way; a detector that passed silence through shows up only
+  as invented speech in the plan. Switching `WHISPER_VAD_METHOD` between runs and
+  comparing is the only way to tell, and the run log records which was asked for.
 - `SPEECH_PAD` is a single margin for a whole episode, and it is doing two jobs at
   once: absorbing Whisper's timing error and setting how long a gap must be to
   count. A recording where those want different values has no right answer.
@@ -1150,14 +1203,12 @@ authority. The ones whose meaning is easy to get wrong:
 | `INPUT_EXTS` | a discovery filter only; the format never reaches the editing logic |
 | `OUTPUT_CODEC`/`OUTPUT_EXT` | the output format, unrelated to what came in |
 | `RESAMPLE_TO` | empty means a rate mismatch is an error, not that nothing happens |
-| `WHISPER_VAD` | the only speech detection there is; off means silence gets transcribed and whatever is invented there becomes speech in the plan |
-| `WHISPER_ENDPOINT`/`LLAMA_ENDPOINT` | required, not optional; there is no local mode to fall back to, and `127.0.0.1` is how a one-machine install is spelled |
+| `WHISPER_VAD_METHOD` | which detector decides what speech is; always on, since it is also how whisperx batches the audio |
+| `LLAMA_ENDPOINT` | required unless `LLM_ENABLE=0`; there is no local mode to fall back to, and `127.0.0.1` is how a one-machine install is spelled |
+| `WHISPER_MODEL` | the run's cost, on a CPU; also the ceiling on which disfluencies exist to be found |
 | `SPEECH_PAD` | how far each word is widened before the union that makes the speech map; a gap needs `SILENCE_MIN_DURATION` **plus twice this** to be silence |
 | `SPLIT_SILENCE_THRESHOLD` | picks chunk boundaries, and sets how much loud-but-untranscribed audio gets reported; it never decides what is cut |
-| `WHISPER_RECOVER` | re-asks about stretches the first pass returned nothing for — the only thing that recovers a discarded decode window |
 | `WHISPER_PROMPT` | conditioning text, not an instruction; empty means Whisper returns fluent prose and the disfluencies never reach the LLM stage at all |
-| `WHISPER_REASK` | questions a word carrying more *measured* speech than `WHISPER_REASK_WORD_SECONDS`; a word merely stretched across silence is not questioned |
-| `WHISPER_REASK_WINDOW` | short is the mechanism — a long window returns the same fluent reading that hid the disfluency |
 | `SPEECH_MAP_CLIP` | bounds each word by the level scan when building the speech map; off means a word stretched across silence protects all of it, from both cutting and the other track's disfluencies |
 | `LLAMA_MODEL_NAME` | required by a router-mode server, ignored by a single-model one |
 | `SILENCE_MIN_DURATION` | how long a gap must be before it is worth shortening |
@@ -1165,7 +1216,6 @@ authority. The ones whose meaning is easy to get wrong:
 | `CUT_PADDING` | speech margin kept either side of every cut |
 | `RENDER_FRAME_SAMPLES` | timing granularity of the whole edit; must be uniform across an episode |
 | `MAX_CUT_FRACTION` | refusal threshold, not a target |
-| `WHISPER_CHUNK_SECONDS` | upload chunk size for remote transcription; 0 sends the lot |
 | `PODCAST_ROOT` | the whole layout; the four directory settings override it individually |
 | `LLM_API` | `chat` lets the server apply the model's template; `completion` is the raw-prompt fallback |
 | `LLM_CHECK_SCHEMA` | one request that turns a silent whole-run failure into an immediate one |
