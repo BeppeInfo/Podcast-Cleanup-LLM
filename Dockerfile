@@ -15,7 +15,7 @@
 # wants. Mounting a podcast-cleanup.conf into the image would silently outrank
 # every -e you pass, so do not, unless that is what you mean.
 
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.13
 
 # --- base: the interpreter, ffmpeg, and the pipeline itself -------------------
 FROM python:${PYTHON_VERSION}-slim AS base

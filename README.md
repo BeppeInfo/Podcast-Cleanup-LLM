@@ -47,7 +47,7 @@ entirely, so the edit keeps its breathing room instead of sounding gasped.
 | Tool | Needed for | Notes |
 | --- | --- | --- |
 | ffmpeg + ffprobe | everything | the only hard dependency; in the image already |
-| python3 | everything | standard library only; the image pins 3.12 |
+| python3 | everything | standard library only; the image pins 3.13 |
 | a whisper-server | the `transcribe` stage | reached over HTTP; not started here, and not in the image |
 | a llama-server | the `detect` stage | reached over HTTP; not started here, and not in the image |
 | a Silero VAD model | the `transcribe` stage | `ggml-silero-*.bin`, run by whisper.cpp itself — no Python package |
