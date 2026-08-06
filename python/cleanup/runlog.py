@@ -1,10 +1,11 @@
 """The run log and the console display.
 
-A faithful port of `lib/log.sh`, format for format: while the port is in
-progress a line written here and a line written there land in the same file and
-look the same on screen, so which side produced it is invisible. That is the
-whole requirement — the alternative is a console that changes appearance halfway
-down as stages move across.
+Once a port of `lib/log.sh`, format for format, so that a line written here and
+a line written there were indistinguishable while stages moved across. That file
+is gone and this is the only implementation; the format survives it because it is
+what the console and the kept log have always looked like, not because something
+else still has to match. The launcher's one remaining error line is copied from
+`Log.error` and pinned by a test.
 
 Two audiences, deliberately different:
 
@@ -50,7 +51,7 @@ class Palette:
 
 
 class Log:
-    """One run's log. Mirrors lib/log.sh; see that file's comments for the why."""
+    """One run's log: the file that is kept, and the console that is watched."""
 
     def __init__(self, path: str = "", level: str = "info", stream=None,
                  colour=None):

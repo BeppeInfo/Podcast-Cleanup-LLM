@@ -2738,58 +2738,45 @@ class TestPipelinePrepareStage(unittest.TestCase):
 class TestRunLog(unittest.TestCase):
     """The console format.
 
-    Two halves, for a reason. The launcher still emits a few lines of its own —
-    tool discovery, the config dump, a configuration error — through lib/log.sh,
-    into the same file. Those are compared against bash directly, because both
-    implementations exist and must not drift.
+    This used to be compared line for line against lib/log.sh, which wrote into
+    the same file while the port was under way. That file is gone and there is
+    one implementation, so the format is pinned to its own output instead: still
+    a promise, just without a second implementation to check it against.
 
-    Everything else (stage headers, the counter, multi-line reports, durations)
-    left bash with the driver loop, so there is nothing to compare against any
-    more. Those are pinned to their exact output instead: the format is still a
-    promise, it just no longer has a second implementation to check it against.
+    One shared surface is left. The launcher prints an error of its own for the
+    failures that happen before Python starts — an unknown option, a missing
+    python3 — and that line has to look like every other error the run produces.
     """
 
-    def _python_levels(self, level):
-        buf = io.StringIO()
-        log = runlog.Log(level=level, stream=buf, colour=False)
-        log.debug("a detail")
-        log.info("a note")
-        log.warn("a warning")
-        log.error("a failure")
-        return buf.getvalue()
-
-    def _bash_levels(self, level):
-        script = f"""
-LOG_LEVEL={level}; LOG_FILE=""
-source lib/log.sh
-log_debug "a detail"
-log_info "a note"
-log_warn "a warning"
-log_error "a failure"
-"""
+    def _launcher(self, argv, env=None):
+        """stderr from running the launcher itself, for real."""
         result = subprocess.run(
-            ["bash", "-c", script], capture_output=True, text=True, cwd=REPO_ROOT,
-            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"}, check=True)
+            [os.path.join(REPO_ROOT, "clean-podcast.sh"), *argv],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb", **(env or {})},
+            check=False)
+        self.assertEqual(result.returncode, 1)
         return result.stderr
 
-    def test_the_levels_still_shared_with_bash_match_it(self):
-        for level in ("debug", "info", "warn", "error"):
-            with self.subTest(level=level):
-                self.assertEqual(self._python_levels(level),
-                                 self._bash_levels(level))
+    def _as_error(self, message):
+        buf = io.StringIO()
+        runlog.Log(level="error", stream=buf, colour=False).error(message)
+        return buf.getvalue()
 
-    def test_the_log_file_line_matches_bash(self):
-        root = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        mine, theirs = os.path.join(root, "py.log"), os.path.join(root, "sh.log")
-        runlog.Log(path=mine, stream=io.StringIO(), colour=False).warn("careful")
-        subprocess.run(
-            ["bash", "-c", f'LOG_FILE={theirs}; source lib/log.sh; '
-                           'log_warn "careful"'],
-            cwd=REPO_ROOT, check=True, capture_output=True)
-        # Timestamps differ; the rest must not.
-        strip = lambda text: text.split(" ", 2)[2]
-        self.assertEqual(strip(open(mine).read()), strip(open(theirs).read()))
+    def test_the_launchers_error_looks_like_every_other_error(self):
+        self.assertEqual(
+            self._launcher(["--no-such-option"]),
+            self._as_error("unknown option: --no-such-option (try --help)"))
+
+    def test_the_launchers_missing_tool_message_is_the_python_one(self):
+        # proc.require_bin says this once Python is running; the launcher has to
+        # say it when the tool that is missing is Python itself.
+        with self.assertRaises(proc.ToolError) as caught:
+            proc.require_bin("python3", "definitely-not-installed-xyz")
+        self.assertEqual(
+            self._launcher(["--list-stages"],
+                           env={"PYTHON_BIN": "definitely-not-installed-xyz"}),
+            self._as_error(str(caught.exception)))
 
     def test_stage_headers_and_counter_keep_their_format(self):
         buf = io.StringIO()

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Data-side entry point for the podcast cleanup pipeline.
+"""Entry point for the podcast cleanup pipeline.
 
-Every subcommand reads and writes files in the episode work directory, so any
-stage can be re-run by hand. Audio is never touched here: this side of the
-pipeline decides *what* to do, the shell side runs ffmpeg and the models.
+`run` is the whole pipeline; the rest are single steps that read and write files
+in the episode work directory, so any stage can be re-run by hand.
 
-Progress is reported as "PROGRESS <done> <total>" lines on stdout, which the
-shell turns into a live counter.
+stdout belongs to the subcommands that emit data for the launcher to `eval` or
+read — `config`, `config-names`, `meta-shell`. Nothing logs to it.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -61,6 +61,14 @@ def cmd_list_stages(args):
 def cmd_run(args):
     """Run the pipeline. The one place that sequences the stages."""
     log = runlog.Log.from_env()
+    if not log.path:
+        # Nobody has named a log, so this run opens one somewhere temporary.
+        # discover adopts it into the work directory once the episode is known,
+        # which is why it cannot simply be written there to begin with.
+        handle, path = tempfile.mkstemp(prefix="podcast-cleanup-", suffix=".log")
+        os.close(handle)
+        log.init(path, path)
+    log.debug(f"python: {sys.executable}")
     settings = cfg.from_environment()
     try:
         stages = pipeline.select_stages(args.from_stage, args.to_stage, args.stages)

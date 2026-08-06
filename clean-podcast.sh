@@ -16,10 +16,44 @@ set -euo pipefail
 
 LIB_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# shellcheck source=lib/log.sh
-source "$LIB_ROOT/lib/log.sh"
 # shellcheck source=lib/config.sh
 source "$LIB_ROOT/lib/config.sh"
+
+# The run log is Python's — it opens it, and `discover` moves it into the work
+# directory. Nothing here writes to it, which is why there is no longer a bash
+# half of runlog.py to keep in step. What is left is the handful of failures
+# that happen before Python starts, and those have only a console to go to.
+if [[ -t 2 && "${NO_COLOR:-}" == "" && "${TERM:-dumb}" != "dumb" ]]; then
+    C_RED=$'\033[31m' C_RESET=$'\033[0m'
+else
+    C_RED='' C_RESET=''
+fi
+
+# Matches Log.error, so the one line the launcher can still print looks like
+# every other error the run produces.
+die() {
+    printf '%s  ✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+    exit 1
+}
+
+# The resolved path to a tool, or an error and 1. Deliberately does not call
+# die(): the caller uses it inside $(...), where an exit would only end the
+# subshell and let a missing tool slip through. Pair it with `|| exit 1`.
+require_bin() {
+    local label="$1" candidate="$2" resolved
+    if [[ -x "$candidate" ]]; then
+        printf '%s' "$candidate"
+    elif resolved=$(command -v "$candidate" 2>/dev/null); then
+        printf '%s' "$resolved"
+    else
+        printf '%s  ✗%s %s not found: %s is neither an executable path nor on PATH\n' \
+            "$C_RED" "$C_RESET" "$label" "'$candidate'" >&2
+        return 1
+    fi
+}
+
+LOG_LEVEL="${LOG_LEVEL:-info}"     # debug | info | warn | error
+DRY_RUN=0
 
 CONFIG_FILE=""
 EPISODE_ID_OVERRIDE=""
@@ -133,10 +167,6 @@ parse_args() {
 main() {
     parse_args "$@"
 
-    # Until the episode is identified the log goes somewhere temporary; the
-    # discover stage adopts it into the work directory and carries it over.
-    log_init "$(mktemp -t podcast-cleanup-XXXXXX.log)"
-
     # One call: defaults, config file, environment and the options above are
     # resolved and checked on the Python side, and come back as assignments.
     config_load "$CONFIG_FILE"
@@ -164,7 +194,7 @@ main() {
     PODCAST_WHISPER_API_KEY="$WHISPER_API_KEY" \
         PODCAST_LLAMA_API_KEY="$LLAMA_API_KEY" \
         PODCAST_CONFIG_FILE="${CONFIG_FILE:-}" \
-        PODCAST_LOG_FILE="$LOG_FILE" LOG_LEVEL="$LOG_LEVEL" \
+        LOG_LEVEL="$LOG_LEVEL" \
         exec "$PYTHON" "$LIB_ROOT/python/cleanup_cli.py" "${args[@]}"
 }
 

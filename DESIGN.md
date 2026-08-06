@@ -887,7 +887,8 @@ models, and nothing on the network.
 The first layer stopped being purely pure when the stages moved into Python, and
 that was worth accepting. Most of it still needs nothing but python3, but the
 stage tests run real ffmpeg over a fraction of a second of synthesised audio, and
-the log tests run bash to compare against `lib/log.sh`. In exchange, things that
+two log tests run the launcher itself to check that the errors it can still print
+match the ones Python prints. In exchange, things that
 were previously only reachable end to end — a resumed stage skipping its
 re-measure, a publish failing without deleting the inputs, a no-edit track being
 copied rather than converted — are now unit-testable, and three of those were

@@ -553,11 +553,14 @@ one real episode with `--keep-work` the first time.
 ## Layout
 
 ```
-clean-podcast.sh              CLI, config, stage sequencing, failure handling
-lib/log.sh                    logging, progress, command execution
-lib/config.sh                 defaults, config loading, validation
-lib/stages.sh                 the seven stages, and the llama server lifecycle
-python/cleanup_cli.py         subcommands the shell calls
+clean-podcast.sh              CLI: options, then hand over to Python
+lib/config.sh                 sources the config file and exports the answers
+python/cleanup_cli.py         entry point: `run`, and the single-step subcommands
+python/cleanup/pipeline.py    the stage sequence, resume behaviour, failure handling
+python/cleanup/config.py      defaults, precedence, validation, the config dump
+python/cleanup/discover.py    the filename convention and episode identification
+python/cleanup/runlog.py      the run log and the console display
+python/cleanup/proc.py        running commands, and finding the ones we need
 python/cleanup/intervals.py   interval algebra and timeline remapping
 python/cleanup/silence.py     silencedetect parsing: chunk boundaries, and the
                               only opinion about the audio that is not Whisper's
@@ -567,12 +570,19 @@ python/cleanup/asr.py         remote whisper-server client, chunking, and
 python/cleanup/llm.py         chunking, prompting, response validation
 python/cleanup/plan.py        the cut-versus-mute decision
 python/cleanup/render.py      ffmpeg expressions, duration prediction, transcript
+web/app.py                    the upload/watch/download interface
+web/job.py                    one job at a time, and the log it streams
+web/store.py                  which settings the form offers, and where they live
+Dockerfile, compose.yml       the image, and the two ways to run it
+tests/selftest.sh             end to end over synthetic audio
+tests/test_pipeline.py        the unit and stage layers
 tests/stub_servers.py         stand-ins for both servers, for the self-test
 DESIGN.md                     how it all fits together, and why
 ```
 
-The shell drives ffmpeg and the models; everything under `python/cleanup/` reads
-and writes JSON and never touches audio.
+`python/cleanup/` is the engine and needs no dependencies; both front ends call
+`run_episode`, so neither can drift from the other. Only `render` and `prepare`
+touch audio — everything else reads and writes JSON.
 
 ## Tuning notes
 

@@ -67,32 +67,17 @@ config_make_tree() {
     return 0
 }
 
-# Finding ffmpeg, and checking it can build OUTPUT_CODEC, is proc.resolve_ffmpeg
-# on the Python side — called from run_episode, so the web front end gets the
-# check too rather than meeting the missing encoder at render time.
-
-config_need_whisper() {
-    [[ -n "$WHISPER_ENDPOINT" ]] \
-        || die "WHISPER_ENDPOINT is required: transcription is always sent to a whisper-server. Point it at one — http://127.0.0.1:8081 if it runs on this machine."
-    log_debug "whisper: $WHISPER_ENDPOINT"
-}
-
-config_describe_models() {
-    log_info "Whisper: $WHISPER_ENDPOINT   LLM: $LLAMA_ENDPOINT"
-}
-
-config_need_llama() {
-    [[ -n "$LLAMA_ENDPOINT" ]] \
-        || die "LLAMA_ENDPOINT is required: edit detection is always sent to a llama-server. Point it at one, or set LLM_ENABLE=0 to do silence editing only."
-    log_debug "llama: $LLAMA_ENDPOINT"
-}
+# What used to live below here is all on the Python side now, called from
+# run_episode so the web front end is covered by the same code:
+#
+#   config_need_ffmpeg    -> proc.resolve_ffmpeg   (and the encoder check)
+#   config_need_whisper   -> pipeline.stage_transcribe
+#   config_need_llama     -> pipeline.stage_detect
+#   config_dump           -> config.dump
+#
+# config_describe_models went with the driver loop; cleanup_cli prints that line.
 
 config_need_python() {
     [[ -n "${PYTHON:-}" ]] && return 0
     PYTHON=$(require_bin python3 "${PYTHON_BIN:-python3}") || exit 1
-    log_debug "python: $PYTHON"
 }
-
-# The dump of every effective setting is config.dump() on the Python side, run
-# from run_episode so the web front end gets it too. Keeping a second list of
-# setting names here is what let six of them go unlogged.
