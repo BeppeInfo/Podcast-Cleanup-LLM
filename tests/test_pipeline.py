@@ -30,6 +30,7 @@ from cleanup import intervals as iv
 from cleanup import runlog
 from cleanup import asr, config as cfg, discover, llm, pipeline, proc  # noqa: E501
 from cleanup import plan as planner, render, silence, transcript as tr
+from cleanup import whisperx_asr as wx
 # The CLI itself, for the exit codes the shell branches on. Importing is safe:
 # it only runs main() under __main__.
 import cleanup_cli as cli
@@ -2074,6 +2075,163 @@ class TestProc(unittest.TestCase):
         ffmpeg, _probe = proc.resolve_ffmpeg(
             cfg.defaults(), log, environ={"FFMPEG_BIN": real})
         self.assertEqual(ffmpeg, real)
+
+
+class FakeWhisperX:
+    """Stands in for the whisperx package. No model, no torch, no download.
+
+    The real thing is 3GB of dependencies and downloads weights on first use,
+    which is not something the unit layer should ever touch — the same reason
+    the remote client was tested against a stub server rather than a real one.
+    """
+
+    def __init__(self, segments, language="en", words=None):
+        self._segments, self._language, self._words = segments, language, words
+        self.load_model_calls, self.align_model_calls = [], []
+        self.transcribe_options = []
+
+    # --- the three entry points whisperx_asr uses ---------------------------
+    def load_model(self, name, **kwargs):
+        self.load_model_calls.append((name, kwargs))
+        return self
+
+    def load_align_model(self, language_code, device):
+        self.align_model_calls.append(language_code)
+        return ("align-model", {"language": language_code})
+
+    def load_audio(self, path):
+        return [0.0] * 16000
+
+    def align(self, segments, model, meta, audio, device, **kwargs):
+        return {"segments": self._words if self._words is not None else segments}
+
+    # --- the model object load_model returns --------------------------------
+    # Deliberately narrow: FasterWhisperPipeline.transcribe takes these and
+    # nothing else. A fake that swallowed **anything would have accepted
+    # initial_prompt here, which the real one raises on — and had it been
+    # merely ignored instead, the transcript would have come back fluent with
+    # the fillers gone and every test still green.
+    def transcribe(self, audio, batch_size=None, num_workers=0, language=None,
+                   task=None, chunk_size=30, print_progress=False,
+                   combined_progress=False, verbose=False,
+                   progress_callback=None):
+        self.transcribe_options.append(
+            {"batch_size": batch_size, "language": language})
+        return {"segments": self._segments, "language": self._language}
+
+
+class TestWhisperXTiming(unittest.TestCase):
+    """Turning aligned words into the segments the rest of the pipeline reads."""
+
+    def test_one_segment_per_word_with_millisecond_offsets(self):
+        aligned = {"segments": [{"start": 0.0, "end": 2.0, "words": [
+            {"word": "well", "start": 0.5, "end": 0.8},
+            {"word": "um", "start": 1.2, "end": 1.35},
+        ]}]}
+        got = wx.segments_from_alignment(aligned)
+        self.assertEqual(
+            got,
+            [{"text": "well", "offsets": {"from": 500, "to": 800}},
+             {"text": "um", "offsets": {"from": 1200, "to": 1350}}])
+
+    def test_an_untimed_word_is_never_dropped(self):
+        # The safety property. The speech map is derived from these words and
+        # silence is their absence, so a dropped word is audio that can then be
+        # cut out from under the speaker.
+        aligned = {"segments": [{"start": 0.0, "end": 3.0, "words": [
+            {"word": "chapter", "start": 0.0, "end": 1.0},
+            {"word": "19"},                                  # no timings
+            {"word": "begins", "start": 2.0, "end": 3.0},
+        ]}]}
+        got = wx.segments_from_alignment(aligned)
+        self.assertEqual([s["text"] for s in got], ["chapter", "19", "begins"])
+        # It landed in the gap its neighbours left, not at zero.
+        self.assertEqual(got[1]["offsets"], {"from": 1000, "to": 2000})
+
+    def test_an_untimed_run_is_shared_out_evenly(self):
+        words = [{"word": "a", "start": 0.0, "end": 1.0},
+                 {"word": "b"}, {"word": "c"}, {"word": "d"},
+                 {"word": "e", "start": 4.0, "end": 5.0}]
+        filled = wx.fill_missing_timings(words, 0.0, 5.0)
+        self.assertEqual([round(w["start"], 3) for w in filled],
+                         [0.0, 1.0, 2.0, 3.0, 4.0])
+
+    def test_untimed_at_the_edges_borrows_the_segment_bounds(self):
+        words = [{"word": "first"},
+                 {"word": "middle", "start": 2.0, "end": 3.0},
+                 {"word": "last"}]
+        filled = wx.fill_missing_timings(words, 1.0, 6.0)
+        self.assertEqual(round(filled[0]["start"], 3), 1.0)
+        self.assertEqual(round(filled[2]["end"], 3), 6.0)
+
+    def test_the_result_feeds_build_from_segments_unchanged(self):
+        # The whole point of the one-word-per-segment shape: nothing downstream
+        # of transcript.py had to learn about WhisperX.
+        aligned = {"segments": [{"start": 0.0, "end": 2.0, "words": [
+            {"word": "so", "start": 0.1, "end": 0.3},
+            {"word": "anyway", "start": 0.4, "end": 0.9},
+        ]}]}
+        built = tr.build_from_segments(wx.segments_from_alignment(aligned), "alice")
+        self.assertEqual([w["text"] for w in built["words"]], ["so", "anyway"])
+        self.assertAlmostEqual(built["words"][0]["start"], 0.1, places=3)
+        self.assertAlmostEqual(built["words"][1]["end"], 0.9, places=3)
+
+
+class TestWhisperXTranscriber(unittest.TestCase):
+    """Loading the model, and what gets asked of it."""
+
+    def _fake(self, **kwargs):
+        fake = FakeWhisperX(**kwargs)
+        return fake, (lambda: fake)
+
+    def test_the_model_is_loaded_once_and_reused(self):
+        # Loading costs tens of seconds on a CPU and an episode is several
+        # tracks; per-track loading would dominate the run.
+        fake, loader = self._fake(segments=[{"start": 0.0, "end": 1.0, "words": [
+            {"word": "hello", "start": 0.0, "end": 1.0}]}])
+        t = wx.Transcriber(model="small", loader=loader)
+        t.transcribe("/one.wav")
+        t.transcribe("/two.wav")
+        self.assertEqual(len(fake.load_model_calls), 1)
+        self.assertEqual(fake.load_model_calls[0][0], "small")
+
+    def test_the_aligner_is_loaded_once_per_language(self):
+        fake, loader = self._fake(segments=[{"start": 0.0, "end": 1.0, "words": [
+            {"word": "hello", "start": 0.0, "end": 1.0}]}])
+        t = wx.Transcriber(loader=loader)
+        t.transcribe("/one.wav")
+        t.transcribe("/two.wav")
+        self.assertEqual(fake.align_model_calls, ["en"])
+
+    def test_the_prompt_reaches_the_model_at_load_time(self):
+        # Without it Whisper returns fluent prose and the disfluencies never
+        # reach the detector — DESIGN.md §6. WhisperX fixes its decode options
+        # when the model is built; its transcribe() takes no initial_prompt, so
+        # passing one per call is a TypeError rather than a silent no-op.
+        fake, loader = self._fake(segments=[{"start": 0.0, "end": 1.0, "words": [
+            {"word": "um", "start": 0.0, "end": 1.0}]}])
+        wx.Transcriber(loader=loader, prompt="Um, uh, so").transcribe("/a.wav")
+        _name, kwargs = fake.load_model_calls[0]
+        self.assertEqual(kwargs["asr_options"], {"initial_prompt": "Um, uh, so"})
+        self.assertNotIn("initial_prompt", fake.transcribe_options[0])
+
+    def test_silence_is_an_answer_not_a_failure(self):
+        # One participant is silent for minutes while the other talks; a track
+        # with nothing in it must not look like a broken run.
+        fake, loader = self._fake(segments=[])
+        segments, language = wx.Transcriber(loader=loader).transcribe("/quiet.wav")
+        self.assertEqual(segments, [])
+        self.assertEqual(language, "en")
+        self.assertEqual(fake.align_model_calls, [])   # nothing to align
+
+    def test_a_missing_package_says_where_to_get_it(self):
+        def absent():
+            raise wx.WhisperXMissing(
+                "whisperx is not installed in this interpreter. Use the "
+                "container image, which carries it.")
+        with self.assertRaises(wx.WhisperXMissing) as caught:
+            wx.Transcriber(loader=absent)
+        self.assertIn("container image", str(caught.exception))
 
 
 class TestEndpointsAreRequired(unittest.TestCase):
