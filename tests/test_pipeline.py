@@ -1710,8 +1710,26 @@ class TestWhisperXTranscriber(unittest.TestCase):
             {"word": "um", "start": 0.0, "end": 1.0}]}])
         wx.Transcriber(loader=loader, prompt="Um, uh, so").transcribe("/a.wav")
         _name, kwargs = fake.load_model_calls[0]
-        self.assertEqual(kwargs["asr_options"], {"initial_prompt": "Um, uh, so"})
+        self.assertEqual(kwargs["asr_options"]["initial_prompt"], "Um, uh, so")
         self.assertNotIn("initial_prompt", fake.transcribe_options[0])
+
+    def test_the_decode_does_not_retry_at_a_higher_temperature(self):
+        # WhisperX re-decodes at rising temperatures when a pass looks too
+        # repetitive. A stutter *is* repetitive, so the retry removes what this
+        # pipeline exists to find — and above zero it samples, which made three
+        # identical runs of the same audio give two different transcripts.
+        fake, loader = self._fake(segments=[])
+        wx.Transcriber(loader=loader)
+        self.assertEqual(fake.load_model_calls[0][1]["asr_options"]["temperatures"],
+                         [0.0])
+
+    def test_the_ladder_can_be_asked_for(self):
+        # For a track with a genuine repetition loop, which is what the ladder
+        # is actually for.
+        fake, loader = self._fake(segments=[])
+        wx.Transcriber(loader=loader, temperature_fallback=True)
+        self.assertNotIn("temperatures",
+                         fake.load_model_calls[0][1].get("asr_options") or {})
 
     def test_the_vad_method_is_stated_not_defaulted(self):
         # It was defined as a setting and wired to nothing, so WhisperX fell

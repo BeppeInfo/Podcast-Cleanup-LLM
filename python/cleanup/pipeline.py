@@ -742,6 +742,7 @@ def stage_transcribe(work: str, settings, log, ffmpeg: str = "ffmpeg",
                 language=settings["WHISPER_LANG"],
                 prompt=settings["WHISPER_PROMPT"],
                 vad_method=settings["WHISPER_VAD_METHOD"],
+                temperature_fallback=settings["WHISPER_TEMPERATURE_FALLBACK"] == "1",
                 vad_options=vad_options(settings),
                 threads=int(settings["WHISPER_THREADS"]),
             )

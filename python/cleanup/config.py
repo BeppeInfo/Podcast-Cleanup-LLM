@@ -62,6 +62,16 @@ SETTINGS: dict[str, tuple] = {
     # int8 is the CPU answer; float16 is meaningless without CUDA.
     "WHISPER_COMPUTE_TYPE": ("int8", CHOICE, ("int8", "float16", "float32")),
     "WHISPER_BATCH_SIZE": ("8", INT, None),
+    # **Only 1 is reproducible.** CTranslate2 reduces across threads in whatever
+    # order they finish, and the floating-point difference is enough to change
+    # which beam wins. Measured on the 57s sample: three runs at 4 threads gave
+    # 70, 62 and 69 words, and the words that came and went were the fillers and
+    # repetitions — the whole point of the transcript. At 1 thread, three runs
+    # were byte-identical.
+    #
+    # Left at 4 because most runs want the speed and a shifting filler is not a
+    # broken episode. Set it to 1 before comparing two configurations, or the
+    # difference being measured is drowned by this.
     "WHISPER_THREADS": ("4", INT, None),
     "WHISPER_LANG": ("auto", STR, None),
 
@@ -78,6 +88,18 @@ SETTINGS: dict[str, tuple] = {
     "WHISPER_VAD_METHOD": ("pyannote", CHOICE, ("pyannote", "silero")),
     "WHISPER_VAD_ONSET": ("0.500", NUM, None),
     "WHISPER_VAD_OFFSET": ("0.363", NUM, None),
+
+    # Whisper re-decodes at a higher temperature when a pass trips its
+    # compression-ratio or log-probability threshold. That ladder is on by
+    # default in WhisperX and it is wrong here: repeated words compress well, so
+    # a genuine stutter is exactly what trips the threshold, and the retry
+    # decodes it away. Off, therefore, which is also what the old client asked
+    # whisper-server for (`temperature=0`).
+    #
+    # This is *not* what makes a run reproducible — see WHISPER_THREADS. Turn it
+    # on if a track comes back with a genuine repetition loop that the ladder
+    # would escape; the plan stage reports those under `looping_transcripts`.
+    "WHISPER_TEMPERATURE_FALLBACK": ("0", FLAG, None),
 
     "SPEECH_MAP_CLIP": ("1", FLAG, None),
     "WHISPER_PROMPT": ("", STR, None),

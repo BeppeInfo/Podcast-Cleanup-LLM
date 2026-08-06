@@ -614,6 +614,49 @@ plan stage refuses to cut audio no transcript accounts for. If that refusal fire
 on a real episode, the answer is to bring recovery back, not to raise the
 threshold.
 
+### A bigger model is not a better transcript, and a run is not reproducible
+
+Two measurements from the WhisperX branch, both of which cut against intuition
+and both of which change how this pipeline should be configured.
+
+**Fluency is the enemy, and it scales with model size.** §6 explains why the
+prompt matters: left to itself Whisper returns fluent prose and the disfluencies
+never reach the detector. Model size does the same thing, in the same direction.
+On the 57s sample, host track, one thread, same prompt:
+
+| model | words | fillers | repeats | transcribe |
+| --- | --- | --- | --- | --- |
+| tiny | 77 | 4 | 7 | 6s |
+| base | 72 | 4 | 5 | 6s |
+| small | 62 | **0** | 4 | 11s |
+| large-v3-turbo | 62 | 3 | 3 | 34s |
+| large-v3 | 67 | 4 | 6 | 50s |
+
+`small` found no fillers at all. It is not failing — it is doing what a good ASR
+model does, which is report what was *meant*. That is the wrong objective here,
+and no threshold downstream can recover a word the transcript does not contain.
+The ordering is not monotonic either: `large-v3` keeps as much as `tiny` while
+getting the words right, so this is not "smaller is better" but "fluency is
+worse, and accuracy is a separate axis". One clip, one track — the ordering
+needs confirming on a real episode, but the direction is the point.
+
+**The transcript is not reproducible above one thread.** CTranslate2 reduces
+across threads in completion order, and that floating-point difference is enough
+to change which beam wins. Three runs of identical inputs at four threads gave
+70, 62 and 69 words; at one thread, three runs were byte-identical. The words
+that came and went were the fillers and the repetitions.
+
+This matters more than it would in most pipelines, because those words *are* the
+subject. It also means A/B comparisons — a new model, a different VAD, a
+threshold change — are measuring noise unless `WHISPER_THREADS=1`. The default
+stays at 4 for speed; the eval harness should not use it.
+
+Whisper's temperature ladder was the first suspect and was innocent. It is
+disabled anyway (`WHISPER_TEMPERATURE_FALLBACK`), on its own merits: it re-decodes
+when a pass looks too repetitive, and a stutter looks exactly like that, so the
+retry removes what the run is looking for. The old client asked whisper-server
+for `temperature=0` for the same reason; the port had dropped it.
+
 ### Which detector decides what speech is
 
 WhisperX always runs a VAD — it is how audio is batched, not an option — so the

@@ -72,9 +72,30 @@ INPUT_EXTS="flac wav wave aiff aif m4a mp4 mka mkv mp3 ogg oga opus wv ape alac"
 #
 # On a CPU this is the setting that decides how long a run takes, and there is
 # no way around it: WhisperX accelerates on CUDA only, so a machine with a
-# Radeon card transcribes on its cores like any other. Bigger is a better
-# transcript and a longer wait, more or less linearly. small is the balance
-# point; medium is roughly three to four times its runtime.
+# Radeon card transcribes on its cores like any other.
+#
+# **Bigger is not simply better here, and smaller is not simply faster.** What
+# this pipeline needs from a transcript is the disfluencies, and a model's
+# fluency works against that. Measured on the 57s sample, host track, one
+# thread, same prompt — fillers is "um"/"uh" surviving, repeats is a word
+# immediately repeated:
+#
+#     model             words  fillers  repeats   transcribe
+#     tiny                 77        4        7          6s
+#     base                 72        4        5          6s
+#     small                62        0        4         11s
+#     large-v3-turbo       62        3        3         34s
+#     large-v3             67        4        6         50s
+#
+# small found *no fillers at all* — it is fluent enough to tidy them away, and
+# what it removes the detector can never cut. tiny and base keep the most but
+# mishear words badly ("what it felt heist", "ROCast"). large-v3 keeps as much
+# as tiny and gets the words right, at five times small's runtime; turbo sits
+# between them.
+#
+# One 57-second clip, one track. Confirm on your own episode before trusting the
+# ordering — but do check that whatever you choose still contains the fillers,
+# because that is the ceiling on everything downstream.
 WHISPER_MODEL="small"
 
 # cpu, or cuda if there is an NVIDIA card. There is no ROCm path — faster-whisper
@@ -86,9 +107,26 @@ WHISPER_DEVICE="cpu"
 WHISPER_COMPUTE_TYPE="int8"
 
 # How many VAD segments are decoded at once, and how many cores to use. Batch
-# size trades memory for speed. Threads at 0 lets CTranslate2 decide.
+# size trades memory for speed.
 WHISPER_BATCH_SIZE="8"
+
+# **Only 1 is reproducible.** CTranslate2 reduces across threads in whatever
+# order they finish, and that floating-point difference is enough to change
+# which beam wins. Three runs of the same audio at 4 threads gave 70, 62 and 69
+# words — and the words that came and went were the fillers and the repetitions,
+# which is exactly what the run is looking for.
+#
+# Left at 4 because most runs want the speed and a shifting filler is not a
+# broken episode. Set it to 1 before comparing two configurations, or the
+# difference being measured is drowned by this.
 WHISPER_THREADS="4"
+
+# Whisper re-decodes at a rising temperature when a pass looks too repetitive or
+# too improbable. A stutter looks exactly like that, so the retry decodes away
+# what this pipeline exists to find; the old client asked whisper-server for
+# temperature=0 for the same reason. Turn it on only for a track with a genuine
+# repetition loop, which the plan stage reports under looping_transcripts.
+WHISPER_TEMPERATURE_FALLBACK="0"
 
 # Language code, or "auto" to detect. Setting it explicitly is both faster and
 # more accurate than detection on a two-hour recording.

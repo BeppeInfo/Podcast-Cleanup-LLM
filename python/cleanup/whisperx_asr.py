@@ -145,7 +145,8 @@ class Transcriber:
     def __init__(self, model: str = DEFAULT_MODEL, device: str = "cpu",
                  compute_type: str = DEFAULT_COMPUTE_TYPE, language: str = "",
                  prompt: str = "", vad_method: str = "", vad_options=None,
-                 threads: int = 4, loader=None):
+                 threads: int = 4, temperature_fallback: bool = False,
+                 loader=None):
         self.device = device
         self.language = language if language and language != "auto" else ""
         self._whisperx = (loader or _load_whisperx)()
@@ -156,7 +157,17 @@ class Transcriber:
         # is a kinder failure than the one it would otherwise be — a prompt
         # silently ignored means fluent prose, no fillers, and nothing for the
         # detector to find. See DESIGN.md §6.
-        asr_options = {"initial_prompt": prompt} if prompt else None
+        asr_options = {}
+        if prompt:
+            asr_options["initial_prompt"] = prompt
+        if not temperature_fallback:
+            # One decode, at temperature 0, kept whatever it says. WhisperX
+            # otherwise re-decodes at rising temperatures whenever a pass looks
+            # too repetitive or too improbable — and a stutter looks exactly
+            # like that, so the retry removes the thing this pipeline exists to
+            # find. This does not make a run reproducible; threads do, and the
+            # ladder was innocent of that. See WHISPER_THREADS.
+            asr_options["temperatures"] = [0.0]
         # vad_method is passed explicitly rather than left to default. WhisperX
         # picks pyannote when it is not told, and whisper-server ran Silero —
         # so leaving this out does not keep the old behaviour, it quietly
