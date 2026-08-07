@@ -127,6 +127,17 @@ combinations, most of it one knob, and the gap between the best and second-best
 settings was well inside what a single differently-placed cut would move.
 Confirm on a second episode before believing a parameter change.
 
+**The reference is a hand edit, and a hand edit can be wrong.** It is the target
+because it is a human being's judgement about their own podcast, not because it
+is correct. On the fixture this was built with, the editor left a "those, those"
+repetition in and later agreed it should have gone — so every candidate that
+removed it was charged a precision penalty for being *right*. Precision below
+100% therefore does not mean the pipeline over-cut; it means it and the editor
+disagreed, and which of them was wrong is a question the score cannot answer.
+Step 5 is what answers it. When a candidate is penalised for a span, read that
+span before assuming it was the pipeline that erred — and consider fixing the
+reference, since every future comparison inherits the mistake.
+
 **Some gaps are not parameter gaps.** On that fixture the honest split was: two
 of nine cuts unreachable at any setting — one a false start Whisper does not
 transcribe under any configuration, one a single-track cut that global cuts

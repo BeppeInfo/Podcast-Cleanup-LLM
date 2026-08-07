@@ -446,6 +446,35 @@ This is recorded rather than deleted because the finding it rests on — that
 *window length* is the lever, not repetition — is the kind of thing that is
 expensive to rediscover. If the problem recurs, that is where to start.
 
+### Punctuation is an input to the detector, and the ASR model chooses it
+
+Found while comparing WhisperX against the old whisper-server results. The host
+track says "pancakes, pancakes" — one word, said twice. What reaches the LLM
+depends on which model transcribed it:
+
+    tiny, base, small        ... talking about pancakes, pancakes. Those ...
+    large-v3-turbo, large-v3 ... talking about pancakes. Pancakes. Those ...
+
+The larger models hear the repetition as rhetorical emphasis and punctuate it as
+two sentences. The detector then agrees with them: on the `large-v3` run it
+proposed six edits for that track and this was not among them — not rejected by
+`_validate`, never proposed at all. The older transcript's comma-joined version
+was cut by the old pipeline.
+
+Both readings are defensible, which is what makes this worth writing down. The
+point is the coupling: **the transcript's punctuation is an input to the
+disfluency judgement, not cosmetic**, so changing the ASR model changes what the
+LLM stage considers a stutter even when every word is identical. A comparison
+between two transcription setups is therefore never only a comparison of
+transcription.
+
+It also means a missed edit has three possible homes, and they need
+distinguishing before anything is tuned: the word was never transcribed (§6, the
+prompt), the word was transcribed but punctuated out of suspicion (here), or the
+word was proposed and filtered (`LLM_MIN_CONFIDENCE`, `LLM_ACCEPT_KINDS`). The
+audit log in `llm/<participant>.audit.jsonl` separates the third from the first
+two; only reading the transcript separates the first two from each other.
+
 ### Nothing here knows which model it is talking to
 
 Both models are named only by a path — `WHISPER_MODEL`, `LLAMA_MODEL` — and the
