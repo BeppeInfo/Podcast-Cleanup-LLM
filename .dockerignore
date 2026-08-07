@@ -17,5 +17,7 @@ __pycache__/
 *.py[cod]
 
 # Machine-specific; the image deliberately ships no config file so that the
-# environment is what configures a container.
+# environment is what configures a container. The .env carries endpoints and
+# model names for one machine and must not reach a published image either.
 podcast-cleanup.conf
+*.env
