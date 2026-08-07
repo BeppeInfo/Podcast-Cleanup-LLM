@@ -52,6 +52,15 @@ from score_plan import score  # noqa: E402
 # it means anything — tools/README.md is explicit that this is fixed first.
 MAX_ENVELOPE_ERROR = 0.1
 
+# ...but that check is not sufficient on its own. It compares only the
+# overlapping prefix of the rebuilt audio against the edit, so a recovery that
+# loses alignment and swallows a long stretch in the middle still scores well on
+# the part before the damage. This is the check that catches it: the recovered
+# cuts must account for exactly the length the edit is missing, and arithmetic
+# cannot be fooled by a prefix. Seen for real — a 33.8s phantom cut in an
+# otherwise sensible list, at an envelope error of 0.011.
+MAX_DURATION_DISAGREEMENT = 0.25
+
 
 def fingerprint(*paths: str) -> str:
     """A content hash of the inputs a cached answer was computed from.
@@ -106,6 +115,13 @@ def recover(original: str, edited: str, cache: str, label: str) -> dict:
     return recovered
 
 
+def duration_disagreement(recovered: dict) -> float:
+    """How far the recovered cuts are from explaining the edit's length."""
+    removed = sum(end - start for start, end in recovered["removed"])
+    expected = recovered["original_duration"] - recovered["edit_duration"]
+    return abs(removed - expected)
+
+
 def as_plan(recovered: dict) -> dict:
     """A recovered cut list in the shape score() reads.
 
@@ -130,6 +146,7 @@ def compare(original: str, reference: str, candidates, cache: str, track: str):
         rows.append({
             "name": name, "path": path,
             "envelope_error": got.get("envelope_error", 0.0),
+            "disagreement": duration_disagreement(got),
             "duration": got["edit_duration"],
             "removed": stats["planned"],
             "precision": stats["precision"], "recall": stats["recall"],
@@ -178,16 +195,29 @@ def main() -> int:
     width = max([len(r["name"]) for r in rows] + [9]) + 2
     print(f"\n  {'candidate':<{width}}{'length':>9}{'removed':>10}"
           f"{'precision':>11}{'recall':>9}{'F1':>8}{'missed':>9}")
-    for row in sorted(rows, key=lambda r: -r["f1"]):
-        flag = " !" if row["envelope_error"] >= MAX_ENVELOPE_ERROR else ""
+    def unreliable(row):
+        return (row["envelope_error"] >= MAX_ENVELOPE_ERROR
+                or row["disagreement"] >= MAX_DURATION_DISAGREEMENT)
+
+    # Unreliable rows sort last and are not ranked against the rest: a broken
+    # recovery produces numbers, and numbers in a sorted table read as results.
+    for row in sorted(rows, key=lambda r: (unreliable(r), -r["f1"])):
+        flag = " !" if unreliable(row) else ""
         print(f"  {row['name']:<{width}}{row['duration']:>8.2f}s"
               f"{row['removed']:>9.2f}s"
               f"{row['precision'] * 100:>10.1f}%{row['recall'] * 100:>8.1f}%"
               f"{row['f1'] * 100:>7.1f}%{row['missed']:>8.2f}s{flag}")
 
-    if any(r["envelope_error"] >= MAX_ENVELOPE_ERROR for r in rows):
-        print("\n  ! marked rows did not align against the original; their "
-              "recovered cut list is unreliable")
+    for row in rows:
+        if row["disagreement"] >= MAX_DURATION_DISAGREEMENT:
+            print(f"\n  ! {row['name']}: recovered cuts total "
+                  f"{row['removed']:.2f}s but the edit is only "
+                  f"{row['duration'] and (ref['original_duration'] - row['duration']):.2f}s "
+                  f"shorter than the original — off by {row['disagreement']:.2f}s. "
+                  f"The alignment lost its place; this row is not a result.")
+        elif row["envelope_error"] >= MAX_ENVELOPE_ERROR:
+            print(f"\n  ! {row['name']}: did not align against the original "
+                  f"(envelope error {row['envelope_error']:.3f}); not a result.")
 
     print("\n  F1 is over removed *time*, not cuts. A few points is noise — see\n"
           "  tools/README.md, 'Reading the numbers honestly', before concluding\n"

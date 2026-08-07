@@ -39,6 +39,21 @@ It ends with a check: the recovered list is spliced out of the original and
 compared against the edit. Envelope error well under 0.1 means the cut list is
 right. If it is not, nothing downstream means anything — fix that first.
 
+**That check is necessary and not sufficient.** It compares only the
+overlapping prefix of the rebuilt audio against the edit, so a recovery that
+loses its place partway and swallows a long stretch still scores well on
+everything before the damage. `compare_runs.py` therefore also checks the
+arithmetic — the recovered cuts must account for exactly the length the edit is
+missing — and refuses to rank a row that fails it. A real case: a 33.8s phantom
+cut in an otherwise sensible list, at an envelope error of 0.011.
+
+**A render made with `CUT_FADE` cannot be scored here.** The alignment is
+correlation against the original, and ramping the audio at every join is enough
+to throw it off — both faded renders of the sample failed by an identical
+27.37s. Measure with `CUT_FADE=0` and apply the fade only to what you ship; it
+changes no cut boundary and no duration, so the scored run and the shipped one
+differ in nothing the score can see.
+
 **2. Find out what was cut, not just where.** This decides whether a miss is
 tunable at all. A filler the transcript never contained is not a threshold
 problem, and no amount of sweeping will find it.

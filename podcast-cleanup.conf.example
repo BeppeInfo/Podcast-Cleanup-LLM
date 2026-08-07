@@ -367,6 +367,12 @@ MUTE_FADE="0.030"
 # Two cuts closer together than twice this have their ramps merged, which also
 # silences the sliver between them. That sliver is shorter than the fade, and
 # the alternative — fusing the cuts — would delete it outright.
+#
+# One practical consequence: a faded render cannot be scored by tools/. That
+# harness recovers the cut list by correlating the render against the original,
+# and ramping every join throws the alignment off. Measure with CUT_FADE=0 and
+# fade only what you ship — the fade moves no boundary and changes no duration,
+# so the two runs differ in nothing the score could see anyway.
 CUT_FADE="0"
 
 # ------------------------------------------------------------ edit detection --

@@ -1853,6 +1853,18 @@ class TestRunComparison(unittest.TestCase):
             handle.write(b"re-cut by hand")
         self.assertNotEqual(before, self.cr.fingerprint(one, two))
 
+    def test_a_recovery_that_lost_its_place_is_caught_by_arithmetic(self):
+        # The envelope check compares only the overlapping prefix, so a
+        # recovery that swallows a long stretch in the middle still scores
+        # well on the part before the damage. Seen for real: a 33.8s phantom
+        # cut at an envelope error of 0.011.
+        good = self._recovered([(10.0, 12.0), (30.0, 33.0)])
+        self.assertLess(self.cr.duration_disagreement(good),
+                        self.cr.MAX_DURATION_DISAGREEMENT)
+        broken = dict(good, removed=[[10.0, 12.0], [15.0, 48.0]])
+        self.assertGreater(self.cr.duration_disagreement(broken),
+                           self.cr.MAX_DURATION_DISAGREEMENT)
+
     def test_a_reference_that_did_not_align_is_not_silently_scored(self):
         # tools/README.md is explicit: above this the cut list is wrong and
         # nothing computed from it means anything.
