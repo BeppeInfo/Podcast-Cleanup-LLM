@@ -3109,6 +3109,59 @@ class TestFilterExpressions(unittest.TestCase):
             self.assertGreaterEqual(value, -1e-9)
             self.assertLessEqual(value, 1.0 + 1e-9)
 
+    def test_cut_fade_ramps_into_and_out_of_the_join(self):
+        # The ramp lands on the audio either side of the cut; the flat zero in
+        # the middle is discarded with the cut itself, so what reaches the
+        # output is a fade-out arriving at the splice and a fade-in leaving it.
+        fade = 0.05
+        expression = render.cut_fade_expression([{"start": 10.0, "end": 12.0}], fade)
+        for t in (0.0, 9.0, 9.9, 13.0, 100.0):
+            self.assertAlmostEqual(eval_expr(expression, t), 1.0, places=6, msg=f"t={t}")
+        self.assertAlmostEqual(eval_expr(expression, 9.975), 0.5, places=3)
+        self.assertAlmostEqual(eval_expr(expression, 10.0), 0.0, places=6)
+        self.assertAlmostEqual(eval_expr(expression, 12.0), 0.0, places=6)
+        self.assertAlmostEqual(eval_expr(expression, 12.025), 0.5, places=3)
+
+    def test_cuts_closer_than_two_fades_do_not_break_the_tree(self):
+        # Padding by the fade can make neighbours overlap even when the cuts do
+        # not, and the dispatch tree needs disjoint spans. Fusing the *cuts*
+        # would delete the audio between them, so only the ramps are merged.
+        fade = 0.05
+        cuts = [{"start": 10.0, "end": 10.5}, {"start": 10.55, "end": 11.0}]
+        expression = render.cut_fade_expression(cuts, fade)
+        for step in range(0, 1400):
+            value = eval_expr(expression, 9.5 + step / 1000.0)
+            self.assertGreaterEqual(value, -1e-9)
+            self.assertLessEqual(value, 1.0 + 1e-9)
+        # The sliver between them is inside the merged ramp, so it is silenced
+        # rather than left at full gain against a step on either side.
+        self.assertAlmostEqual(eval_expr(expression, 10.525), 0.0, places=6)
+        self.assertAlmostEqual(eval_expr(expression, 9.0), 1.0, places=6)
+        self.assertAlmostEqual(eval_expr(expression, 12.0), 1.0, places=6)
+
+    def test_cut_fade_is_off_by_default_and_changes_nothing(self):
+        cuts = [{"start": 10.0, "end": 12.0}]
+        self.assertEqual(render.build_filter(cuts, [], 512, 0.03),
+                         render.build_filter(cuts, [], 512, 0.03, cut_fade=0.0))
+        self.assertNotIn("volume", render.build_filter(cuts, [], 512, 0.03))
+
+    def test_cut_fade_is_applied_before_the_cut_is_taken(self):
+        # Order is the whole reason this works: after aselect the audio either
+        # side of the join is adjacent, and there is nothing left to ramp over.
+        graph = render.build_filter([{"start": 10.0, "end": 12.0}], [], 512,
+                                    0.03, cut_fade=0.03)
+        self.assertLess(graph.index("volume"), graph.index("aselect"))
+
+    def test_cut_fade_does_not_change_the_predicted_length(self):
+        # A gain change alters no sample count, so the frame-exact prediction
+        # and the duration check downstream of it are untouched.
+        cuts = [{"start": 10.0, "end": 12.0}]
+        self.assertEqual(
+            render.expected_output_samples(60.0, 48000, 512, cuts),
+            render.expected_output_samples(60.0, 48000, 512, cuts))
+        graph = render.build_filter(cuts, [], 512, 0.03, cut_fade=0.03)
+        self.assertIn("aselect", graph)
+
     def test_build_filter_passthrough(self):
         self.assertIsNone(render.build_filter([], [], 512, 0.03))
 

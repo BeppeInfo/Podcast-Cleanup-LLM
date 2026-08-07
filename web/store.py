@@ -56,6 +56,10 @@ GROUPS = [
         ("CUT_PADDING", "Cut padding", "seconds claimed around a disfluency"),
         ("MIN_CUT", "Shortest cut worth making", "seconds"),
         ("MUTE_FADE", "Mute fade", "seconds at each end of a muted span"),
+        ("CUT_FADE", "Cut fade",
+         "seconds ramped into and out of every cut; 0 is a hard splice. Costs "
+         "no time — shorter than a few render frames is a smaller step, not a "
+         "fade"),
         ("MAX_CUT_FRACTION", "Refuse a plan removing more than",
          "fraction of the episode; almost always a wrong threshold"),
     ]),

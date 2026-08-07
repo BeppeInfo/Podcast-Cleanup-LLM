@@ -127,6 +127,16 @@ SETTINGS: dict[str, tuple] = {
     "CUT_PADDING": ("0.10", NUM, None),
     "MIN_CUT": ("0.15", NUM, None),
     "MUTE_FADE": ("0.030", NUM, None),
+    # Ramp the audio down into every cut and back up out of it, so the splice
+    # is a fade rather than a step. Applied before the cut is taken, so it
+    # costs no time and changes no duration — the ramp lands on the audio
+    # either side of the join and the middle is discarded with the cut.
+    #
+    # 0 disables it, which is the default because it is what every existing run
+    # did. The floor worth knowing: `volume` is re-evaluated once per
+    # RENDER_FRAME_SAMPLES, so a fade shorter than a few frames is a smaller
+    # step rather than a ramp — at 512 samples and 48 kHz a frame is ~10.7 ms.
+    "CUT_FADE": ("0", NUM, None),
 
     "LLM_ENABLE": ("1", FLAG, None),
     "LLM_CHUNK_WORDS": ("350", INT, None),

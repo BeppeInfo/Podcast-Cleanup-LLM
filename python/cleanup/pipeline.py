@@ -1281,6 +1281,7 @@ def write_filters(work: str, meta, current, settings) -> dict:
     os.makedirs(directory, exist_ok=True)
     frame_samples = int(settings["RENDER_FRAME_SAMPLES"])
     fade = float(settings["MUTE_FADE"])
+    cut_fade = float(settings["CUT_FADE"])
 
     expectations = {}
     for track in meta["tracks"]:
@@ -1291,7 +1292,8 @@ def write_filters(work: str, meta, current, settings) -> dict:
         resample = render_rate if render_rate != track["sample_rate"] else None
 
         graph = render.build_filter(
-            current["cuts"], mutes, frame_samples, fade, resample=resample)
+            current["cuts"], mutes, frame_samples, fade, resample=resample,
+            cut_fade=cut_fade)
         path = os.path.join(directory, f"{participant}.filter")
         if graph is None:
             if os.path.exists(path):

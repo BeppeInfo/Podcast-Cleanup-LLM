@@ -2,7 +2,8 @@
 
 The graph per track is:
 
-    asetnsamples -> volume (mutes) -> aselect (cuts) -> asetpts
+    asetnsamples -> volume (mutes) -> volume (cut fades) -> aselect (cuts)
+                 -> asetpts
 
 `aselect` decides per *frame*, not per sample, so cut points land on a frame
 boundary. That is why `asetnsamples` comes first and why every track in an
@@ -50,9 +51,15 @@ def cut_expression(cuts) -> str:
     return _tree(spans, lambda s, e: f"between(t,{_fmt(s)},{_fmt(e)})")
 
 
-def mute_gain_expression(mutes, fade: float) -> str:
-    """Gain multiplier: 1 normally, 0 inside a mute, ramped over `fade`."""
-    spans = iv.normalize([(m["start"], m["end"]) for m in mutes])
+def gain_expression(spans, fade: float) -> str:
+    """Gain multiplier: 1 normally, 0 inside a span, ramped over `fade`.
+
+    The tree needs disjoint spans, and padding by `fade` can make neighbours
+    overlap even when the originals did not — so the padded spans are normalized
+    here rather than trusting the caller to have fused them. The mute path did
+    trust that, because `plan.py` fuses mutes across gaps of `2*mute_fade`; the
+    cut path cannot, since fusing two cuts would delete the audio between them.
+    """
     fade = max(fade, 1e-4)
 
     def leaf(start, end):
@@ -63,19 +70,36 @@ def mute_gain_expression(mutes, fade: float) -> str:
         f = _fmt(fade)
         return f"clip((t-{low})/{f},0,1)*clip(({high}-t)/{f},0,1)"
 
-    # Padded spans are disjoint (mutes were fused across gaps of 2*fade), so the
-    # tree pivots on the padded start.
-    padded = [(s - fade, e + fade) for s, e in spans]
-    ordered = sorted(zip(padded, spans))
-    tree = _tree(
-        [p for p, _ in ordered],
-        lambda ps, pe: leaf(ps + fade, pe - fade),
-    )
+    padded = iv.normalize(
+        [(start - fade, end + fade) for start, end in iv.normalize(spans)])
+    tree = _tree(padded, lambda ps, pe: leaf(ps + fade, pe - fade))
     return f"1-({tree})"
 
 
+def mute_gain_expression(mutes, fade: float) -> str:
+    """Gain multiplier for the muted spans of one track."""
+    return gain_expression([(m["start"], m["end"]) for m in mutes], fade)
+
+
+def cut_fade_expression(cuts, fade: float) -> str:
+    """Gain multiplier that ramps into and out of every cut.
+
+    Applied *before* `aselect`, on the original timeline, so the ramp lands on
+    the audio either side of the join and the flat zero in the middle is
+    discarded with the cut. What survives into the output is a fade-out
+    arriving at the splice and a fade-in leaving it.
+
+    Two cuts closer together than `2*fade` have their ramps merged, which also
+    silences the sliver of audio between them. That sliver is shorter than the
+    fade itself, and the alternative — fusing the cuts — would delete it
+    outright and change the edit.
+    """
+    return gain_expression([(c["start"], c["end"]) for c in cuts], fade)
+
+
 def build_filter(
-    cuts, mutes, frame_samples: int, fade: float, resample: int | None = None
+    cuts, mutes, frame_samples: int, fade: float, resample: int | None = None,
+    cut_fade: float = 0.0
 ) -> str | None:
     """Full filtergraph for one track, or None when the track is untouched.
 
@@ -96,6 +120,13 @@ def build_filter(
     if mutes:
         chain.append(
             f"volume=volume='{mute_gain_expression(mutes, fade)}':eval=frame"
+        )
+    # Before aselect, deliberately: see cut_fade_expression. A second volume
+    # rather than one combined expression, so a track with both keeps two
+    # readable trees instead of their product.
+    if cuts and cut_fade > 0:
+        chain.append(
+            f"volume=volume='{cut_fade_expression(cuts, cut_fade)}':eval=frame"
         )
     if cuts:
         chain.append(f"aselect='not({cut_expression(cuts)})'")

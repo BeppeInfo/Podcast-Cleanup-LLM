@@ -343,6 +343,32 @@ MIN_CUT="0.15"
 # Fade length at both ends of a per-track mute, to avoid a click.
 MUTE_FADE="0.030"
 
+# Ramp the audio down into every cut and back up out of it, so a splice is a
+# fade rather than a step. 0 disables it, which is the default because it is
+# what every run before this did.
+#
+# It costs no time and changes no duration. The ramp is applied *before* the
+# cut is taken, on the original timeline, so it lands on the audio either side
+# of the join and the flat part in the middle is discarded along with the cut.
+# The rendered length is unchanged to the sample, and the duration check that
+# guards every run is unaffected.
+#
+# Where it lands is already quiet, which is why a short ramp is inaudible
+# rather than a duck on speech: a silence cut keeps max(SILENCE_KEEP/2,
+# CUT_PADDING) either side, and a disfluency cut widens into the gap around it
+# by at most half that gap, so the other half remains.
+#
+# One floor worth knowing. `volume` is re-evaluated once per
+# RENDER_FRAME_SAMPLES, so the ramp is a staircase, not a line: at 512 samples
+# and 48 kHz each step is ~10.7 ms. A CUT_FADE shorter than a few frames is not
+# a fade at all, just a smaller step. Either keep it at 0.03 or above, or lower
+# RENDER_FRAME_SAMPLES to buy resolution.
+#
+# Two cuts closer together than twice this have their ramps merged, which also
+# silences the sliver between them. That sliver is shorter than the fade, and
+# the alternative — fusing the cuts — would delete it outright.
+CUT_FADE="0"
+
 # ------------------------------------------------------------ edit detection --
 
 LLM_ENABLE="1"

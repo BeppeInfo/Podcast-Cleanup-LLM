@@ -224,6 +224,34 @@ Both expressions are emitted as a **balanced decision tree**
 evaluated in full for every one of a million-odd frames; the tree makes it a
 handful of comparisons.
 
+### Fading a splice without moving it
+
+`CUT_FADE` ramps the audio down into each cut and back up out of it. The reason
+it is nearly free is the order of the graph: `volume` runs *before* `aselect`,
+on the original timeline, so the ramp lands on the audio either side of the join
+and the flat zero in the middle is discarded along with the cut. What survives
+into the output is a fade-out arriving at the splice and a fade-in leaving it.
+
+Nothing else moves. `expected_output_samples` models only `aselect`'s per-frame
+keep-or-drop, and a gain change alters no sample count, so the frame-exact
+prediction and the duration check that guards every run are untouched —
+confirmed on the sample, where the faded and unfaded renders differ in every
+sample and agree to `0.000000s`. Sync is safe for the same reason cuts are: the
+expression is identical on every track.
+
+A crossfade would have been the other option and was not taken. It would shorten
+the timeline by the overlap, which means the cut list no longer predicts the
+output length, `expected_output_samples` needs to model the fade too, and the
+duration check — the thing that catches a render going wrong — has to be
+loosened to accommodate it. A fade that costs no time keeps all of that intact.
+
+Two details that are consequences rather than choices. The ramp is a staircase:
+`volume=eval=frame` is evaluated once per `RENDER_FRAME_SAMPLES`, so at 512
+samples and 48 kHz each step is ~10.7 ms and a fade shorter than a few frames is
+just a smaller step. And cuts closer together than `2*CUT_FADE` have their ramps
+merged, silencing the sliver between them — the alternative, fusing the cuts,
+would delete that audio outright and change the edit.
+
 ### Why cuts are frame-aligned, and why that is fine
 
 `aselect` decides per frame, not per sample, so a cut boundary lands on a frame
