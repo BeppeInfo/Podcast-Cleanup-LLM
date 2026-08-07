@@ -2749,6 +2749,24 @@ class TestConfig(unittest.TestCase):
         dumped, _ = self._dumped(cfg.defaults())
         self.assertEqual(dumped["LLAMA_API_KEY"], "<unset>")
 
+    def test_an_inert_silence_keep_is_pointed_out(self):
+        # Each end of a shortened gap keeps max(SILENCE_KEEP/2, CUT_PADDING),
+        # so below twice the padding the setting does nothing at all. A sweep
+        # produced three byte-identical plans before this said so.
+        said = []
+        values = cfg.defaults()
+        values.update({"SILENCE_KEEP": "0.15", "CUT_PADDING": "0.10"})
+        cfg.validate(values, said.append)
+        self.assertTrue(any("SILENCE_KEEP" in m and "no effect" in m for m in said),
+                        said)
+
+    def test_a_silence_keep_that_bites_is_not_complained_about(self):
+        said = []
+        values = cfg.defaults()
+        values.update({"SILENCE_KEEP": "0.40", "CUT_PADDING": "0.10"})
+        cfg.validate(values, said.append)
+        self.assertFalse([m for m in said if "SILENCE_KEEP" in m], said)
+
     def test_config_file_is_sourced_by_bash(self):
         # Not parsed here: a value referencing another one has to keep working.
         path = self._conf('SILENCE_KEEP="0.2"\nOUTPUT_EXT="wav"\n'

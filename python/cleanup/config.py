@@ -391,6 +391,17 @@ def validate(settings: dict, warn=None) -> None:
             f"SILENCE_KEEP ({settings['SILENCE_KEEP']}) must be smaller than "
             f"SILENCE_MIN_DURATION ({settings['SILENCE_MIN_DURATION']})")
 
+    # Half of SILENCE_KEEP is left at each end of a shortened gap, but never
+    # less than CUT_PADDING — so below twice the padding, the setting stops
+    # doing anything and says nothing about it. Not an error: the run is
+    # correct, the knob is simply not the one being turned. Found by sweeping,
+    # where three values of SILENCE_KEEP produced byte-identical plans.
+    if warn and as_num(settings, "SILENCE_KEEP") <= 2 * as_num(settings, "CUT_PADDING"):
+        warn(f"SILENCE_KEEP ({settings['SILENCE_KEEP']}) has no effect while "
+             f"CUT_PADDING is {settings['CUT_PADDING']}: each end of a shortened "
+             f"gap keeps max(SILENCE_KEEP/2, CUT_PADDING). Raise it above "
+             f"{2 * as_num(settings, 'CUT_PADDING'):g} or lower CUT_PADDING.")
+
     if not settings["TRACK_SEPARATOR"]:
         raise ConfigError("TRACK_SEPARATOR must not be empty")
 

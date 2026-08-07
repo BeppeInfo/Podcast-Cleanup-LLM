@@ -318,6 +318,15 @@ SPLIT_MIN_SILENCE="0.30"
 # A stretch of time counts as silence only when *no* track has speech in it.
 # Gaps longer than SILENCE_MIN_DURATION are shortened to SILENCE_KEEP rather
 # than removed outright, so the edit keeps its breathing room.
+#
+# **SILENCE_KEEP and CUT_PADDING are one setting, not two.** Half of
+# SILENCE_KEEP is left at each end of a shortened gap — but never less than
+# CUT_PADDING, since a cut always keeps that much margin. So any SILENCE_KEEP
+# at or below twice CUT_PADDING does nothing at all, silently: with
+# CUT_PADDING=0.1, the values 0.15 and 0.05 produce byte-identical plans. The
+# run warns when they are set that way. It is also inert from the other
+# direction, when SILENCE_MIN_DURATION is high enough that no gap qualifies in
+# the first place; the two traps are independent and both are quiet.
 SILENCE_MIN_DURATION="1.5"
 SILENCE_KEEP="0.40"
 
