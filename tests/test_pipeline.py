@@ -1837,6 +1837,22 @@ class TestRunComparison(unittest.TestCase):
         missed = iv.total(iv.subtract(stats["reference"], stats["cuts"]))
         self.assertAlmostEqual(missed, 3.0, places=6)
 
+    def test_the_cache_is_invalidated_when_an_input_changes(self):
+        # The reference audio does get re-cut — an editor who finds a miss
+        # fixes it — and a cache keyed only on a label would answer the new
+        # question with the old number, silently.
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        one = os.path.join(root, "a.bin")
+        two = os.path.join(root, "b.bin")
+        for path in (one, two):
+            with open(path, "wb") as handle:
+                handle.write(b"original")
+        before = self.cr.fingerprint(one, two)
+        with open(two, "wb") as handle:
+            handle.write(b"re-cut by hand")
+        self.assertNotEqual(before, self.cr.fingerprint(one, two))
+
     def test_a_reference_that_did_not_align_is_not_silently_scored(self):
         # tools/README.md is explicit: above this the cut list is wrong and
         # nothing computed from it means anything.

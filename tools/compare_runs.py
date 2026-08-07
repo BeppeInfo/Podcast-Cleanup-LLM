@@ -34,6 +34,7 @@ Three of its warnings apply directly:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -52,13 +53,41 @@ from score_plan import score  # noqa: E402
 MAX_ENVELOPE_ERROR = 0.1
 
 
+def fingerprint(*paths: str) -> str:
+    """A content hash of the inputs a cached answer was computed from.
+
+    Hashing rather than trusting mtime, and hashing rather than nothing: the
+    reference audio *does* get re-cut — an editor who finds a miss fixes it —
+    and a cache keyed only on a label would answer the new question with the old
+    number, confidently and silently. Hashing a gigabyte costs a second or two
+    against a recovery that decodes and correlates the whole track.
+    """
+    digest = hashlib.sha256()
+    for path in paths:
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
 def recover(original: str, edited: str, cache: str, label: str) -> dict:
     """The cut list turning `original` into `edited`, via recover_cuts.py.
 
     Cached on disk: recovery is the slow part, correlating whole tracks, and a
     comparison is usually re-run because a candidate changed, not the reference.
+    The cache is invalidated by content, not by name.
     """
     out = os.path.join(cache, f"{label}.cuts.json")
+    stamp = fingerprint(original, edited)
+    if os.path.isfile(out):
+        try:
+            with open(out, encoding="utf-8") as handle:
+                cached = json.load(handle)
+            if cached.get("inputs_sha256") == stamp:
+                return cached
+        except (OSError, ValueError):
+            pass
+        os.remove(out)
     if not os.path.isfile(out):
         os.makedirs(cache, exist_ok=True)
         result = subprocess.run(
@@ -70,7 +99,11 @@ def recover(original: str, edited: str, cache: str, label: str) -> dict:
                 f"could not recover cuts for {label} ({edited}):\n"
                 + (result.stderr or result.stdout).strip())
     with open(out, encoding="utf-8") as handle:
-        return json.load(handle)
+        recovered = json.load(handle)
+    recovered["inputs_sha256"] = stamp
+    with open(out, "w", encoding="utf-8") as handle:
+        json.dump(recovered, handle, indent=2)
+    return recovered
 
 
 def as_plan(recovered: dict) -> dict:
