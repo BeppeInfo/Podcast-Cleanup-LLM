@@ -246,21 +246,76 @@ memory, so the image must run **exactly one worker**, which is why it serves wit
 waitress rather than gunicorn with several. Downloading a finished episode
 removes it from the server unless you pick *Download & keep*.
 
-The same image runs the CLI, and a `dev` target adds the test suites and the
-tools in `tools/`:
+The same image runs the CLI. `docker compose` names its own image, so tag one
+explicitly if you want to drive it directly:
 
 ```sh
-docker run --rm -v ./data:/data podcast-cleanup:runtime cli --help
+docker build --target runtime -t podcast-cleanup:runtime .
+
+docker run --rm --network host \
+    -v ./data:/data -v ./models:/models \
+    -e LLAMA_ENDPOINT=http://your-llama-host:8080 \
+    -e LLAMA_MODEL_NAME=your-model \
+    podcast-cleanup:runtime cli --keep-work
+```
+
+Both volumes matter. `/data` is the working layout — drop tracks in
+`data/incoming/` named `<episode>_<participant>.flac`. `/models` is where the
+weights land, and without it every run re-downloads them: the Whisper model plus
+a 360 MB aligner, which is minutes each time and pointless.
+
+`--network host` is the simple way to reach a llama-server on your LAN by name.
+Compose does the equivalent with `extra_hosts`; on a bare `docker run` without
+it, a hostname like `myserver:8080` will not resolve inside the container.
+
+A `dev` target adds the suites and the measuring tools in `tools/`:
+
+```sh
 docker build --target dev -t podcast-cleanup:dev . && docker run --rm podcast-cleanup:dev
 ```
 
-**From a checkout, on the command line.** No container, no dependencies beyond
-ffmpeg and python3 — the pipeline is standard library only. The web interface is
-container-only; Flask is not needed, or wanted, for this.
+**From a checkout, on the command line.** The pipeline itself is standard
+library, so planning, rendering and every stage but one need nothing beyond
+ffmpeg and python3. The web interface is container-only; Flask is not needed, or
+wanted, for this.
 
 ```sh
 ./clean-podcast.sh              # everything in incoming/
+./clean-podcast.sh --from plan  # re-plan and re-render, no model needed
 ```
+
+**Transcription is the exception.** It needs whisperx installed in the same
+interpreter, and whisperx requires Python `>=3.10,<3.14` — so on a host running
+3.14 the checkout cannot transcribe at all, which is the reason the image pins
+its own interpreter. Either install whisperx into a supported checkout, or
+transcribe in the container and use the checkout for the stages after it: the
+work directory is the interface between them, and `--from plan` picks up
+whatever `transcribe` left there.
+
+### Before a long episode
+
+Transcription is the whole cost and it is CPU-bound (see [Where the models
+run](#where-the-models-run)). Two settings dominate, and the defaults are not
+what you want for a real recording:
+
+- **`WHISPER_MODEL`.** Measured on a 57 s clip: `small` transcribed *no fillers
+  at all*, `large-v3` kept them and got the words right at roughly five times
+  the runtime. What a model smooths away, nothing downstream can cut — so this
+  is a quality setting first and a speed setting second.
+- **`WHISPER_THREADS`.** Only `1` is reproducible. Above it, CTranslate2 reduces
+  across threads in completion order and the transcript shifts between runs —
+  three runs at 4 threads gave 70, 62 and 69 words on the same audio, and the
+  words that moved were the fillers. Leave it at 4 for speed; set it to 1 when
+  comparing two configurations.
+
+Both are on the Settings page when running the web interface, and are `-e`
+overrides or config-file entries on the CLI.
+
+Run the first real episode with `--keep-work`, then read
+`work/<episode>/edit-report.txt` and the transcript in `output/<episode>/` before
+trusting the audio. `tools/` turns "it got closer" into a number. Keeping the
+work directory also means a re-plan costs nothing: transcription is what takes
+the hours, and `--from plan` re-runs everything after it in seconds.
 
 ## Setup
 

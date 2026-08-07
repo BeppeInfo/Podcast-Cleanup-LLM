@@ -1,8 +1,11 @@
 __pycache__/
 *.py[cod]
 
-# A local config is machine-specific; the example is the tracked one.
+# A local config is machine-specific; the example is the tracked one. The .env
+# is the same thing in docker's env-file syntax, and carries endpoints and model
+# names for one particular machine.
 podcast-cleanup.conf
+*.env
 
 # The layout the run creates. The root defaults to the directory holding
 # clean-podcast.sh, so a checkout that is used in place grows these.
