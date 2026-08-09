@@ -25,3 +25,8 @@ podcast-cleanup.conf
 
 # The web app's data volume when it is run from a checkout.
 /data/
+
+# Model weights, mounted by compose and by the documented `docker run`. Gigabytes
+# of downloaded cache, written as root by the container, and re-fetchable at any
+# time — git cannot even scan it without permission errors.
+/models/

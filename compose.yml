@@ -9,6 +9,10 @@
 
 services:
   cleanup:
+    # The published image, so `docker compose up` works without a checkout of
+    # this repo. `--build` still overrides it and builds from source, which is
+    # what you want when changing the code.
+    image: ancapepe/podcast-cleanup:latest
     build:
       context: .
       target: runtime

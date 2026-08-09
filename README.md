@@ -260,17 +260,29 @@ memory, so the image must run **exactly one worker**, which is why it serves wit
 waitress rather than gunicorn with several. Downloading a finished episode
 removes it from the server unless you pick *Download & keep*.
 
-The same image runs the CLI. `docker compose` names its own image, so tag one
-explicitly if you want to drive it directly:
+The image is published, so nothing has to be built to use it:
 
 ```sh
-docker build --target runtime -t podcast-cleanup:runtime .
+docker pull ancapepe/podcast-cleanup:latest
+```
 
+`compose.yml` names it, so `docker compose up` pulls rather than builds. Add
+`--build` when you are changing the code and want it built from the checkout.
+
+The same image runs the CLI:
+
+```sh
 docker run --rm --network host \
     -v ./data:/data -v ./models:/models \
     -e LLAMA_ENDPOINT=http://your-llama-host:8080 \
     -e LLAMA_MODEL_NAME=your-model \
-    podcast-cleanup:runtime cli --keep-work
+    ancapepe/podcast-cleanup:latest cli --keep-work
+```
+
+To build it yourself instead — the same thing compose does with `--build`:
+
+```sh
+docker build --target runtime -t podcast-cleanup:runtime .
 ```
 
 Both volumes matter. `/data` is the working layout — drop tracks in
