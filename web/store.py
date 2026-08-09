@@ -79,8 +79,8 @@ GROUPS = [
     Group("transcribe", "Transcription",
           "What reaches the detector at all — see the note below the prompt.", [
         ("WHISPER_MODEL", "Model",
-         "tiny, base, small, medium, large-v3 — bigger is a better transcript "
-         "and, on a CPU, a much longer wait"),
+         "tiny, base, small, medium, large-v3-turbo, large-v3 — bigger is a "
+         "better transcript and, on a CPU, a much longer wait"),
         ("WHISPER_DEVICE", "Device", "cuda needs an NVIDIA card; Radeon means cpu"),
         ("WHISPER_COMPUTE_TYPE", "Precision", "int8 on a CPU; float16 needs cuda"),
         ("WHISPER_BATCH_SIZE", "Batch size", "speed against memory"),
