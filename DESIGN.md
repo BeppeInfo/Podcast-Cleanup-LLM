@@ -573,10 +573,36 @@ The sharp edge is context, not concurrency. Giving llama-server an explicit
 `-np` takes the slot count out of "auto", which is also what turns `--kv-unified`
 off, so `-c` is split and each slot gets `n_ctx / n_parallel`. Raising the slot
 count therefore *shrinks* the window each chunk must fit into, and a chunk that
-no longer fits is refused, dropped, and shows up only as a track that found
-suspiciously little. `stage_detect` does that arithmetic before the episode and
-warns — but only for a server it starts itself, since a remote one's `-c` and
-`-np` cannot be read back.
+no longer fits is truncated rather than refused, so the window is judged on part
+of itself and shows up only as a track that found suspiciously little.
+
+**A remote server can be asked, and that is better than the arithmetic.** This
+used to say the check was possible only for a server we started ourselves,
+because a remote one's `-c` and `-np` could not be read back. That was wrong.
+`GET /slots` reports `n_ctx` **already divided among the slots**, and the array
+length is the slot count — both numbers, one call, no division rules to
+reproduce. On a router the model has to be named (`/slots?model=…`, or it
+answers "model name is missing from the request"), which is the same
+`LLAMA_MODEL_NAME` the completions already need.
+
+So `_preflight_context` runs once before the episode: it reads the per-slot
+context, tokenises a **real** window through the server's own `/tokenize`, and
+refuses the run if that window plus `LLM_MAX_REPLY_TOKENS` would not fit. It
+also caps `LLM_CONCURRENCY` at the reported slot count, which turns the oldest
+unfixable footgun here — "too high is not an error, the surplus just queues
+invisibly" — into a warning.
+
+Two things make this safe to have. Every probe failure is silent and skips the
+check: a server that will not describe itself is a reason to trust the operator,
+never a reason to refuse work that would have succeeded. And the window is
+tokenised rather than estimated, because the server's own usage accounting
+cannot be used for it — this build reports `usage.prompt_tokens` as 806 for a
+window `/tokenize` measures at 3134, so anything sized on the completion
+response would be sized on a number that does not mean what it appears to.
+
+`LLAMA_CTX` returns for the server that answers completions but not `/slots`.
+It is a fallback, not an override: where both are known the smaller wins and the
+disagreement is reported, because a hand-set number is the one that goes stale.
 
 ## 7. Model placement
 

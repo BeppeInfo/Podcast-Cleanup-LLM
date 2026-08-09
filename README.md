@@ -131,15 +131,26 @@ llama-server \
 - **`-c 8192 --parallel 1`.** The trap here is that `-c` is the *total* context
   divided among slots, so `-c 8192 --parallel 4` leaves 2048 per slot and
   silently truncates the prompt. At the default `LLM_CHUNK_WORDS=350` a request
-  is ~3.3k prompt tokens plus 2048 reserved for the reply, so a slot needs
+  is ~3.1k prompt tokens plus 2048 reserved for the reply, so a slot needs
   ~6k. Multiply `-c` by the slot count.
 
-  | `LLM_CHUNK_WORDS` | prompt tokens | minimum context per slot |
-  | --- | --- | --- |
-  | 150 | ~1.8k | 4096 |
-  | 250 | ~2.5k | 5120 |
-  | 350 (default) | ~3.3k | 6144 |
-  | 500 | ~4.5k | 7168 |
+  Measured through the server's own `/tokenize`, on ordinary conversational
+  English — how a window tokenises depends on the words in it, so treat these
+  as the shape rather than the guarantee:
+
+  | `LLM_CHUNK_WORDS` | prompt tokens | + reply | minimum context per slot |
+  | --- | --- | --- | --- |
+  | 150 | 1734 | 3782 | 4096 |
+  | 250 | 2434 | 4482 | 8192 |
+  | 350 (default) | 3134 | 5182 | 8192 |
+  | 500 | 4184 | 6232 | 8192 |
+  | 750 | 5934 | 7982 | 8192 |
+
+  You do not have to get this right by hand any more. The detect stage asks
+  `/slots` for the per-slot context, tokenises a real window from your own
+  transcript, and refuses the run if it would not fit — and caps
+  `LLM_CONCURRENCY` at the slot count the server reports. Set `LLAMA_CTX` only
+  for a server that will not answer that probe.
 
   The division is what llama.cpp does when the KV cache is split, which is the
   default as soon as `--parallel` is given a number — passing `-np` takes the
@@ -158,9 +169,12 @@ llama-server \
   starts gets `--parallel` derived from `LLM_CONCURRENCY` automatically, and the
   detect stage checks the context arithmetic above before the episode starts.
 
-- **The server's `-c` is the only context there is**, and nothing here checks it
-  against `LLM_CHUNK_WORDS`. A prompt that does not fit is truncated silently and
-  shows up only as a track with suspiciously few edits, so size it by hand.
+- **The server's `-c` is the only context there is**, and the detect stage now
+  checks it against `LLM_CHUNK_WORDS` before the episode starts. A prompt that
+  does not fit is truncated silently and shows up only as a track with
+  suspiciously few edits, which is why this is refused rather than warned about.
+  A server that will not answer `/slots` skips the check instead of failing;
+  give it `LLAMA_CTX` to have it checked anyway.
 - **Any instruct model works**, not just the one in the example. Requests go to
   `/v1/chat/completions`, so llama-server applies the chat template of whatever
   model it has loaded — see "Choosing a model" below.

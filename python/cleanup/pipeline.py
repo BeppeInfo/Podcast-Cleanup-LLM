@@ -821,6 +821,105 @@ def track_was_analysed(result, log) -> bool:
     return True
 
 
+def _preflight_context(client, settings, log, work, meta, kinds, limits,
+                       resume: str) -> int:
+    """Size one window against the slot it has to fit, before the episode.
+
+    Everything this catches is otherwise silent. A window larger than the
+    slot's context is truncated by llama.cpp rather than refused, so it is
+    judged on part of itself; `LLM_CONCURRENCY` above the slot count queues
+    invisibly inside the server. Neither shows up as an error — both show up
+    as a track that found suspiciously little, which is indistinguishable from
+    clean speech.
+
+    Returns the concurrency to actually use. Every probe failure leaves the run
+    exactly as it was: a server that will not describe itself is a reason to
+    skip the check, never a reason to refuse work that would have succeeded.
+    """
+    asked = int(settings["LLM_CONCURRENCY"])
+    reply = int(settings["LLM_MAX_REPLY_TOKENS"])
+
+    override = int(settings["LLAMA_CTX"])
+    budget = client.slot_budget()
+    if budget is None and override <= 0:
+        log.debug("the llama endpoint would not report its slots; "
+                  "skipping the context check (set LLAMA_CTX to check anyway)")
+        return asked
+    if budget is None:
+        n_ctx, slots = override, asked
+        log.debug(f"the llama endpoint would not report its slots; using "
+                  f"LLAMA_CTX={override}")
+    else:
+        n_ctx, slots = budget
+        if override > 0 and override != n_ctx:
+            # The server was asked and answered. Saying so beats letting a
+            # stale override quietly decide the run.
+            log.warn(f"LLAMA_CTX is {override} but the server reports "
+                     f"{n_ctx} per slot; using the server's number")
+            n_ctx = min(override, n_ctx)
+
+    # The real prompt for the widest planned window, tokenised by the server
+    # that will have to hold it. A guess at chars-per-token would be a guess
+    # about the tokenizer of whichever model happens to be loaded.
+    sample = _widest_window_prompt(work, meta, settings, kinds, limits)
+    if sample is None:
+        log.debug("no transcript to size a window from; skipping the context check")
+        return max(1, min(asked, slots))
+    window = client.count_tokens(sample)
+    if window is None:
+        log.debug("the llama endpoint would not tokenise a sample window; "
+                  "skipping the context check")
+        return max(1, min(asked, slots))
+
+    fit = llm.plan_fit(n_ctx, slots, window, reply, asked)
+    if not fit["fits"]:
+        raise StageError(
+            f"a {settings['LLM_CHUNK_WORDS']}-word window is {window} tokens "
+            f"and LLM_MAX_REPLY_TOKENS reserves {reply}, which is "
+            f"{fit['needed']} against the {n_ctx} this server gives a slot. "
+            "llama.cpp truncates rather than refusing, so the run would judge "
+            "each window on part of itself and report suspiciously few edits. "
+            "Lower LLM_CHUNK_WORDS or LLM_MAX_REPLY_TOKENS, or give the server "
+            f"more context ({slots} slot(s) share it).{resume}")
+    if fit["capped"]:
+        log.warn(f"LLM_CONCURRENCY is {asked} but the server has {slots} "
+                 f"slot(s); using {fit['concurrency']}. Above the slot count "
+                 "the surplus queues inside the server and the run only looks "
+                 "slow.")
+    if fit["tight"]:
+        log.warn(f"a window needs {fit['needed']} of the {n_ctx} tokens a slot "
+                 f"has ({fit['headroom']} spare). It fits, but a denser "
+                 "transcript may not.")
+    else:
+        log.debug(f"window {window} tokens + {reply} reply against {n_ctx} "
+                  f"per slot, {slots} slot(s)")
+    return fit["concurrency"]
+
+
+def _widest_window_prompt(work, meta, settings, kinds, limits):
+    """The real prompt for the first full-size window, or None if there is none.
+
+    Built from a transcript rather than from filler text because the token
+    count is the point: how a window tokenises depends on the words in it.
+    """
+    chunk_words = int(settings["LLM_CHUNK_WORDS"])
+    for track in meta["tracks"]:
+        path = os.path.join(work, "words", f"{track['participant']}.words.json")
+        if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+            continue
+        try:
+            words = read_json(path)["words"]
+        except Exception:
+            continue
+        if not words:
+            continue
+        chunks = llm.plan_chunks(len(words), chunk_words, 0)
+        # The widest window, which is every window but possibly the last.
+        first, last = max(chunks, key=lambda c: c[1] - c[0])
+        return llm.build_prompt(words, first, last, kinds, limits["max_words"])
+    return None
+
+
 def stage_detect(work: str, settings, log, api_key=None, resume_hint: str = "",
                  ready_timeout: float = 60.0) -> None:
     """Ask the model which stretches of each transcript are disfluencies.
@@ -874,6 +973,8 @@ def stage_detect(work: str, settings, log, api_key=None, resume_hint: str = "",
         "max_seconds": float(settings["LLM_MAX_EDIT_SECONDS"]),
         "min_confidence": float(settings["LLM_MIN_CONFIDENCE"]),
     }
+    concurrency = _preflight_context(
+        client, settings, log, work, meta, kinds, limits, resume)
     total = len(meta["tracks"])
     failed = 0
 
@@ -902,7 +1003,7 @@ def stage_detect(work: str, settings, log, api_key=None, resume_hint: str = "",
                 audit_path=os.path.join(work, "llm", f"{participant}.audit.jsonl"),
                 on_progress=lambda done, count, name=participant: log.progress(
                     done, count, name),
-                concurrency=int(settings["LLM_CONCURRENCY"]),
+                concurrency=concurrency,
             )
         except llm.AuthRejected:
             raise StageError("the LLM endpoint refused our credentials. Fix the "

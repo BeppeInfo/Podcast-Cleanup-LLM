@@ -228,6 +228,37 @@ class TestTranscriptParsing(unittest.TestCase):
         self.assertEqual(tr.neighbour_gaps(words, 0, 2), (0.0, 0.0))
 
 
+class TestPlanFit(unittest.TestCase):
+    """The arithmetic behind the context preflight, without a server."""
+
+    def test_a_window_and_its_reply_must_both_fit(self):
+        # The reply is reserved, not hoped for: a prompt that fits on its own
+        # still truncates once the model starts generating into the same slot.
+        self.assertTrue(llm.plan_fit(8192, 1, 4334, 2048, 1)["fits"])
+        self.assertFalse(llm.plan_fit(8192, 1, 7000, 2048, 1)["fits"])
+
+    def test_concurrency_is_capped_at_the_slot_count_never_raised(self):
+        self.assertEqual(llm.plan_fit(65536, 2, 4334, 2048, 8)["concurrency"], 2)
+        self.assertTrue(llm.plan_fit(65536, 2, 4334, 2048, 8)["capped"])
+        # Fewer than the slots available is a choice, not a mistake.
+        self.assertEqual(llm.plan_fit(65536, 4, 4334, 2048, 1)["concurrency"], 1)
+        self.assertFalse(llm.plan_fit(65536, 4, 4334, 2048, 1)["capped"])
+
+    def test_concurrency_never_falls_below_one(self):
+        self.assertEqual(llm.plan_fit(65536, 0, 4334, 2048, 4)["concurrency"], 1)
+
+    def test_a_window_near_the_ceiling_fits_but_is_flagged(self):
+        # 8048 of 8192: it fits, and it fits by so little that a denser
+        # transcript would not. Worth saying out loud rather than refusing.
+        tight = llm.plan_fit(8192, 1, 6000, 2048, 1)
+        self.assertTrue(tight["fits"])
+        self.assertTrue(tight["tight"])
+        roomy = llm.plan_fit(65536, 1, 4334, 2048, 1)
+        self.assertTrue(roomy["fits"])
+        self.assertFalse(roomy["tight"])
+        self.assertEqual(roomy["headroom"], 65536 - 4334 - 2048)
+
+
 class TestLlmValidation(unittest.TestCase):
     def setUp(self):
         self.words = [
@@ -2033,11 +2064,20 @@ class TestPipelineDetectStage(unittest.TestCase):
         def check_schema_support(self):
             return None
 
-    def _run(self, root, log, detect, settings=None):
+        # A server that will not describe itself, which is the case the
+        # preflight has to survive: it skips the context check rather than
+        # refusing a run that would have worked.
+        def slot_budget(self):
+            return None
+
+        def count_tokens(self, text):
+            return None
+
+    def _run(self, root, log, detect, settings=None, client=None):
         values = cfg.defaults()
         values.update(settings or {})
         values["LLAMA_ENDPOINT"] = "http://stub"
-        with unittest.mock.patch.object(llm, "LlamaClient", self._Client), \
+        with unittest.mock.patch.object(llm, "LlamaClient", client or self._Client), \
                 unittest.mock.patch.object(llm, "detect", detect):
             pipeline.stage_detect(root, values, log, resume_hint=self.HINT)
 
@@ -2102,6 +2142,54 @@ class TestPipelineDetectStage(unittest.TestCase):
             raise AssertionError("should not be called")
         self._run(root, log, detect)
         self.assertIn("no transcript for alice", buf.getvalue())
+
+    def _describing_client(self, n_ctx, slots, window):
+        """A server that answers the preflight probes with fixed numbers."""
+        outer = self._Client
+        class _Describing(outer):
+            def slot_budget(self):
+                return (n_ctx, slots)
+            def count_tokens(self, text):
+                return window
+        return _Describing
+
+    def test_a_window_too_big_for_a_slot_ends_the_run_before_the_episode(self):
+        """Truncation is silent, so it has to be refused rather than survived."""
+        root, (log, buf) = self._work(), self._log()
+        def detect(*a, **k):
+            raise AssertionError("should not be called")
+        client = self._describing_client(n_ctx=4096, slots=1, window=8000)
+        with self.assertRaises(pipeline.StageError) as caught:
+            self._run(root, log, detect, client=client)
+        message = str(caught.exception)
+        self.assertIn("8000", message)          # what a window costs
+        self.assertIn("4096", message)          # what a slot has
+        self.assertIn("LLM_CHUNK_WORDS", message)   # what to turn down
+        self.assertIn(self.HINT, message)           # and how to resume
+
+    def test_concurrency_is_capped_at_the_slot_count(self):
+        root, (log, buf) = self._work(), self._log()
+        seen = {}
+        def detect(client, parsed, **k):
+            seen["concurrency"] = k["concurrency"]
+            return {"participant": parsed["participant"], "edits": [],
+                    "rejected_count": 0, "chunks": 1, "chunk_failures": 0}
+        client = self._describing_client(n_ctx=65536, slots=2, window=4334)
+        self._run(root, log, detect, settings={"LLM_CONCURRENCY": "8"},
+                  client=client)
+        self.assertEqual(seen["concurrency"], 2)
+        self.assertIn("2 slot(s)", buf.getvalue())
+
+    def test_a_server_that_will_not_describe_itself_is_left_alone(self):
+        """A probe that cannot answer must not refuse work that would succeed."""
+        root, (log, _) = self._work(), self._log()
+        seen = {}
+        def detect(client, parsed, **k):
+            seen["concurrency"] = k["concurrency"]
+            return {"participant": parsed["participant"], "edits": [],
+                    "rejected_count": 0, "chunks": 1, "chunk_failures": 0}
+        self._run(root, log, detect, settings={"LLM_CONCURRENCY": "3"})
+        self.assertEqual(seen["concurrency"], 3)
 
     def test_an_unknown_edit_kind_is_refused_by_name(self):
         root, (log, _) = self._work(), self._log()

@@ -225,12 +225,16 @@ LLAMA_API_KEY=""
 #LLAMA_API_KEY_FILE="/etc/podcast-cleanup/llama.key"
 
 
-# The server's own -c governs the context, and nothing here can check it agrees
-# with LLM_CHUNK_WORDS any more. Worth sizing by hand: at LLM_CHUNK_WORDS=350 a
-# request is ~3.3k prompt tokens plus whatever LLM_MAX_REPLY_TOKENS reserves, so
-# a slot needs about 6k. llama-server divides -c among its --parallel slots
-# unless given --kv-unified, so -c 8192 --parallel 4 leaves 2048 each and
-# truncates — silently, showing up only as a track with suspiciously few edits.
+# The server's own -c governs the context, and the detect stage checks it for
+# you. Before the episode it asks /slots how much context a *slot* has — the
+# number already divided, so none of llama.cpp's own division rules have to be
+# reproduced here — tokenises a real window against that server, and refuses
+# the run if the window plus LLM_MAX_REPLY_TOKENS would not fit. At
+# LLM_CHUNK_WORDS=350 a window measures ~3.1k tokens, so a slot needs about 6k.
+#
+# That check is what stands between you and the silent failure: -c 8192
+# --parallel 4 leaves 2048 each and llama-server truncates rather than
+# refusing, which shows up only as a track with suspiciously few edits.
 # See "Running the servers" in the README.
 
 LLAMA_REQUEST_TIMEOUT="600"
@@ -275,17 +279,27 @@ LLM_CHECK_SCHEMA="1"
 # is pure throughput: at 1 the server decodes at batch size 1, which is bound by
 # memory bandwidth and leaves most of a CPU idle however many cores it has.
 #
-# It has to agree with the server's slot count, because nothing can detect a
-# mismatch: too high and the surplus just queues inside the server, invisibly.
-#   - a server this script starts gets --parallel from this value, unless
-#     LLAMA_EXTRA_ARGS already pins one with -np
-#   - with LLAMA_ENDPOINT, set this to the -np that server was launched with
+# This is now a ceiling, not a claim: the detect stage asks the server how many
+# slots it has and caps this at that number, saying so when it does. Set it
+# higher and you get the slot count; there is no way to overshoot into the
+# invisible queue inside the server any more.
 #
-# And raise LLAMA_CTX with it. Splitting the KV cache is the default once a slot
-# count is given, so -c is shared out among the slots and each window still has
-# to fit in its share. The detect stage checks and warns, but it can only do the
-# arithmetic for a server it starts itself.
+# Splitting the KV cache is the default once a slot count is given, so -c is
+# shared out among the slots and each window still has to fit in its share —
+# which is why the same probe reads the *per-slot* context and refuses a run
+# whose windows would not fit. See LLAMA_CTX for the server that will not
+# answer that probe.
 LLM_CONCURRENCY="1"
+
+# The context a slot has, for a server that will not report it. Leave at 0 and
+# it is asked directly — /slots gives n_ctx already divided among the slots,
+# which is both more accurate than this and impossible to leave stale.
+#
+# Only reach for it with a build started with --no-slots, or an endpoint that
+# answers completions but not /slots. Setting it when the server *does* answer
+# is not an override: the smaller of the two wins, and a disagreement is
+# reported rather than obeyed.
+LLAMA_CTX="0"
 
 # ------------------------------------------------------- silence definition --
 

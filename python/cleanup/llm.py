@@ -28,6 +28,7 @@ import concurrent.futures
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from . import transcript as tr
@@ -187,6 +188,36 @@ def plan_chunks(word_count: int, chunk_words: int, overlap: int):
     return chunks
 
 
+def plan_fit(n_ctx, slots, window_tokens, reply_tokens, concurrency) -> dict:
+    """Whether one window fits its slot, and how many may be in flight.
+
+    Split out as pure arithmetic so the decision can be tested without a
+    server. Two separate things come out of it:
+
+    - **Does a window fit.** A prompt plus the reply it is allowed to generate
+      has to fit the slot's context. Over it, llama.cpp truncates rather than
+      refusing, and a truncated prompt is a window judged on part of itself —
+      which surfaces only as a track that found suspiciously little.
+    - **How many may fly.** `LLM_CONCURRENCY` above the server's slot count is
+      not an error and cannot be felt: the surplus queues inside the server
+      where the client cannot see it, and the run merely looks slow. Capping it
+      at what the server actually has is the only way that becomes visible.
+    """
+    needed = window_tokens + reply_tokens
+    capped = max(1, min(int(concurrency), int(slots)))
+    return {
+        "needed": needed,
+        "n_ctx": int(n_ctx),
+        "fits": needed <= int(n_ctx),
+        "concurrency": capped,
+        "capped": capped != int(concurrency),
+        "headroom": int(n_ctx) - needed,
+        # Not an error, but worth saying: a window this close to the ceiling
+        # fits the sample it was measured on and may not fit a denser one.
+        "tight": needed > int(n_ctx) * 0.8,
+    }
+
+
 class AuthRejected(Exception):
     """The server refused our credentials. Retrying cannot help."""
 
@@ -320,6 +351,75 @@ class LlamaClient:
                 f"the llama endpoint refused the request (HTTP {exc.code})"
                 + (f": {detail}" if detail else "")
             ) from exc
+
+    def _get(self, path: str, timeout: float = 15.0) -> dict | list:
+        """A GET against the server, with the model named if we have one.
+
+        A llama.cpp router refuses /slots and /props outright without a model
+        in the query — "model name is missing from the request" — so the name
+        is not decoration here, it is what makes these endpoints answerable at
+        all on a multi-model server.
+        """
+        query = f"?model={urllib.parse.quote(self.model)}" if self.model else ""
+        request = urllib.request.Request(
+            f"{self.endpoint}{path}{query}", headers=self._headers()
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def slot_budget(self) -> tuple[int, int] | None:
+        """(context per slot, number of slots), straight from the server.
+
+        /slots reports `n_ctx` *already divided* among the slots, which is the
+        number a single window actually has to fit into. That is the whole
+        reason to ask rather than to read `-c` and `--parallel` off the launch
+        args and divide: whether the split happens at all depends on
+        --kv-unified and on whether the slot count was given explicitly, and
+        reproducing those rules here would be the very arithmetic this is meant
+        to stop anyone getting wrong.
+
+        None when the server will not say — a build started with --no-slots, a
+        router that cannot resolve the model, anything unrecognised. A probe
+        that cannot answer must never end a run that would otherwise work, so
+        every failure here is silent and the caller carries on unchecked.
+        """
+        try:
+            slots = self._get("/slots")
+        except Exception:
+            return None
+        if not isinstance(slots, list) or not slots:
+            return None
+        contexts = [
+            int(slot["n_ctx"])
+            for slot in slots
+            if isinstance(slot, dict) and isinstance(slot.get("n_ctx"), int)
+            and slot["n_ctx"] > 0
+        ]
+        if not contexts:
+            return None
+        # The smallest, not the first: a slot we cannot fit is a dropped chunk
+        # whichever one the server happens to hand us.
+        return min(contexts), len(slots)
+
+    def count_tokens(self, text: str) -> int | None:
+        """How many tokens the server makes of this text, or None if it won't say.
+
+        Worth a round trip rather than a chars-per-token guess because the
+        answer decides whether a run is refused, and because the server's own
+        usage accounting cannot be used for it: this build reports
+        `usage.prompt_tokens` as 806 for a window /tokenize measures at 4334,
+        so sizing anything on the completion response would be sizing on a
+        number that does not mean what it appears to.
+        """
+        payload: dict = {"content": text}
+        if self.model:
+            payload["model"] = self.model
+        try:
+            result = self._post("/tokenize", payload, timeout=60)
+        except Exception:
+            return None
+        tokens = result.get("tokens") if isinstance(result, dict) else None
+        return len(tokens) if isinstance(tokens, list) else None
 
     def available_models(self) -> list[str]:
         """Model ids the server admits to, for naming them in an error."""

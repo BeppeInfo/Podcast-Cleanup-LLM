@@ -112,6 +112,10 @@ SETTINGS: dict[str, tuple] = {
     "LLM_API": ("chat", CHOICE, ("chat", "completion")),
     "LLAMA_MODEL_NAME": ("", STR, None),
     "LLM_MAX_REPLY_TOKENS": ("2048", INT, None),
+    # Context per slot, when the server will not say. 0 asks it: /slots reports
+    # n_ctx already divided among the slots, which is what a window has to fit
+    # into. Only needed for a build that does not answer that probe.
+    "LLAMA_CTX": ("0", INT, None),
     "LLM_CHECK_SCHEMA": ("1", FLAG, None),
     "LLM_CONCURRENCY": ("1", INT, None),
 

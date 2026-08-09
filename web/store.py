@@ -74,7 +74,10 @@ GROUPS = [
         ("LLM_CHUNK_WORDS", "Words per request", ""),
         ("LLM_CHUNK_OVERLAP", "Overlap between requests", "words"),
         ("LLM_CONCURRENCY", "Requests in flight",
-         "must match the server's --parallel; speed only"),
+         "capped at the slot count the server reports; speed only"),
+        ("LLAMA_CTX", "Context per slot",
+         "0 asks the server, which is better; set it only for one that "
+         "will not say"),
     ]),
     Group("transcribe", "Transcription",
           "What reaches the detector at all — see the note below the prompt.", [
