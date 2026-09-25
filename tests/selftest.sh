@@ -1235,6 +1235,64 @@ if wait_for_port_file "$L14"; then
 fi
 kill "$L14_PID" 2>/dev/null || true
 
+# ============================================================================
+printf '\n%sCase 15: silence-only, and nothing else%s\n' "$BOLD" "$RESET"
+# ============================================================================
+#
+# FULL_EDIT=0 with SILENCE_ONLY=level: no transcript, no LLM, no whisperx. The
+# fake whisperx is still on PYTHONPATH from the cases above; nothing imports it,
+# which is what "transcription never ran" below checks from the outside. Case
+# 2's episode again, because there the tone is exactly where the transcript
+# said speech was, so with SPEECH_PAD=0 the level scan's map is the same map
+# and the variant must cut exactly what case 2's full plan cut.
+
+CASE15="$SANDBOX/case15"
+build_episode ep002 "$CASE15/incoming" \
+    "$(windows_expr "$A2_SPEECH")" "$(windows_expr "$B2_SPEECH")" 30
+
+if FULL_EDIT=0 SILENCE_ONLY=level "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
+    --input "$CASE15/incoming" --output "$CASE15/output" --work "$CASE15/work" \
+    --config "$CONF" --no-llm --quiet --keep-work >"$SANDBOX/case15.stdout" 2>&1
+then
+    check "pipeline completed" true
+else
+    check "pipeline completed" false
+    fail_note "$(tail -n 25 "$SANDBOX/case15.stdout")"
+fi
+
+OUT15="$CASE15/output/ep002"
+PLAN15="$CASE15/work/ep002/silence-only/level/plan.json"
+check "both level tracks published" \
+    test -s "$OUT15/alice_silence-level.flac" -a -s "$OUT15/bob_silence-level.flac"
+check "its plan and report published" \
+    test -s "$OUT15/ep002_silence-level_plan.json" \
+        -a -s "$OUT15/ep002_silence-level_edit-report.txt"
+check "no full edit and no transcript" bash -c \
+    "[[ ! -e '$OUT15/alice.flac' && ! -e '$OUT15/ep002_transcript.json' ]]"
+check "transcription never ran" bash -c \
+    "[[ ! -d '$CASE15/work/ep002/words' ]] || [[ -z \"\$(ls -A '$CASE15/work/ep002/words')\" ]]"
+
+if [[ -f "$PLAN15" && -f "$PLAN2" ]]; then
+    check "it cuts what the transcript's map cut" python3 -c '
+import json, sys
+level, full = (json.load(open(path))["cuts"] for path in sys.argv[1:])
+spans = lambda cuts: [(c["start"], c["end"]) for c in cuts]
+if len(level) != len(full) or any(
+        abs(a - b) > 0.02 for x, y in zip(spans(level), spans(full))
+        for a, b in zip(x, y)):
+    print(f"level {spans(level)} against full {spans(full)}")
+    sys.exit(1)
+' "$PLAN15" "$PLAN2"
+fi
+
+if [[ -s "$OUT15/alice_silence-level.flac" && -s "$OUT15/bob_silence-level.flac" ]]; then
+    DUR15_A=$(duration_of "$OUT15/alice_silence-level.flac")
+    DUR15_B=$(duration_of "$OUT15/bob_silence-level.flac")
+    check "both tracks identically long" approx "$DUR15_A" "$DUR15_B" 0.0005
+    check "and as long as case 2's full edit" approx "$DUR15_A" "$DUR2_A" 0.03
+    fail_note "alice=${DUR15_A}s bob=${DUR15_B}s case2=${DUR2_A}s"
+fi
+
 
 if (( FAILURES == 0 )); then
     printf '%s✓ all %d checks passed%s\n\n' "$GREEN" "$CHECKS" "$RESET"

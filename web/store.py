@@ -63,6 +63,18 @@ GROUPS = [
         ("MAX_CUT_FRACTION", "Refuse a plan removing more than",
          "fraction of the episode; almost always a wrong threshold"),
     ]),
+    Group("silence_only", "Silence-only outputs",
+          "Extra renders cut on one detector's silence alone — no transcript, "
+          "no edits — published beside the full edit for comparison, as "
+          "<track>_silence-<method>. They use the Silence settings above.", [
+        ("SILENCE_ONLY", "Detectors",
+         "comma separated: level, pyannote, silero; empty for none"),
+        ("SILENCE_ONLY_THRESHOLD", "Level: silent below", "e.g. -45dB"),
+        ("SILENCE_ONLY_MIN_SILENCE", "Level: shortest silence", "seconds"),
+        ("FULL_EDIT", "Full edit",
+         "off produces only the silence-only outputs: no transcription and "
+         "no detector server"),
+    ]),
     Group("detect", "Disfluency detection",
           "What the model is asked to find, and how much of it to believe.", [
         ("LLM_ENABLE", "Enabled", "off means silence editing only"),

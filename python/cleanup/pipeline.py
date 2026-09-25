@@ -165,8 +165,11 @@ def build_meta(track_pairs, episode, ffprobe, resample_to, say=print):
             "aligned at sample 0 the cleanup will drift"
         )
     return meta
-ALL_STAGES = ("discover", "prepare", "transcribe", "detect", "plan",
-              "render", "finalize")
+ALL_STAGES = ("discover", "prepare", "silence-only", "transcribe", "detect",
+              "plan", "render", "finalize")
+
+# What FULL_EDIT=0 leaves out: everything that exists to make the full edit.
+FULL_EDIT_STAGES = ("transcribe", "detect", "plan", "render")
 
 
 class NothingToDo(Exception):
@@ -345,6 +348,28 @@ def run_episode(settings, log, stages, *, episode_override: str = "",
                     stage_prepare(episode.work, settings, log, ffmpeg=ffmpeg)
                     episode.load_tracks()
                 log.stage_end(f"{len(episode.tracks)} tracks decoded")
+
+            elif stage == "silence-only":
+                methods = cfg.silence_only_methods(settings)
+                if not methods:
+                    log.stage_skip("silence-only", "SILENCE_ONLY is empty")
+                    state_mark(episode, stage, dry_run)
+                    continue
+                log.stage_begin("silence-only",
+                                f"cutting silence alone: {', '.join(methods)}")
+                if dry_run:
+                    log.info(f"would render {len(methods)} silence-only "
+                             f"variants into {episode.staging}")
+                else:
+                    stage_silence_only(episode.work, episode.staging, settings,
+                                       log, ffmpeg=ffmpeg, ffprobe=ffprobe,
+                                       force=force)
+                log.stage_end(f"{len(methods)} variants rendered and verified")
+
+            elif stage in FULL_EDIT_STAGES and settings.get("FULL_EDIT", "1") != "1":
+                log.stage_skip(stage, "FULL_EDIT=0")
+                state_mark(episode, stage, dry_run)
+                continue
 
             elif stage == "transcribe":
                 log.stage_begin(
@@ -649,6 +674,128 @@ def stage_prepare(work: str, settings, log, ffmpeg: str = "ffmpeg") -> None:
     refresh_durations(work, log)
 
 
+def silence_only_dir(work: str, method: str) -> str:
+    """One variant's own work tree: its speech maps, plan, filters, prediction."""
+    return os.path.join(work, "silence-only", method)
+
+
+def silence_only_speech(method: str, work: str, meta, settings, log,
+                        ffmpeg: str, vad_loader=None) -> dict:
+    """{participant: speech spans} according to one detector, unpadded.
+
+    `level` is silencedetect, with its own threshold; the VADs are WhisperX's,
+    with the onset and offset transcription would hear through. Either way the
+    map is drawn over the prepared 16 kHz mono track, the same audio the
+    transcriber is given.
+    """
+    base = silence_only_dir(work, method)
+    spans: dict = {}
+    detector = None
+    if method != "level":
+        log.info(f"loading the {method} VAD on {settings['WHISPER_DEVICE']}")
+        try:
+            detector = wx.VoiceActivity(
+                method, device=settings["WHISPER_DEVICE"],
+                onset=float(settings["WHISPER_VAD_ONSET"]),
+                offset=float(settings["WHISPER_VAD_OFFSET"]),
+                loader=vad_loader)
+        except wx.WhisperXMissing as exc:
+            raise StageError(f"SILENCE_ONLY={method} needs whisperx: {exc}") from None
+
+    for track in meta["tracks"]:
+        participant = track["participant"]
+        wav = os.path.join(work, "prep", f"{participant}.wav")
+        if not (os.path.isfile(wav) and os.path.getsize(wav) > 0):
+            raise StageError(f"missing prepared track: {wav}")
+        duration = float(track["duration"])
+        if detector is None:
+            found = silencedetect(
+                ffmpeg, wav, settings["SILENCE_ONLY_THRESHOLD"],
+                settings["SILENCE_ONLY_MIN_SILENCE"], duration,
+                os.path.join(base, f"{participant}.silence.log"), log)
+            if found is None:
+                # Unlike the scan beside transcription, nothing else can stand
+                # in for this one: it is the whole of the variant's map.
+                raise StageError(f"could not scan {participant} for silence")
+        else:
+            found = [(start, min(end, duration))
+                     for start, end in detector.speech(wav) if start < duration]
+        spans[participant] = iv.normalize(found)
+        render.write_json(os.path.join(base, f"{participant}.speech.json"), {
+            "participant": participant,
+            "detector": method,
+            "duration": round(duration, 3),
+            "speech": [[round(s, 4), round(e, 4)] for s, e in spans[participant]],
+        })
+        log.raw(f"{method}: {participant} {len(spans[participant])} speech "
+                f"stretches, {iv.total(spans[participant]):.1f}s of {duration:.1f}s")
+    return spans
+
+
+def stage_silence_only(work: str, staging: str, settings, log,
+                       ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe",
+                       force: bool = False, vad_loader=None) -> list[str]:
+    """Plan and render each SILENCE_ONLY variant. Returns the variants done.
+
+    Each variant is the full edit with everything but silence taken away: one
+    detector's speech, padded by SPEECH_PAD, and cut by the same plan builder
+    with the same settings. No words, so no disfluency edits and no mutes, and
+    so no transcript to publish beside it. It runs before transcription, so its
+    outputs are staged however long the transcription then takes, and whether
+    it goes on to finish.
+
+    A variant's plan refuses exactly where the full one would, MAX_CUT_FRACTION
+    included, and stops the run. Refusing here costs a minute; it is also the
+    likeliest sign of a threshold that is wrong for these tracks, which is
+    better learned before the transcription than after it.
+    """
+    meta = read_json(os.path.join(work, "meta.json"))
+    params = plan_params(settings)
+    participants = [t["participant"] for t in meta["tracks"]]
+    durations = {t["participant"]: float(t["duration"]) for t in meta["tracks"]}
+    done = []
+
+    for method in cfg.silence_only_methods(settings):
+        base = silence_only_dir(work, method)
+        names = output_names(settings, method)
+        marker = os.path.join(work, "state", f"silence-only-{method}.ok")
+        staged = [os.path.join(staging, names(p)) for p in participants]
+        if os.path.isfile(marker) and all(os.path.isfile(p) for p in staged):
+            log.debug(f"silence-only {method} already rendered")
+            done.append(method)
+            continue
+        if os.path.exists(marker):
+            os.remove(marker)
+        os.makedirs(base, exist_ok=True)
+
+        spans = silence_only_speech(method, work, meta, settings, log, ffmpeg,
+                                    vad_loader=vad_loader)
+        speech = {p: iv.pad(spans.get(p, []), params["speech_pad"], 0.0, durations[p])
+                  for p in participants}
+        result = planner.build_plan(
+            meta, speech, {}, {p: [] for p in participants}, params,
+            detector=method)
+        render.write_json(os.path.join(base, "plan.json"), result)
+        report = planner.format_report(result)
+        with open(os.path.join(base, "edit-report.txt"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(report)
+        log.report(f"silence-only: {method}\n{report}")
+
+        blocking = result.get("blocking") or []
+        if blocking and not force:
+            raise StageError(
+                f"refusing the {method} silence-only output: " + "; ".join(blocking)
+                + " (override with --force, or leave it out of SILENCE_ONLY)")
+
+        describe_filters(write_filters(base, meta, result, settings), log)
+        render_tracks(work, base, staging, names, f"silence-only-{method}",
+                      settings, log, ffmpeg=ffmpeg, ffprobe=ffprobe)
+        open(marker, "w").close()
+        done.append(method)
+    return done
+
+
 def vad_options(settings) -> dict:
     """WhisperX's VAD knobs. Not the same two numbers as whisper-server's.
 
@@ -672,23 +819,17 @@ def scan_levels(work: str, participant: str, wav: str, duration: float,
     Returns None when it could not be done, which is a warning rather than a
     failure — the run continues with less to cross-check against.
     """
-    scan_log = os.path.join(work, "asr", f"{participant}.silence.log")
-    target = os.path.join(work, "asr", f"{participant}.loud.json")
     threshold = settings["SPLIT_SILENCE_THRESHOLD"]
-    argv = [
-        ffmpeg, "-nostdin", "-v", "info", "-i", wav,
-        "-af", f"silencedetect=noise={threshold}:d={settings['SPLIT_MIN_SILENCE']}",
-        "-f", "null", "-",
-    ]
-    if proc.run_to_file(argv, log, scan_log) != 0:
+    loud = silencedetect(
+        ffmpeg, wav, threshold, settings["SPLIT_MIN_SILENCE"], duration,
+        os.path.join(work, "asr", f"{participant}.silence.log"), log)
+    if loud is None:
         log.warn(f"could not scan {participant} for quiet spots: chunk boundaries "
                  "may land mid-word, and nothing will cross-check its transcript "
                  "against its audio")
         return None
 
-    with open(scan_log, encoding="utf-8", errors="replace") as handle:
-        loud = silence.parse_silencedetect(handle.read(), duration)
-    render.write_json(target, {
+    render.write_json(os.path.join(work, "asr", f"{participant}.loud.json"), {
         "participant": participant,
         "duration": round(duration, 3),
         "threshold": threshold,
@@ -696,6 +837,25 @@ def scan_levels(work: str, participant: str, wav: str, duration: float,
     })
     log.raw(f"{len(loud)} non-silent stretches, {iv.total(loud):.1f}s of "
             f"{duration:.1f}s above the threshold")
+    return loud
+
+
+def silencedetect(ffmpeg: str, wav: str, threshold: str, min_silence,
+                  duration: float, scan_log: str, log):
+    """ffmpeg's silencedetect over one file, as non-silent stretches.
+
+    None when ffmpeg failed; what that costs depends on who asked, so saying so
+    is left to them. The raw log is kept at `scan_log` either way.
+    """
+    argv = [
+        ffmpeg, "-nostdin", "-v", "info", "-i", wav,
+        "-af", f"silencedetect=noise={threshold}:d={min_silence}",
+        "-f", "null", "-",
+    ]
+    if proc.run_to_file(argv, log, scan_log) != 0:
+        return None
+    with open(scan_log, encoding="utf-8", errors="replace") as handle:
+        loud = silence.parse_silencedetect(handle.read(), duration)
     return [tuple(span) for span in loud]
 
 
@@ -1109,25 +1269,51 @@ def verify_durations(expectations, actual, tolerance: float, log) -> None:
 def stage_render(work: str, staging: str, settings, log, ffmpeg: str = "ffmpeg",
                  ffprobe: str = "ffprobe") -> None:
     """Render every track through its filtergraph, then check the lengths."""
-    plan_path = os.path.join(work, "plan.json")
+    render_tracks(work, work, staging, output_names(settings), "render",
+                  settings, log, ffmpeg=ffmpeg, ffprobe=ffprobe)
+
+
+def output_names(settings, variant: str = ""):
+    """participant -> published filename, for the edit or one variant.
+
+    A function of the participant rather than a dict, because the names are
+    needed before and after meta.json has been read, by stages that each know
+    the participants their own way.
+    """
+    suffix, extension = settings["OUTPUT_SUFFIX"], settings["OUTPUT_EXT"]
+    tail = f"_silence-{variant}" if variant else ""
+    return lambda participant: f"{participant}{suffix}{tail}.{extension}"
+
+
+def render_tracks(work: str, base: str, staging: str, name_for, marker: str,
+                  settings, log, ffmpeg: str = "ffmpeg",
+                  ffprobe: str = "ffprobe") -> None:
+    """Render one plan's tracks into staging, then check their lengths.
+
+    `base` holds that plan — plan.json, render/ and expected.json, as the plan
+    stage or a silence-only variant wrote them — while meta.json and the state
+    markers are the episode's, in `work`. `marker` prefixes the per-track state
+    markers so two plans' renders never answer for each other.
+    """
+    plan_path = os.path.join(base, "plan.json")
     if not (os.path.isfile(plan_path) and os.path.getsize(plan_path) > 0):
-        raise StageError("no plan.json; run the plan stage first")
+        raise StageError("no plan.json; run the plan stage first"
+                         if base == work else f"no plan.json in {base}")
 
     meta = read_json(os.path.join(work, "meta.json"))
     state = os.path.join(work, "state")
     os.makedirs(staging, exist_ok=True)
     jobs = max(1, int(settings["FFMPEG_JOBS"]))
-    suffix, extension = settings["OUTPUT_SUFFIX"], settings["OUTPUT_EXT"]
 
     jobs_to_run = []
     for track in meta["tracks"]:
         participant = track["participant"]
-        target = os.path.join(staging, f"{participant}{suffix}.{extension}")
-        marker = os.path.join(state, f"render-{participant}.ok")
-        filter_path = os.path.join(work, "render", f"{participant}.filter")
-        if os.path.exists(marker):
-            os.remove(marker)
-        jobs_to_run.append((track, target, marker, filter_path))
+        target = os.path.join(staging, name_for(participant))
+        marker_path = os.path.join(state, f"{marker}-{participant}.ok")
+        filter_path = os.path.join(base, "render", f"{participant}.filter")
+        if os.path.exists(marker_path):
+            os.remove(marker_path)
+        jobs_to_run.append((track, target, marker_path, filter_path))
 
     def render_one(item) -> tuple[str, int]:
         track, target, marker, filter_path = item
@@ -1139,7 +1325,7 @@ def stage_render(work: str, staging: str, settings, log, ffmpeg: str = "ffmpeg",
             # No edits and no resampling. Copying beats re-encoding, but only
             # when the file is already in the format being asked for.
             same = (track.get("codec") == settings["OUTPUT_CODEC"]
-                    and source.rpartition(".")[2] == extension)
+                    and source.rpartition(".")[2] == settings["OUTPUT_EXT"])
             if same:
                 log.info(f"{participant} needs no edits and is already "
                          f"{settings['OUTPUT_CODEC']}, copying it through")
@@ -1187,12 +1373,12 @@ def stage_render(work: str, staging: str, settings, log, ffmpeg: str = "ffmpeg",
     actual = {}
     for track in meta["tracks"]:
         participant = track["participant"]
-        target = os.path.join(staging, f"{participant}{suffix}.{extension}")
+        target = os.path.join(staging, name_for(participant))
         if not (os.path.isfile(target) and os.path.getsize(target) > 0):
             raise StageError(f"rendered file is missing or empty: {target}")
         actual[participant] = probe_duration(ffprobe, target)
 
-    verify_durations(read_json(os.path.join(work, "expected.json"))["tracks"],
+    verify_durations(read_json(os.path.join(base, "expected.json"))["tracks"],
                      actual, float(settings["DURATION_TOLERANCE"]), log)
 
 
@@ -1246,12 +1432,17 @@ def stage_finalize(work: str, out_dir: str, staging: str, settings, log,
 
     Returns the run log's path, which moves when the work directory goes.
     """
-    build_transcript(work, episode_id, log)
+    full = settings.get("FULL_EDIT", "1") == "1"
+    variants = cfg.silence_only_methods(settings)
+    # There is no transcript without the full edit: the variants never
+    # transcribe, and their cuts are silence, which removes no words anyway.
+    if full:
+        build_transcript(work, episode_id, log)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
 
-    suffix, extension = settings["OUTPUT_SUFFIX"], settings["OUTPUT_EXT"]
-    for participant in sorted(sources):
-        name = f"{participant}{suffix}.{extension}"
+    makers = ([output_names(settings)] if full else []) + [
+        output_names(settings, method) for method in variants]
+    for name in [make(p) for make in makers for p in sorted(sources)]:
         staged = os.path.join(staging, name)
         final = os.path.join(out_dir, name)
         try:
@@ -1266,7 +1457,9 @@ def stage_finalize(work: str, out_dir: str, staging: str, settings, log,
     except OSError:
         pass
 
-    for entry in SIDECARS:
+    # Only the full edit's own: a plan.json left by an earlier full run of this
+    # episode is not a description of what is being published now.
+    for entry in (SIDECARS if full else ()):
         source_name, target_name = (
             (entry, entry) if isinstance(entry, str) else entry)
         source = os.path.join(work, source_name.format(episode=episode_id))
@@ -1274,6 +1467,12 @@ def stage_finalize(work: str, out_dir: str, staging: str, settings, log,
             continue
         shutil.copyfile(source, os.path.join(
             out_dir, target_name.format(episode=episode_id)))
+    for method in variants:
+        for leaf in ("plan.json", "edit-report.txt"):
+            source = os.path.join(silence_only_dir(work, method), leaf)
+            if os.path.isfile(source):
+                shutil.copyfile(source, os.path.join(
+                    out_dir, f"{episode_id}_silence-{method}_{leaf}"))
 
     # Logs outlive everything else, by design.
     published_log = os.path.join(out_dir, "logs", "run.log")

@@ -34,6 +34,10 @@ from . import transcript as tr
 # A mute fragment left over after subtracting cuts is not worth rendering.
 MIN_MUTE = 0.02
 
+# The `detector` of a plan whose speech map came from the words. Every other
+# value is a silence-only plan, named for the detector that drew its map.
+TRANSCRIPT = "transcript"
+
 
 def _silence_cuts(gaps, duration, params) -> list[dict]:
     """Shorten each qualifying silent gap, rather than removing it outright."""
@@ -226,7 +230,8 @@ def looping_words(participants, words) -> dict:
     return looping
 
 
-def build_plan(meta, speech, edits, words, params, loud=None) -> dict:
+def build_plan(meta, speech, edits, words, params, loud=None,
+               detector: str = TRANSCRIPT) -> dict:
     """Assemble the plan. `speech`/`edits`/`words`/`loud` are keyed by participant.
 
     `speech` comes from `transcript.speech_from_words` — the padded union of the
@@ -237,6 +242,13 @@ def build_plan(meta, speech, edits, words, params, loud=None) -> dict:
     `loud` is the level scan, and is the exception: the one input that does not
     come from Whisper. It is not used to decide anything, only to refuse — see
     `untranscribed_audio`.
+
+    `detector` names where `speech` came from. Anything but TRANSCRIPT is a
+    silence-only plan: the map is one detector's padded speech, and it arrives
+    with no words, no edits and no level scan, so the transcript checks below
+    have nothing to look at and stay quiet. Going through here rather than a
+    second builder is the point — a comparison is only fair if the silence it
+    compares was cut by the same arithmetic.
     """
     duration = float(meta["duration"])
     participants = [track["participant"] for track in meta["tracks"]]
@@ -248,11 +260,17 @@ def build_plan(meta, speech, edits, words, params, loud=None) -> dict:
     mutes: dict[str, list[dict]] = {p: [] for p in participants}
     warnings: list[str] = []
 
-    if not speech_all:
+    if not speech_all and detector == TRANSCRIPT:
         warnings.append(
             "no track transcribed a single word, so the whole episode reads as "
             "silence — check that the whisper endpoint returned anything at all "
             "before trusting this plan"
+        )
+    elif not speech_all:
+        warnings.append(
+            f"the {detector} detector found no speech on any track, so the whole "
+            "episode reads as silence — check its threshold before trusting this "
+            "plan"
         )
 
     # Classify every LLM finding as a global cut or a single-track mute.
@@ -439,6 +457,7 @@ def build_plan(meta, speech, edits, words, params, loud=None) -> dict:
 
     return {
         "episode_id": meta["episode_id"],
+        "detector": detector,
         "duration": round(duration, 3),
         "participants": participants,
         "params": params,
@@ -464,9 +483,16 @@ def build_plan(meta, speech, edits, words, params, loud=None) -> dict:
 def format_report(plan) -> str:
     """A readable summary of what the plan does, kept alongside the outputs."""
     stats = plan["stats"]
+    # Older plans predate the field, and were all built from a transcript.
+    detector = plan.get("detector", TRANSCRIPT)
     lines = [
         f"Episode:          {plan['episode_id']}",
         f"Participants:     {', '.join(plan['participants'])}",
+    ]
+    if detector != TRANSCRIPT:
+        lines.append(f"Speech map:       {detector} only — silence cuts, no "
+                     "transcript, no edits")
+    lines += [
         f"Original length:  {_hms(stats['duration'])}",
         f"Cleaned length:   {_hms(stats['output_duration'])}",
         f"Removed:          {_hms(stats['removed'])} "
@@ -479,6 +505,9 @@ def format_report(plan) -> str:
         "Per participant:",
     ]
     for participant, values in stats["per_participant"].items():
+        if detector != TRANSCRIPT:
+            lines.append(f"  {participant:<16} speech {_hms(values['speech'])}")
+            continue
         lines.append(
             f"  {participant:<16} speech {_hms(values['speech'])}  "
             f"words {values['words']:<6} edits found {values['edits_found']:<4} "

@@ -24,6 +24,8 @@ run the CLI without installing anything, and only transcription breaks that.
 
 from __future__ import annotations
 
+import types
+
 DEFAULT_MODEL = "small"
 DEFAULT_COMPUTE_TYPE = "int8"
 DEFAULT_BATCH_SIZE = 8
@@ -49,6 +51,73 @@ def _load_whisperx():
             "whisperx here."
         ) from exc
     return whisperx
+
+
+def _load_vad_kit():
+    """What VoiceActivity needs from whisperx, gathered in one replaceable place.
+
+    Four names from three modules, and torch for the device. Returned as a
+    namespace so a test can hand over the same shape with nothing behind it.
+    """
+    whisperx = _load_whisperx()
+    import torch
+    from whisperx.vads import Pyannote, Silero
+    from whisperx.vads.pyannote import Binarize
+    return types.SimpleNamespace(
+        load_audio=whisperx.load_audio, Pyannote=Pyannote, Silero=Silero,
+        Binarize=Binarize, device=torch.device)
+
+
+class VoiceActivity:
+    """WhisperX's VAD on its own: where it hears speech, and nothing else.
+
+    Inside `transcribe` the VAD is two steps. The model scores the audio, and
+    `merge_chunks` turns the scores into speech turns and then packs those turns
+    into ~30s windows for batched decoding. The turns are the speech map; the
+    windows are far too coarse to cut on. So this repeats the first step exactly
+    as WhisperX does it — same classes, same onset and offset — and stops before
+    the packing.
+
+    pyannote's model returns frame scores, which `Binarize` thresholds into
+    turns. Silero returns segments already, thresholded at the onset alone, as
+    it is inside WhisperX; it has no offset to honour.
+
+    Loads no Whisper model and no aligner, which is what lets a silence-only
+    output exist before transcription has started.
+    """
+
+    SAMPLE_RATE = 16000
+    # Silero caps a segment at this many seconds, as WhisperX's does. A long
+    # turn arrives in pieces that touch, and the union puts them back together.
+    CHUNK_SECONDS = 30
+
+    def __init__(self, method: str, device: str = "cpu", onset: float = 0.5,
+                 offset: float = 0.363, loader=None):
+        if method not in ("pyannote", "silero"):
+            raise ValueError(f"no VAD called '{method}'")
+        self.method = method
+        self.onset = onset
+        self.offset = offset
+        self._kit = (loader or _load_vad_kit)()
+        if method == "pyannote":
+            self._model = self._kit.Pyannote(
+                self._kit.device(device), token=None,
+                vad_onset=onset, vad_offset=offset)
+        else:
+            self._model = self._kit.Silero(
+                vad_onset=onset, chunk_size=self.CHUNK_SECONDS)
+
+    def speech(self, wav_path: str) -> list[tuple[float, float]]:
+        """Speech turns in seconds, sorted, as the detector drew them."""
+        audio = self._kit.load_audio(wav_path)
+        found = self._model({"waveform": self._model.preprocess_audio(audio),
+                             "sample_rate": self.SAMPLE_RATE})
+        if self.method == "pyannote":
+            turns = self._kit.Binarize(onset=self.onset, offset=self.offset)(found)
+            spans = [(float(t.start), float(t.end)) for t in turns.get_timeline()]
+        else:
+            spans = [(float(s.start), float(s.end)) for s in found]
+        return sorted(span for span in spans if span[1] > span[0])
 
 
 def fill_missing_timings(words, start: float, end: float) -> list[dict]:

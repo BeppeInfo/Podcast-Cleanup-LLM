@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 import unittest.mock
 import wave
@@ -3471,6 +3472,340 @@ class TestFinalTranscript(unittest.TestCase):
         self.assertIn("00:00:0", srt)
         text = render.transcript_to_text(result)
         self.assertIn("think so", text)
+
+
+# --- silence-only outputs -----------------------------------------------------
+
+
+class TestSilenceOnlyConfig(unittest.TestCase):
+    def _valid(self, **over):
+        values = cfg.defaults()
+        values.update(over)
+        cfg.validate(values)
+        return values
+
+    def test_methods_keep_their_order_and_appear_once(self):
+        values = self._valid(SILENCE_ONLY=" silero, level ,silero,,pyannote")
+        self.assertEqual(cfg.silence_only_methods(values),
+                         ["silero", "level", "pyannote"])
+
+    def test_nothing_is_asked_for_by_default(self):
+        self.assertEqual(cfg.silence_only_methods(self._valid()), [])
+
+    def test_an_unknown_method_is_named(self):
+        with self.assertRaises(cfg.ConfigError) as caught:
+            self._valid(SILENCE_ONLY="level,webrtc")
+        self.assertIn("'webrtc'", str(caught.exception))
+
+    def test_no_full_edit_and_no_variants_would_produce_nothing(self):
+        with self.assertRaises(cfg.ConfigError) as caught:
+            self._valid(FULL_EDIT="0")
+        self.assertIn("would produce nothing", str(caught.exception))
+        self._valid(FULL_EDIT="0", SILENCE_ONLY="level")
+
+
+class TestSilenceOnlyPlan(unittest.TestCase):
+    def test_the_detector_is_recorded_and_reported(self):
+        speech = {"a": [(0.0, 5.0), (12.0, 20.0)]}
+        result = planner.build_plan(_meta(["a"], 20.0), speech, {}, {"a": []},
+                                    PARAMS, detector="pyannote")
+        self.assertEqual(result["detector"], "pyannote")
+        report = planner.format_report(result)
+        self.assertIn("Speech map:       pyannote only", report)
+        # No words were ever asked for, so the report does not count zero of them.
+        self.assertNotIn("words 0", report)
+
+    def test_it_cuts_exactly_what_the_full_plan_would_from_the_same_map(self):
+        speech = {"a": [(0.0, 5.0), (12.0, 20.0)], "b": [(3.0, 6.0)]}
+        full = planner.build_plan(_meta(["a", "b"], 20.0), speech, {}, {}, PARAMS)
+        only = planner.build_plan(_meta(["a", "b"], 20.0), speech, {},
+                                  {"a": [], "b": []}, PARAMS, detector="level")
+        self.assertEqual(full["cuts"], only["cuts"])
+        self.assertEqual(full["keep"], only["keep"])
+
+    def test_no_speech_at_all_blames_the_detector_not_whisper(self):
+        result = planner.build_plan(_meta(["a"], 20.0), {"a": []}, {}, {"a": []},
+                                    PARAMS, detector="silero")
+        text = " ".join(result["warnings"])
+        self.assertIn("silero detector found no speech", text)
+        self.assertNotIn("whisper", text)
+
+    def test_a_plan_from_before_the_field_reads_as_a_transcript_plan(self):
+        result = planner.build_plan(_meta(["a"], 20.0), {"a": [(0.0, 20.0)]},
+                                    {}, {}, PARAMS)
+        del result["detector"]
+        self.assertNotIn("Speech map:", planner.format_report(result))
+
+
+class _FakeVadKit:
+    """whisperx's VAD classes with nothing behind them.
+
+    `spans` maps a wav's basename to the speech turns its model "finds". The
+    classes record how they were built and called, so a test can check the
+    onset and offset reach the model and that no chunk merging happens.
+    """
+
+    def __init__(self, spans):
+        kit = self
+        self.spans = spans
+        self.built = []
+        self.binarized = []
+        self.loaded = []
+
+        def turns(audio):
+            return [types.SimpleNamespace(start=s, end=e)
+                    for s, e in kit.spans.get(os.path.basename(audio), [])]
+
+        class Pyannote:
+            def __init__(self, device, token=None, **options):
+                kit.built.append(("pyannote", device, options))
+
+            @staticmethod
+            def preprocess_audio(audio):
+                return ("tensor", audio)
+
+            def __call__(self, audio):
+                return ("scores", turns(audio["waveform"][1]))
+
+        class Silero:
+            def __init__(self, **options):
+                kit.built.append(("silero", None, options))
+
+            @staticmethod
+            def preprocess_audio(audio):
+                return audio
+
+            def __call__(self, audio):
+                assert audio["sample_rate"] == 16000
+                return turns(audio["waveform"])
+
+        class Binarize:
+            def __init__(self, **options):
+                kit.binarized.append(options)
+
+            def __call__(self, scores):
+                assert scores[0] == "scores"
+                return types.SimpleNamespace(get_timeline=lambda: scores[1])
+
+        self.Pyannote, self.Silero, self.Binarize = Pyannote, Silero, Binarize
+
+    def load_audio(self, path):
+        self.loaded.append(path)
+        return path
+
+    @staticmethod
+    def device(name):
+        return f"device:{name}"
+
+    def __call__(self):
+        return self
+
+
+class TestVoiceActivity(unittest.TestCase):
+    def test_pyannote_is_thresholded_with_both_numbers_and_never_merged(self):
+        # Two turns 40s apart: WhisperX's merge would have packed nothing past
+        # its 30s chunk, and this must hand both back untouched.
+        kit = _FakeVadKit({"a.wav": [(50.0, 52.5), (1.0, 2.0)]})
+        vad = wx.VoiceActivity("pyannote", device="cpu", onset=0.6, offset=0.4,
+                               loader=kit)
+        self.assertEqual(vad.speech("/x/a.wav"), [(1.0, 2.0), (50.0, 52.5)])
+        self.assertEqual(kit.built, [("pyannote", "device:cpu",
+                                      {"vad_onset": 0.6, "vad_offset": 0.4})])
+        self.assertEqual(kit.binarized, [{"onset": 0.6, "offset": 0.4}])
+
+    def test_silero_takes_the_onset_and_its_segments_as_they_come(self):
+        kit = _FakeVadKit({"a.wav": [(3.0, 4.0), (5.0, 5.0), (0.5, 1.5)]})
+        vad = wx.VoiceActivity("silero", onset=0.7, offset=0.1, loader=kit)
+        # The empty segment is dropped; nothing else is touched.
+        self.assertEqual(vad.speech("/x/a.wav"), [(0.5, 1.5), (3.0, 4.0)])
+        self.assertEqual(kit.built, [("silero", None,
+                                      {"vad_onset": 0.7, "chunk_size": 30})])
+        self.assertEqual(kit.binarized, [])
+
+    def test_an_unknown_method_is_refused_before_anything_loads(self):
+        with self.assertRaises(ValueError):
+            wx.VoiceActivity("webrtc", loader=lambda: self.fail("loaded"))
+
+
+class TestSilenceOnlyStage(unittest.TestCase):
+    """The stage end to end: detect, plan, filter, render, verify."""
+
+    # alice sounds 0-3s and bob 7-10s, so the only silence is 3-7s. Padded by
+    # SPEECH_PAD (0.25) the gap is 3.25-6.75, and shortening it to SILENCE_KEEP
+    # (0.4) cuts 3.45-6.55: 3.1s of a 10s episode.
+    SPANS = {"alice.wav": [(0.0, 3.0)], "bob.wav": [(7.0, 10.0)]}
+    CUT = (3.45, 6.55)
+
+    def _log(self):
+        path = os.path.join(tempfile.mkdtemp(), "run.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), ignore_errors=True)
+        buf = io.StringIO()
+        return runlog.Log(path=path, stream=buf, colour=False), buf
+
+    def _settings(self, **over):
+        values = cfg.defaults()
+        values.update(FFMPEG_JOBS="1")
+        values.update(over)
+        return values
+
+    def _wav(self, path, windows, seconds=10.0, rate=16000):
+        loud = b"\x00\x40"
+        frames = bytearray()
+        for n in range(int(seconds * rate)):
+            t = n / rate
+            frames += loud if any(s <= t < e for s, e in windows) else b"\0\0"
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(bytes(frames))
+
+    def _episode(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        work = os.path.join(root, "work")
+        for leaf in ("prep", "state", "src"):
+            os.makedirs(os.path.join(work, leaf), exist_ok=True)
+        tracks = []
+        for name, windows in (("alice", [(0.0, 3.0)]), ("bob", [(7.0, 10.0)])):
+            source = os.path.join(work, "src", f"{name}.wav")
+            self._wav(source, windows)
+            shutil.copyfile(source, os.path.join(work, "prep", f"{name}.wav"))
+            tracks.append({"participant": name, "source": source,
+                           "duration": 10.0, "sample_rate": 16000,
+                           "render_rate": 16000, "sample_fmt": "s16",
+                           "codec": "pcm_s16le", "lossless": True})
+        with open(os.path.join(work, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump({"episode_id": "ep", "duration": 10.0,
+                       "sample_rate": 16000, "tracks": tracks}, handle)
+        return work, os.path.join(root, "staging")
+
+    def _check_rendered(self, work, staging, method):
+        plan = json.load(open(os.path.join(
+            pipeline.silence_only_dir(work, method), "plan.json")))
+        self.assertEqual(plan["detector"], method)
+        self.assertEqual(plan["mutes"], {"alice": [], "bob": []})
+        silence = [c for c in plan["cuts"] if "silence" in c["reasons"]]
+        self.assertEqual(len(silence), 1)
+        self.assertAlmostEqual(silence[0]["start"], self.CUT[0], delta=0.05)
+        self.assertAlmostEqual(silence[0]["end"], self.CUT[1], delta=0.05)
+        for name in ("alice", "bob"):
+            rendered = os.path.join(staging, f"{name}_silence-{method}.flac")
+            self.assertAlmostEqual(
+                pipeline.probe_duration("ffprobe", rendered),
+                10.0 - (self.CUT[1] - self.CUT[0]), delta=0.06)
+
+    def test_level_needs_nothing_but_ffmpeg(self):
+        work, staging = self._episode()
+        log, _ = self._log()
+        done = pipeline.stage_silence_only(
+            work, staging, self._settings(SILENCE_ONLY="level"), log,
+            vad_loader=lambda: self.fail("level must not load a VAD"))
+        self.assertEqual(done, ["level"])
+        self._check_rendered(work, staging, "level")
+        base = pipeline.silence_only_dir(work, "level")
+        self.assertTrue(os.path.isfile(os.path.join(base, "alice.silence.log")))
+        self.assertTrue(os.path.isfile(os.path.join(base, "edit-report.txt")))
+        # Its own threshold, not the chunk splitter's.
+        self.assertIn("noise=-45dB", open(log.path, encoding="utf-8").read())
+
+    def test_a_vad_variant_cuts_where_its_detector_heard_nothing(self):
+        work, staging = self._episode()
+        log, _ = self._log()
+        kit = _FakeVadKit(self.SPANS)
+        pipeline.stage_silence_only(
+            work, staging, self._settings(SILENCE_ONLY="silero"), log,
+            vad_loader=kit)
+        self._check_rendered(work, staging, "silero")
+        # Given the prepared tracks, the audio transcription would be given.
+        self.assertEqual(sorted(os.path.basename(p) for p in kit.loaded),
+                         ["alice.wav", "bob.wav"])
+        speech = json.load(open(os.path.join(
+            pipeline.silence_only_dir(work, "silero"), "bob.speech.json")))
+        self.assertEqual(speech["speech"], [[7.0, 10.0]])
+
+    def test_every_variant_asked_for_is_its_own_output(self):
+        work, staging = self._episode()
+        log, _ = self._log()
+        done = pipeline.stage_silence_only(
+            work, staging, self._settings(SILENCE_ONLY="pyannote,level"), log,
+            vad_loader=_FakeVadKit(self.SPANS))
+        self.assertEqual(done, ["pyannote", "level"])
+        self.assertEqual(sorted(os.listdir(staging)), [
+            "alice_silence-level.flac", "alice_silence-pyannote.flac",
+            "bob_silence-level.flac", "bob_silence-pyannote.flac"])
+
+    def test_a_resumed_run_does_not_redo_a_finished_variant(self):
+        work, staging = self._episode()
+        settings = self._settings(SILENCE_ONLY="pyannote")
+        pipeline.stage_silence_only(work, staging, settings, self._log()[0],
+                                    vad_loader=_FakeVadKit(self.SPANS))
+        pipeline.stage_silence_only(
+            work, staging, settings, self._log()[0],
+            vad_loader=lambda: self.fail("a finished variant was redone"))
+
+    def test_a_plan_over_the_safety_limit_refuses_and_names_the_variant(self):
+        work, staging = self._episode()
+        # Half a second of speech in ten: nearly all of it would be cut.
+        kit = _FakeVadKit({"alice.wav": [(0.0, 0.5)]})
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_silence_only(
+                work, staging, self._settings(SILENCE_ONLY="silero"),
+                self._log()[0], vad_loader=kit)
+        self.assertIn("refusing the silero silence-only output",
+                      str(caught.exception))
+        self.assertFalse(os.path.exists(staging) and os.listdir(staging))
+
+    def test_a_vad_without_whisperx_says_which_setting_asked_for_it(self):
+        work, staging = self._episode()
+
+        def missing():
+            raise wx.WhisperXMissing("whisperx is not installed")
+
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_silence_only(
+                work, staging, self._settings(SILENCE_ONLY="pyannote"),
+                self._log()[0], vad_loader=missing)
+        self.assertIn("SILENCE_ONLY=pyannote needs whisperx", str(caught.exception))
+
+
+class TestSilenceOnlyFinalize(unittest.TestCase):
+    def _episode(self, full):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        work = os.path.join(root, "work", "ep")
+        out = os.path.join(root, "output", "ep")
+        staging = os.path.join(out, ".staging")
+        base = pipeline.silence_only_dir(work, "level")
+        for path in (os.path.join(work, "logs"), base, staging):
+            os.makedirs(path, exist_ok=True)
+        source = os.path.join(root, "ep_alice.flac")
+        open(source, "wb").close()
+        names = ["alice_silence-level.flac"] + (["alice.flac"] if full else [])
+        for name in names:
+            with open(os.path.join(staging, name), "wb") as handle:
+                handle.write(b"rendered")
+        for leaf in ("plan.json", "edit-report.txt"):
+            with open(os.path.join(base, leaf), "w", encoding="utf-8") as handle:
+                handle.write("{}")
+        # Left by an earlier full run of the same episode.
+        with open(os.path.join(work, "plan.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        log_path = os.path.join(root, "run.log")
+        open(log_path, "w").close()
+        log = runlog.Log(path=log_path, stream=io.StringIO(), colour=False)
+        return work, out, staging, {"alice": source}, log
+
+    def test_without_the_full_edit_only_the_variants_are_published(self):
+        work, out, staging, sources, log = self._episode(full=False)
+        settings = cfg.defaults()
+        settings.update(FULL_EDIT="0", SILENCE_ONLY="level", KEEP_WORK="1")
+        # No words directory exists, so building a transcript would fail here.
+        pipeline.stage_finalize(work, out, staging, settings, log, "ep", sources)
+        self.assertEqual(sorted(n for n in os.listdir(out) if n != "logs"), [
+            "alice_silence-level.flac", "ep_silence-level_edit-report.txt",
+            "ep_silence-level_plan.json"])
+        self.assertFalse(os.path.exists(sources["alice"]))
 
 
 if __name__ == "__main__":

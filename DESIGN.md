@@ -169,6 +169,10 @@ inputs/<episode>_<participant>.<ext>       any format ffmpeg can decode
    ├─ prepare ───→ prep/<p>.wav      16 kHz mono, what Whisper wants
    │               meta.json         durations replaced with measured ones
    │
+   ├─ silence-only → silence-only/<method>/   per SILENCE_ONLY method: <p>.speech.json,
+   │                 plan.json, edit-report.txt, render/, expected.json;
+   │                 output/<ep>/.staging/<p>_silence-<method>.flac, verified
+   │
    ├─ transcribe → words/<p>.words.json   words with timings, and segments
    │                                      (one request per chunk, per track)
    │               asr/<p>.loud.json      the level scan: chunk boundaries, and
@@ -898,6 +902,49 @@ provide. It needs no Silero and no model: ffmpeg was already a hard dependency.
 The lesson worth keeping is narrower than "keep the old check" — it is that a
 transcript cannot be its own witness.
 
+### Silence-only outputs, and what they are for
+
+Everything above is an argument about which detector should draw the speech map,
+settled by reasoning about failure modes. `SILENCE_ONLY` settles it by listening
+instead: it renders the episode again with the map drawn by one detector alone —
+`level` (silencedetect), `pyannote` or `silero` — and publishes that beside the
+full edit. Together with the full edit that separates what each layer adds:
+loudness alone, voice detection, and then the transcript and the LLM on top.
+
+**The comparison is only fair if everything but the map is held still**, so
+nothing else is new. Each detector's spans are padded by `SPEECH_PAD` and go
+through `plan.build_plan` with no words and no edits, the same `SILENCE_*`
+settings, the same frame alignment and the same safety rails; the plan records
+which `detector` drew it and the report says so. On a map that agrees, a variant
+cuts exactly what the full plan cuts — selftest case 15 holds `level` to case 2's
+full edit to the sample.
+
+**The VADs are WhisperX's own, stopped one step early.** Inside `transcribe` the
+VAD scores the audio, thresholds the scores into turns, then packs the turns into
+~30s windows for batched decoding. The windows are useless for cutting; the turns
+are exactly what transcription hears through. `whisperx_asr.VoiceActivity`
+repeats the first two steps with the same classes and `WHISPER_VAD_ONSET` /
+`OFFSET` and returns the turns, loading no Whisper model and no aligner.
+
+**It runs before transcription**, as its own stage, because it needs only the
+prepared tracks: on a CPU each VAD took under a second per minute of audio, and a
+variant's refusal (a threshold wrong for these tracks, usually) arrives before
+the hours rather than after. `FULL_EDIT=0` stops there. It then needs no llama
+endpoint, and for `level` alone no whisperx, so a bare checkout can run it.
+
+**What it cannot tell you.** Each variant is silence editing only: disfluencies
+stay, and there are no mutes, because both come from words. And `level` inherits
+the fixed-threshold weakness the rest of this section describes — room tone or
+bleed above `SILENCE_ONLY_THRESHOLD` hides a gap, and a laugh or a cough is kept.
+That is the opposite trade from the transcript's map, which is rather the point
+of having both to listen to.
+
+On the 57s sample, at `SPEECH_PAD=0.15`, `SILENCE_MIN_DURATION=0.5` and
+`SILENCE_KEEP=0.15`: `level` removed 5.4%, `silero` 4.4%,
+`pyannote` 1.5%, and the transcript-based map (tiny model, no LLM) 11.8%.
+pyannote's turns bridge the short pauses between phrases that word timings leave
+exposed. One fixture and no listening yet, so a shape rather than a verdict.
+
 ### Authenticating to either endpoint
 
 The llama client sends `Authorization: Bearer <key>` when a key is configured,
@@ -1024,8 +1071,8 @@ are marked.
 ## 10. Testing strategy
 
 ```sh
-python3 tests/test_pipeline.py    # 156 tests, 21 classes, ~60 s, stdlib only
-./tests/selftest.sh               # 64 checks, 10 cases, ~17 s, ffmpeg only
+python3 tests/test_pipeline.py    # 253 tests, ~60 s, stdlib only
+./tests/selftest.sh               # 87 checks, 14 cases, ffmpeg only
 ```
 
 ### What makes this awkward to test
@@ -1333,6 +1380,8 @@ authority. The ones whose meaning is easy to get wrong:
 | `LLAMA_ENDPOINT` | required unless `LLM_ENABLE=0`; there is no local mode to fall back to, and `127.0.0.1` is how a one-machine install is spelled |
 | `WHISPER_MODEL` | the run's cost, on a CPU; also the ceiling on which disfluencies exist to be found |
 | `SPEECH_PAD` | how far each word is widened before the union that makes the speech map; a gap needs `SILENCE_MIN_DURATION` **plus twice this** to be silence |
+| `SILENCE_ONLY` | extra comparison renders cut on one detector's silence alone; never changes the full edit |
+| `FULL_EDIT` | `0` publishes only the `SILENCE_ONLY` outputs; refused when that list is empty |
 | `SPLIT_SILENCE_THRESHOLD` | picks chunk boundaries, and sets how much loud-but-untranscribed audio gets reported; it never decides what is cut |
 | `WHISPER_PROMPT` | conditioning text, not an instruction; empty means Whisper returns fluent prose and the disfluencies never reach the LLM stage at all |
 | `SPEECH_MAP_CLIP` | bounds each word by the level scan when building the speech map; off means a word stretched across silence protects all of it, from both cutting and the other track's disfluencies |
