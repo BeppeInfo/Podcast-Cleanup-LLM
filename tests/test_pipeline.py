@@ -1527,6 +1527,23 @@ class TestProc(unittest.TestCase):
         buf = io.StringIO()
         return runlog.Log(path=path, stream=buf, colour=False), buf
 
+    def _fake_ffmpeg(self, status):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        path = os.path.join(root, "ffmpeg")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"#!/bin/sh\nexit {status}\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_the_filtergraph_file_option_follows_what_ffmpeg_accepts(self):
+        # 7.0 and later read `-/filter_complex path`; 8.0 removed the old
+        # spelling, and before 7.0 only the old spelling exists.
+        self.assertEqual(proc.filter_script_args(self._fake_ffmpeg(0), "g"),
+                         ["-/filter_complex", "g"])
+        self.assertEqual(proc.filter_script_args(self._fake_ffmpeg(1), "g"),
+                         ["-filter_complex_script", "g"])
+
     def test_output_goes_to_the_log_not_the_console(self):
         log, buf = self._log()
         status = proc.run(["sh", "-c", "echo chatty; echo more"], log)

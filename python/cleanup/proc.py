@@ -17,10 +17,12 @@ per completion instead. That was the shell's rule and it was the right one.
 
 from __future__ import annotations
 
+import functools
 import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 
 TAIL_LINES = 20
 
@@ -55,6 +57,41 @@ def has_encoder(ffmpeg: str, codec: str) -> bool:
     except OSError:
         return False
     return f"Encoder {codec}" in result.stdout
+
+
+@functools.lru_cache(maxsize=None)
+def _takes_file_option_prefix(ffmpeg: str) -> bool:
+    """Whether this ffmpeg reads an option's value from a file as `-/name path`."""
+    with tempfile.NamedTemporaryFile("w", suffix=".filter") as graph:
+        graph.write("[0:a]anull[out]")
+        graph.flush()
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-nostdin", "-hide_banner", "-v", "error",
+                 "-f", "lavfi", "-i", "anullsrc=d=0.01",
+                 "-/filter_complex", graph.name, "-map", "[out]",
+                 "-f", "null", "-"],
+                capture_output=True, check=False)
+        except OSError:
+            return False
+    return result.returncode == 0
+
+
+def filter_script_args(ffmpeg: str, path: str) -> list[str]:
+    """The options that make ffmpeg read its filtergraph from `path`.
+
+    Two spellings, and no version of ffmpeg takes both for long: 7.0 added
+    `-/filter_complex path` and deprecated `-filter_complex_script`, and 8.0
+    removed the old one, so a render that works in the image (7.1) failed on a
+    host with 9. The graph cannot simply go inline instead — a long episode's
+    cut expression can outgrow the kernel's 128 KiB limit on one argument. So
+    ask this ffmpeg once, by trying the new form on a trivial graph, and use
+    whichever it accepts. Cached per binary, since the answer cannot change
+    within a run.
+    """
+    if _takes_file_option_prefix(ffmpeg):
+        return ["-/filter_complex", path]
+    return ["-filter_complex_script", path]
 
 
 def resolve_ffmpeg(settings, log, ffmpeg: str = "", ffprobe: str = "",

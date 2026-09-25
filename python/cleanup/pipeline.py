@@ -1348,7 +1348,7 @@ def render_tracks(work: str, base: str, staging: str, name_for, marker: str,
 
         argv = [ffmpeg, "-nostdin", "-y", "-v", "warning", "-progress", "pipe:1",
                 "-nostats", "-i", source,
-                "-filter_complex_script", filter_path, "-map", "[out]",
+                *proc.filter_script_args(ffmpeg, filter_path), "-map", "[out]",
                 *encode, target]
         on_line = None
         if jobs <= 1:
