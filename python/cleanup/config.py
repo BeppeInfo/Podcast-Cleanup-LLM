@@ -75,9 +75,14 @@ SETTINGS: dict[str, tuple] = {
     "WHISPER_THREADS": ("4", INT, None),
     "WHISPER_LANG": ("auto", STR, None),
 
-    # WhisperX always runs a VAD — it is how the audio is batched, not an
-    # option — so there is no longer anything to turn off. What is left is
-    # which detector and where its thresholds sit.
+    # The one detector that decides where speech is, for the whole run. The
+    # `silence` stage runs it over every prepared track, renders the episode
+    # cut on its silence alone and publishes that as <participant>_silence;
+    # the full edit then starts from the same map and lets the words shorten
+    # it further. WhisperX is handed the same method and thresholds for its
+    # own VAD, which it always runs — it is how the audio is batched, not an
+    # option — so what transcription hears through and what the silence cut
+    # listened to are the same detector.
     #
     # pyannote, which is what WhisperX intends and ships the weights for.
     # Silero is what whisper-server ran, so it is the like-for-like setting when
@@ -142,18 +147,13 @@ SETTINGS: dict[str, tuple] = {
     # step rather than a ramp — at 512 samples and 48 kHz a frame is ~10.7 ms.
     "CUT_FADE": ("0", NUM, None),
 
-    # Silence-only outputs: extra renders of the episode whose cuts come from
-    # one detector's idea of silence alone — no transcript, no LLM, no mutes —
-    # published beside the full edit for comparison. A comma-separated list of
-    # SILENCE_ONLY_METHODS; empty produces none. The level threshold is its own
-    # setting so tuning it cannot move the chunk boundaries SPLIT_* chooses.
-    "SILENCE_ONLY": ("", STR, None),
-    "SILENCE_ONLY_THRESHOLD": ("-45dB", STR, None),
-    "SILENCE_ONLY_MIN_SILENCE": ("0.30", NUM, None),
-    # The transcript-and-LLM edit. 0 skips transcribe, detect, plan and render,
-    # leaving only the SILENCE_ONLY outputs — and needs neither whisperx (for
-    # `level`) nor a llama endpoint.
-    "FULL_EDIT": ("1", FLAG, None),
+    # How far the edit goes, each step published beside the ones before it:
+    #   silence     the detector's silence cut alone (<participant>_silence)
+    #   transcript  plus the silence the words reveal, no LLM (_transcript)
+    #   full        plus the LLM's disfluency cuts and mutes (<participant>)
+    # Stopping before `full` needs no llama endpoint; stopping at `silence`
+    # does not transcribe at all.
+    "STOP_AFTER": ("full", CHOICE, ("silence", "transcript", "full")),
 
     "LLM_ENABLE": ("1", FLAG, None),
     "LLM_CHUNK_WORDS": ("350", INT, None),
@@ -181,10 +181,6 @@ SETTINGS: dict[str, tuple] = {
     "FAILED_ACTION": ("log", CHOICE, ("log", "move")),
     "DURATION_TOLERANCE": ("0.02", NUM, None),
 }
-
-# What SILENCE_ONLY may name. `level` is ffmpeg's silencedetect; the other two
-# are the VADs WHISPER_VAD_METHOD chooses between, run on their own.
-SILENCE_ONLY_METHODS = ("level", "pyannote", "silero")
 
 # Never written to the log by value. That log is copied into the output
 # directory and outlives the work directory, the inputs and the container.
@@ -360,16 +356,6 @@ def as_flag(settings, name) -> bool:
     return str(settings[name]).strip() == "1"
 
 
-def silence_only_methods(settings) -> list[str]:
-    """The SILENCE_ONLY variants, in the order given, each once."""
-    methods: list[str] = []
-    for name in str(settings.get("SILENCE_ONLY", "")).split(","):
-        name = name.strip()
-        if name and name not in methods:
-            methods.append(name)
-    return methods
-
-
 def validate(settings: dict, warn=None) -> None:
     """Every check the shell did, in the order it did them."""
     for name, (_, kind, choices) in SETTINGS.items():
@@ -445,17 +431,6 @@ def validate(settings: dict, warn=None) -> None:
 
     if not settings["TRACK_SEPARATOR"]:
         raise ConfigError("TRACK_SEPARATOR must not be empty")
-
-    methods = silence_only_methods(settings)
-    unknown = [name for name in methods if name not in SILENCE_ONLY_METHODS]
-    if unknown:
-        raise ConfigError(
-            f"SILENCE_ONLY has unknown method '{unknown[0]}' "
-            f"(known: {', '.join(SILENCE_ONLY_METHODS)})")
-    if not as_flag(settings, "FULL_EDIT") and not methods:
-        raise ConfigError(
-            "FULL_EDIT=0 with SILENCE_ONLY empty would produce nothing; name at "
-            f"least one of {', '.join(SILENCE_ONLY_METHODS)}")
 
 
 def dump(settings: dict, log) -> None:

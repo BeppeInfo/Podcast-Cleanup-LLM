@@ -63,17 +63,20 @@ GROUPS = [
         ("MAX_CUT_FRACTION", "Refuse a plan removing more than",
          "fraction of the episode; almost always a wrong threshold"),
     ]),
-    Group("silence_only", "Silence-only outputs",
-          "Extra renders cut on one detector's silence alone — no transcript, "
-          "no edits — published beside the full edit for comparison, as "
-          "<track>_silence-<method>. They use the Silence settings above.", [
-        ("SILENCE_ONLY", "Detectors",
-         "comma separated: level, pyannote, silero; empty for none"),
-        ("SILENCE_ONLY_THRESHOLD", "Level: silent below", "e.g. -45dB"),
-        ("SILENCE_ONLY_MIN_SILENCE", "Level: shortest silence", "seconds"),
-        ("FULL_EDIT", "Full edit",
-         "off produces only the silence-only outputs: no transcription and "
-         "no detector server"),
+    Group("speech", "Speech detection",
+          "One detector decides where speech is, once per episode. The episode "
+          "is cut on its silence alone and published as <track>_silence, using "
+          "the Silence settings above; the full edit starts from the same map, "
+          "and transcription hears through the same detector.", [
+        ("WHISPER_VAD_METHOD", "Detector",
+         "silero is what whisper-server used; pyannote needs no runtime "
+         "download but is a different detector"),
+        ("WHISPER_VAD_ONSET", "Speech starts above", "0 to 1"),
+        ("WHISPER_VAD_OFFSET", "Speech ends below",
+         "0 to 1; pyannote only, silero uses the onset alone"),
+        ("STOP_AFTER", "Stop after",
+         "silence: only the silence cut, no transcription. transcript: also "
+         "the words' cut, no LLM server. full: the whole edit"),
     ]),
     Group("detect", "Disfluency detection",
           "What the model is asked to find, and how much of it to believe.", [
@@ -104,12 +107,6 @@ GROUPS = [
         ("WHISPER_PROMPT", "Initial prompt",
          "conditioning text, not an instruction; empty means Whisper returns "
          "fluent prose and the disfluencies never reach the detector"),
-        ("WHISPER_VAD_METHOD", "Speech detection",
-         "silero is what whisper-server used; pyannote needs no runtime "
-         "download but is a different detector"),
-        ("WHISPER_VAD_ONSET", "Speech starts above", "0 to 1"),
-        ("WHISPER_VAD_OFFSET", "Speech ends below",
-         "0 to 1; pyannote only, silero uses the onset alone"),
         ("SPEECH_MAP_CLIP", "Bound word timings by the level scan",
          "off means a word stretched across silence protects all of it"),
     ]),

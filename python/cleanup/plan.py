@@ -1,8 +1,8 @@
 """Unify the transcript's silence and the LLM's findings into one edit plan.
 
-Both inputs are derived from the same transcript: silence is where Whisper
-returned no words (`transcript.speech_from_words`), and edits are what the LLM
-found in those words. DESIGN.md covers why that trade was taken.
+Silence is where Whisper returned no words (`transcript.speech_from_words`),
+within where the speech detector heard any speech at all, and edits are what the
+LLM found in those words. DESIGN.md covers why that trade was taken.
 
 Two checks guard the obvious hazard in it. `looping_words` catches a transcript
 that repeats itself, which is how Whisper fails on material that is not speech.
@@ -35,7 +35,7 @@ from . import transcript as tr
 MIN_MUTE = 0.02
 
 # The `detector` of a plan whose speech map came from the words. Every other
-# value is a silence-only plan, named for the detector that drew its map.
+# value is the silence stage's plan, named for the detector that drew its map.
 TRANSCRIPT = "transcript"
 
 
@@ -184,6 +184,29 @@ def untranscribed_audio(participants, words, loud, duration, pad) -> dict:
     return missing
 
 
+def unheard_words(participants, words, heard) -> dict:
+    """Words the speech detector heard no speech under at all.
+
+    The full edit's map is the words inside the detector's padded speech, so a
+    word with none of that under it claims nothing and a silence cut may take
+    it. WhisperX decodes windows packed from the same detector's turns, so this
+    is rare — a quiet word inside a window, between two turns — but when it
+    happens it is the words and the detector disagreeing, and the detector wins.
+    Returned so the plan can say which, and whether a cut removed them.
+    """
+    found: dict[str, list[dict]] = {}
+    for participant in participants:
+        spans = heard.get(participant) or []
+        lost = [
+            word for word in words.get(participant) or []
+            if iv.overlap_amount((float(word["start"]), float(word["end"])),
+                                 spans) <= iv.EPS
+        ]
+        if lost:
+            found[participant] = lost
+    return found
+
+
 def looping_words(participants, words) -> dict:
     """Tracks whose transcript repeats one run of words far past plausibility.
 
@@ -231,7 +254,7 @@ def looping_words(participants, words) -> dict:
 
 
 def build_plan(meta, speech, edits, words, params, loud=None,
-               detector: str = TRANSCRIPT) -> dict:
+               detector: str = TRANSCRIPT, heard=None, heard_by: str = "") -> dict:
     """Assemble the plan. `speech`/`edits`/`words`/`loud` are keyed by participant.
 
     `speech` comes from `transcript.speech_from_words` — the padded union of the
@@ -243,12 +266,17 @@ def build_plan(meta, speech, edits, words, params, loud=None,
     come from Whisper. It is not used to decide anything, only to refuse — see
     `untranscribed_audio`.
 
-    `detector` names where `speech` came from. Anything but TRANSCRIPT is a
-    silence-only plan: the map is one detector's padded speech, and it arrives
+    `detector` names where `speech` came from. Anything but TRANSCRIPT is the
+    silence stage's plan: the map is one detector's padded speech, and it arrives
     with no words, no edits and no level scan, so the transcript checks below
     have nothing to look at and stay quiet. Going through here rather than a
-    second builder is the point — a comparison is only fair if the silence it
-    compares was cut by the same arithmetic.
+    second builder is the point: the full edit's silence cuts only ever add to
+    the silence cut's, because both were made by the same arithmetic.
+
+    `heard` is that detector's padded map, keyed like `speech`, and `heard_by`
+    its name. Given to a transcript plan, whose `speech` already lies inside
+    it, it is used only to report words the detector heard nothing under — see
+    `unheard_words`.
     """
     duration = float(meta["duration"])
     participants = [track["participant"] for track in meta["tracks"]]
@@ -366,6 +394,24 @@ def build_plan(meta, speech, edits, words, params, loud=None,
             "before overriding"
         )
 
+    outside = unheard_words(participants, words, heard) if heard is not None else {}
+    outside_cut = 0
+    for participant, lost in sorted(outside.items()):
+        inside = [
+            word for word in lost
+            if iv.overlap_amount((float(word["start"]), float(word["end"])),
+                                 cut_spans) > iv.EPS
+        ]
+        outside_cut += len(inside)
+        sample = " ".join(str(word.get("text", "")) for word in (inside or lost)[:6])
+        warnings.append(
+            f"{len(lost)} of {participant}'s words fall where {heard_by or 'the detector'} "
+            "heard no speech, so the speech map does not protect them"
+            + (f" — {len(inside)} of them are inside cuts" if inside else "")
+            + f" (\"{sample}\"). A smaller WHISPER_VAD_ONSET makes the "
+            "detector likelier to hear them"
+        )
+
     looping = looping_words(participants, words)
     for participant, detail in sorted(looping.items()):
         warnings.append(
@@ -437,6 +483,8 @@ def build_plan(meta, speech, edits, words, params, loud=None,
             sum(e - s for gaps in unheard.values() for s, e in gaps), 3
         ),
         "untranscribed_in_cuts": round(cut_unheard, 3),
+        "unheard_words": sum(len(lost) for lost in outside.values()),
+        "unheard_words_in_cuts": outside_cut,
         "cut_from_llm": sum(
             1 for c in cuts if any(s.startswith("llm:") for s in c["sources"])
         ),
@@ -458,6 +506,8 @@ def build_plan(meta, speech, edits, words, params, loud=None,
     return {
         "episode_id": meta["episode_id"],
         "detector": detector,
+        # The detector a transcript plan's map was bounded by; empty otherwise.
+        "speech_detector": heard_by if heard is not None else "",
         "duration": round(duration, 3),
         "participants": participants,
         "params": params,
@@ -492,6 +542,9 @@ def format_report(plan) -> str:
     if detector != TRANSCRIPT:
         lines.append(f"Speech map:       {detector} only — silence cuts, no "
                      "transcript, no edits")
+    elif plan.get("speech_detector"):
+        lines.append(f"Speech map:       the words, within what "
+                     f"{plan['speech_detector']} heard")
     lines += [
         f"Original length:  {_hms(stats['duration'])}",
         f"Cleaned length:   {_hms(stats['output_duration'])}",

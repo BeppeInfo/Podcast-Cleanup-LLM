@@ -42,36 +42,60 @@ Silence is **shortened, not removed**. A gap longer than `SILENCE_MIN_DURATION`
 is trimmed down to `SILENCE_KEEP` of residual quiet rather than spliced out
 entirely, so the edit keeps its breathing room instead of sounding gasped.
 
-### Silence-only outputs, for comparison
+### Three cuts, each published along the way
 
-`SILENCE_ONLY` asks for extra renders of the episode whose cuts come from one
-detector's idea of silence and nothing else: no transcript, no LLM, no mutes.
-Each is published beside the full edit as `<participant>_silence-<method>`:
+A run publishes the episode at each step of the edit, so what each layer adds
+can be heard on its own:
 
-| method | speech is | needs |
+| output | cuts | stop there with |
 | --- | --- | --- |
-| `level` | anything above `SILENCE_ONLY_THRESHOLD` (ffmpeg's silencedetect) | ffmpeg |
-| `pyannote` | what WhisperX's pyannote VAD calls voice | whisperx (the image) |
-| `silero` | what Silero VAD calls voice | whisperx, and a `torch.hub` download once |
+| `<participant>_silence` | the detector's silence alone | `STOP_AFTER=silence` (no transcription) |
+| `<participant>_transcript` | plus the silence between words, no LLM | `STOP_AFTER=transcript` (no llama endpoint) |
+| `<participant>` | plus the LLM's disfluency cuts and mutes | `STOP_AFTER=full`, the default |
+
+Each comes with its own `<ep>_<step>_plan.json` and `_edit-report.txt`; the full
+edit's are `<ep>_plan.json` and `<ep>_edit-report.txt` as before. The speaker
+transcript is published with the last cut reached, on that cut's timeline.
+
+#### The silence cut
+
+One detector decides where speech is: `WHISPER_VAD_METHOD`, `pyannote` (the
+default) or `silero`. The `silence` stage runs it once over every track, before
+transcription, and renders the episode cut on its silence alone — no transcript,
+no LLM, no mutes. That is published beside the full edit as
+`<participant>_silence`, with its own plan and edit report.
+
+The full edit then starts from the same map. The gaps between words can shorten
+it, since a pause between phrases the detector bridged is still silence, but
+never lengthen it: a word where the detector heard no speech protects nothing,
+and the plan names any such word a cut takes. So the full edit cuts everything
+the silence cut did, plus disfluencies and whatever pauses the words reveal.
+WhisperX's own VAD, which decides what gets transcribed, is the same detector at
+the same `WHISPER_VAD_ONSET`/`WHISPER_VAD_OFFSET`.
 
 ```sh
-SILENCE_ONLY=level,pyannote,silero ./clean-podcast.sh   # all three, plus the full edit
-FULL_EDIT=0 SILENCE_ONLY=level ./clean-podcast.sh       # silence only; no models at all
+STOP_AFTER=silence ./clean-podcast.sh      # the silence cut only
+STOP_AFTER=transcript ./clean-podcast.sh   # and the transcript cut; no llama endpoint
 ```
 
-The VADs run with `WHISPER_VAD_ONSET`/`WHISPER_VAD_OFFSET`, so each is the same
-detector transcription hears through, stopped before WhisperX packs its turns into
-30-second windows. Every variant is padded by `SPEECH_PAD` and cut by the same plan
-builder with the same `SILENCE_*` settings as the full edit — that is what makes
-the comparison fair — and so they differ only in where they think speech is.
+The silence cut is padded by `SPEECH_PAD` and shortened by the same `SILENCE_*`
+settings, through the same plan builder, as the full edit. It is cheap: on a CPU
+each VAD took under a second per minute of audio, after a few seconds' load. Its
+plan refuses on the same safety rails as the full one, `MAX_CUT_FRACTION`
+included, and since the full edit only ever cuts more, a refusal here stops the
+run before the transcription rather than after it; `--force` overrides.
+`STOP_AFTER=silence` skips everything from `transcribe` to `render` but still
+needs whisperx, which runs the detector.
 
-They run in their own `silence-only` stage, before transcription, and are cheap:
-on a CPU each VAD took under a second per minute of audio, after a few seconds'
-load.
-Each plan refuses on the same safety rails as the full one, `MAX_CUT_FRACTION`
-included; `--force` overrides. `FULL_EDIT=0` skips `transcribe`, `detect`, `plan`
-and `render`, needs no llama endpoint, and for `level` needs no whisperx either, so
-it runs from a bare checkout.
+#### The transcript cut
+
+The `transcript` stage runs right after transcription. It builds the plan the
+full edit would build with the LLM's findings left out: the detector's map
+shortened by the words, the same checks, the same refusals. It is rendered as
+`<participant>_transcript`. Because the LLM only ever adds cuts, a refusal here,
+such as a cut over audio no transcript accounts for, would have stopped the full
+edit too, and now stops the run before the LLM is asked anything. With
+`LLM_ENABLE=0` the full edit and the transcript cut are the same edit.
 
 ## Requirements
 
@@ -79,7 +103,7 @@ it runs from a bare checkout.
 | --- | --- | --- |
 | ffmpeg + ffprobe | everything | the only hard dependency; in the image already |
 | python3 | everything | standard library only; the image pins 3.13 |
-| whisperx | the `transcribe` stage | in the image, with CPU-only torch; runs in this process, not as a server |
+| whisperx | the `silence` and `transcribe` stages | in the image, with CPU-only torch; runs in this process, not as a server |
 | a llama-server | the `detect` stage | reached over HTTP; not started here, and not in the image |
 | Flask + waitress | the web interface only | in the image; running from a checkout needs neither |
 | numpy + scipy | `tools/` only | for measuring a run against a hand edit; the `dev` image target has them |
@@ -466,10 +490,11 @@ After a successful run:
     ep042_transcript.txt
     ep042_plan.json               every cut and mute, with its reason
     ep042_edit-report.txt         human-readable summary
-    leonardo_silence-level.flac   one set per SILENCE_ONLY method, if asked for
+    leonardo_silence.flac         the silence cut, one per track, same length as each other
+    leonardo_transcript.flac      the transcript cut (no LLM), likewise
     …
-    ep042_silence-level_plan.json
-    ep042_silence-level_edit-report.txt
+    ep042_silence_plan.json       and _edit-report.txt, for the silence cut
+    ep042_transcript_plan.json    and _edit-report.txt, for the transcript cut
     logs/
         run.log                   the whole run
         llama-server.log
@@ -486,11 +511,13 @@ failure leaves them untouched. `--keep-inputs` and `--keep-work` opt out.
 ```
 discover    find the episode's tracks, probe them, agree on an episode id
 prepare     decode each track to 16 kHz mono (what Whisper wants)
-silence-only  plan and render each SILENCE_ONLY variant; skipped when empty
+silence     WHISPER_VAD_METHOD finds speech once; the silence cut is rendered
 transcribe  Whisper per track, to completion, then every process exits
-            (its Silero pass is what decides where speech is at all)
+            (through the same detector, so it hears what the silence cut kept)
+transcript  the detector's map, shortened by the words; rendered, no LLM
 detect      the LLM finds disfluencies; the server starts and stops here
-plan        unify silence and edits into cuts and mutes
+plan        the detector's map, shortened by the words, and the edits, into
+            cuts and mutes
 render      one ffmpeg pass per track, into staging, then verified
 finalize    publish outputs, delete intermediates and inputs
 ```

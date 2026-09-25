@@ -82,7 +82,7 @@ class VoiceActivity:
     turns. Silero returns segments already, thresholded at the onset alone, as
     it is inside WhisperX; it has no offset to honour.
 
-    Loads no Whisper model and no aligner, which is what lets a silence-only
+    Loads no Whisper model and no aligner, which is what lets the silence cut
     output exist before transcription has started.
     """
 

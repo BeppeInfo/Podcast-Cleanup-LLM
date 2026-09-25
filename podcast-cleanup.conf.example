@@ -135,15 +135,23 @@ WHISPER_LANG="auto"
 
 # ------------------------------------------------------------ speech detection --
 
-# WhisperX always runs a voice activity detector — it is how the audio is cut
-# into batches, not an option — so unlike whisper-server there is nothing to turn
-# off. What is left is which detector, and where its thresholds sit.
+# One detector decides where speech is, for the whole run, and this is it.
 #
-# It still does the same two jobs it always did, and they are still the reason
-# this matters more than it looks. Whisper transcribes only what the VAD calls
-# speech, and handed silence it invents text and loops a phrase while doing it;
-# the plan then derives its speech map from the words that come back. So what is
-# silence to cut, and what is speech to protect, is decided here.
+# The `silence` stage runs it once over every track, before transcription, and
+# renders the episode cut on its silence alone: padded by SPEECH_PAD, shortened
+# by the SILENCE_* settings, no transcript, no LLM, no mutes. That is published
+# as <participant>_silence, with its own plan and edit report, beside the full
+# edit.
+#
+# The full edit then starts from the same map. The words can shorten it — a
+# pause between phrases the detector bridged is still silence — but never
+# lengthen it: a word where the detector heard no speech protects nothing, and
+# the plan names such words when a cut takes them. So the full edit cuts
+# everything the silence cut did, and more.
+#
+# WhisperX is handed the same detector and thresholds for its own VAD, which it
+# always runs — it is how the audio is cut into batches, not an option. Whisper
+# transcribes only what that calls speech, and handed silence it invents text.
 #
 # pyannote is WhisperX's own default and ships its weights inside the package.
 # silero is what whisper-server ran, which makes it the like-for-like setting
@@ -389,34 +397,18 @@ MUTE_FADE="0.030"
 # so the two runs differ in nothing the score could see anyway.
 CUT_FADE="0"
 
-# ------------------------------------------------------- silence-only outputs --
+# ------------------------------------------------------------------ stop after --
 
-# Extra renders of the episode whose cuts come from one detector's idea of
-# silence and nothing else — no transcript, no LLM, no mutes — published beside
-# the full edit as <participant>_silence-<method>, each with its own plan and
-# edit report. For comparing what each layer of the pipeline contributes.
-#
-# A comma-separated list of any of:
-#   level     ffmpeg's silencedetect below SILENCE_ONLY_THRESHOLD. Loudness only,
-#             so a laugh, a breath or mic bleed counts as speech and is kept.
-#   pyannote  WhisperX's pyannote VAD, at WHISPER_VAD_ONSET / _OFFSET.
-#   silero    Silero VAD, at WHISPER_VAD_ONSET; fetched from torch.hub once.
-# The two VADs need whisperx, so the container; level needs only ffmpeg.
-#
-# Every variant is padded by SPEECH_PAD and shortened by the SILENCE_* settings
-# above, through the same plan builder as the full edit, so they differ only in
-# where they think speech is. Each refuses on the same safety rails.
-SILENCE_ONLY=""
-
-# The level method's threshold and shortest silence. Separate from SPLIT_*, which
-# place chunk boundaries and should not move because this was tuned.
-SILENCE_ONLY_THRESHOLD="-45dB"
-SILENCE_ONLY_MIN_SILENCE="0.30"
-
-# The transcript-and-LLM edit. 0 skips transcribe, detect, plan and render and
-# publishes only the SILENCE_ONLY outputs, which then need no llama endpoint and,
-# for level alone, no whisperx either. Refused with SILENCE_ONLY empty.
-FULL_EDIT="1"
+# How far the edit goes. Each step is published beside the ones before it, so a
+# full run leaves all three to compare:
+#   silence     <participant>_silence: the detector's silence cut alone. Stops
+#               before transcription.
+#   transcript  <participant>_transcript: the same, plus the silence the words
+#               reveal between phrases. No LLM, so no llama endpoint needed.
+#   full        <participant>: plus the LLM's disfluency cuts and mutes.
+# The speaker transcript is published with the last cut reached, on its
+# timeline. With LLM_ENABLE=0, full and transcript are the same edit.
+STOP_AFTER="full"
 
 # ------------------------------------------------------------ edit detection --
 

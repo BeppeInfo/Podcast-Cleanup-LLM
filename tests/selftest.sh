@@ -204,7 +204,7 @@ run_pipeline() {
     # the cases that fail on purpose write their logs to.
     "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
         --input "$incoming" --output "$output" --work "$work" \
-        --stages discover,prepare,transcribe,plan,render,finalize \
+        --stages discover,prepare,silence,transcribe,transcript,plan,render,finalize \
         --no-llm --quiet "$@"
 }
 
@@ -452,7 +452,7 @@ build_episode ep006 "$CASE6/incoming" \
     "$(windows_expr '0,20')" "$(windows_expr '4,6')" 20
 
 run_pipeline "$CASE6/incoming" "$CASE6/output" "$CASE6/work" \
-    --config "$CONF" --keep-work --stages discover,prepare \
+    --config "$CONF" --keep-work --stages discover,prepare,silence \
     >"$SANDBOX/case6a.stdout" 2>&1 \
     || { check "case 6 setup" false; fail_note "$(tail -n 20 "$SANDBOX/case6a.stdout")"; }
 
@@ -525,7 +525,7 @@ INJECT
 if "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
     --input "$CASE6/incoming" --output "$CASE6/output" \
     --work "$CASE6/work" --config "$CONF" --episode ep006 --keep-work --quiet \
-    --stages plan,render,finalize >"$SANDBOX/case6b.stdout" 2>&1
+    --stages transcript,plan,render,finalize >"$SANDBOX/case6b.stdout" 2>&1
 then
     check "pipeline completed" true
 else
@@ -1126,8 +1126,12 @@ check "the refusal says what it found" \
     grep -qi "no transcript accounts for" "$SANDBOX/case12.stdout"
 check "the refusal names the setting that shrinks the loss" \
     grep -q "WHISPER_VAD_ONSET" "$SANDBOX/case12.stdout"
+# The transcript cut is the full edit without the LLM, so it refuses first.
+check "and it came from the transcript cut, before the LLM" \
+    grep -q "refusing the transcript cut" "$SANDBOX/case12.stdout"
 
-PLAN12="$CASE12/work/ep012/plan.json"
+PLAN12="$CASE12/work/ep012/transcript/plan.json"
+check "its plan was written" test -s "$PLAN12"
 if [[ -f "$PLAN12" ]]; then
     check "the missing span is recorded for listening" python3 -c '
 import json, sys
@@ -1236,21 +1240,23 @@ fi
 kill "$L14_PID" 2>/dev/null || true
 
 # ============================================================================
-printf '\n%sCase 15: silence-only, and nothing else%s\n' "$BOLD" "$RESET"
+printf '\n%sCase 15: the silence cut, and nothing else%s\n' "$BOLD" "$RESET"
 # ============================================================================
 #
-# FULL_EDIT=0 with SILENCE_ONLY=level: no transcript, no LLM, no whisperx. The
-# fake whisperx is still on PYTHONPATH from the cases above; nothing imports it,
-# which is what "transcription never ran" below checks from the outside. Case
-# 2's episode again, because there the tone is exactly where the transcript
-# said speech was, so with SPEECH_PAD=0 the level scan's map is the same map
-# and the variant must cut exactly what case 2's full plan cut.
+# STOP_AFTER=silence: the silence stage alone, with no transcript and no LLM. The fake
+# whisperx's VAD is told case 2's windows, where the tone is and exactly where
+# case 2's transcript said speech was, so the detector's map is the same map
+# and the silence cut must cut exactly what case 2's full plan cut.
 
 CASE15="$SANDBOX/case15"
 build_episode ep002 "$CASE15/incoming" \
     "$(windows_expr "$A2_SPEECH")" "$(windows_expr "$B2_SPEECH")" 30
+cat >"$SANDBOX/case15.vad.json" <<'VAD'
+{"alice.wav": [[0, 4], [18, 22]], "bob.wav": [[4, 8], [22, 26]]}
+VAD
+export FAKE_WHISPERX_VAD="$SANDBOX/case15.vad.json"
 
-if FULL_EDIT=0 SILENCE_ONLY=level "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
+if STOP_AFTER=silence "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
     --input "$CASE15/incoming" --output "$CASE15/output" --work "$CASE15/work" \
     --config "$CONF" --no-llm --quiet --keep-work >"$SANDBOX/case15.stdout" 2>&1
 then
@@ -1261,12 +1267,12 @@ else
 fi
 
 OUT15="$CASE15/output/ep002"
-PLAN15="$CASE15/work/ep002/silence-only/level/plan.json"
-check "both level tracks published" \
-    test -s "$OUT15/alice_silence-level.flac" -a -s "$OUT15/bob_silence-level.flac"
+PLAN15="$CASE15/work/ep002/silence/plan.json"
+check "both silence-cut tracks published" \
+    test -s "$OUT15/alice_silence.flac" -a -s "$OUT15/bob_silence.flac"
 check "its plan and report published" \
-    test -s "$OUT15/ep002_silence-level_plan.json" \
-        -a -s "$OUT15/ep002_silence-level_edit-report.txt"
+    test -s "$OUT15/ep002_silence_plan.json" \
+        -a -s "$OUT15/ep002_silence_edit-report.txt"
 check "no full edit and no transcript" bash -c \
     "[[ ! -e '$OUT15/alice.flac' && ! -e '$OUT15/ep002_transcript.json' ]]"
 check "transcription never ran" bash -c \
@@ -1275,22 +1281,125 @@ check "transcription never ran" bash -c \
 if [[ -f "$PLAN15" && -f "$PLAN2" ]]; then
     check "it cuts what the transcript's map cut" python3 -c '
 import json, sys
-level, full = (json.load(open(path))["cuts"] for path in sys.argv[1:])
+vad, full = (json.load(open(path))["cuts"] for path in sys.argv[1:])
 spans = lambda cuts: [(c["start"], c["end"]) for c in cuts]
-if len(level) != len(full) or any(
-        abs(a - b) > 0.02 for x, y in zip(spans(level), spans(full))
+if len(vad) != len(full) or any(
+        abs(a - b) > 0.02 for x, y in zip(spans(vad), spans(full))
         for a, b in zip(x, y)):
-    print(f"level {spans(level)} against full {spans(full)}")
+    print(f"vad {spans(vad)} against full {spans(full)}")
     sys.exit(1)
 ' "$PLAN15" "$PLAN2"
 fi
 
-if [[ -s "$OUT15/alice_silence-level.flac" && -s "$OUT15/bob_silence-level.flac" ]]; then
-    DUR15_A=$(duration_of "$OUT15/alice_silence-level.flac")
-    DUR15_B=$(duration_of "$OUT15/bob_silence-level.flac")
+if [[ -s "$OUT15/alice_silence.flac" && -s "$OUT15/bob_silence.flac" ]]; then
+    DUR15_A=$(duration_of "$OUT15/alice_silence.flac")
+    DUR15_B=$(duration_of "$OUT15/bob_silence.flac")
     check "both tracks identically long" approx "$DUR15_A" "$DUR15_B" 0.0005
     check "and as long as case 2's full edit" approx "$DUR15_A" "$DUR2_A" 0.03
     fail_note "alice=${DUR15_A}s bob=${DUR15_B}s case2=${DUR2_A}s"
+fi
+
+# ============================================================================
+printf '\n%sCase 16: the full edit starts from the detector'"'"'s map%s\n' "$BOLD" "$RESET"
+# ============================================================================
+#
+# Case 2's episode, except alice also sounds 10-14 and her transcript has words
+# there — but the detector heard no speech in it, as it might not for a laugh.
+# The words cannot put speech back where the detector heard none, so the full
+# edit still cuts across 8-18, says which words it took, and comes out exactly
+# as long as the silence cut published beside it.
+
+CASE16="$SANDBOX/case16"
+A16_SPEECH='0,4 10,14 18,22'
+build_episode ep016 "$CASE16/incoming" \
+    "$(windows_expr "$A16_SPEECH")" "$(windows_expr "$B2_SPEECH")" 30
+whisper_responses "$SANDBOX/case16.words.json" \
+    "alice=$A16_SPEECH" "bob=$B2_SPEECH"
+use_whisper_responses "$SANDBOX/case16.words.json"
+# The detector is still case 15's, which heard nothing at 10-14.
+
+if run_pipeline "$CASE16/incoming" "$CASE16/output" "$CASE16/work" \
+    --config "$CONF" --keep-work >"$SANDBOX/case16.stdout" 2>&1
+then
+    check "pipeline completed" true
+else
+    check "pipeline completed" false
+    fail_note "$(tail -n 25 "$SANDBOX/case16.stdout")"
+fi
+
+PLAN16="$CASE16/work/ep016/plan.json"
+if [[ -f "$PLAN16" ]]; then
+    check "the words the detector did not hear are cut, and said so" python3 -c '
+import json, sys
+plan = json.load(open(sys.argv[1]))
+cuts, stats, warnings = plan["cuts"], plan["stats"], plan["warnings"]
+inner = [c for c in cuts if "silence" in c["reasons"]
+         and c["start"] < 10 and c["end"] > 14]
+if len(inner) != 1:
+    print(f"expected one cut across 10-14, got {cuts}")
+    sys.exit(1)
+if stats["unheard_words_in_cuts"] < 1:
+    print(f"no unheard words counted: {stats}")
+    sys.exit(1)
+if not any("heard no speech" in w for w in warnings):
+    print(f"no warning: {warnings}")
+    sys.exit(1)
+' "$PLAN16"
+fi
+
+OUT16="$CASE16/output/ep016"
+check "the full edit and the silence cut are both published" \
+    test -s "$OUT16/alice.flac" -a -s "$OUT16/alice_silence.flac" \
+        -a -s "$OUT16/ep016_silence_plan.json"
+if [[ -s "$OUT16/alice.flac" && -s "$OUT16/alice_silence.flac" ]]; then
+    DUR16_FULL=$(duration_of "$OUT16/alice.flac")
+    DUR16_SILENCE=$(duration_of "$OUT16/alice_silence.flac")
+    check "with no LLM, they are the same length" \
+        approx "$DUR16_FULL" "$DUR16_SILENCE" 0.03
+    fail_note "full=${DUR16_FULL}s silence=${DUR16_SILENCE}s"
+fi
+unset FAKE_WHISPERX_VAD
+
+# ============================================================================
+printf '\n%sCase 17: stopping at the transcript cut%s\n' "$BOLD" "$RESET"
+# ============================================================================
+#
+# Every stage in order, as a user would run it, but with STOP_AFTER=transcript
+# and no llama endpoint anywhere: detect, plan and render must not run, so
+# nothing asks for one. Case 2's episode and transcript, so the transcript cut
+# is exactly case 2's full edit — which had no LLM either.
+
+CASE17="$SANDBOX/case17"
+build_episode ep002 "$CASE17/incoming" \
+    "$(windows_expr "$A2_SPEECH")" "$(windows_expr "$B2_SPEECH")" 30
+use_whisper_responses "$SANDBOX/case2.words.json"
+
+if STOP_AFTER=transcript "$ROOT/clean-podcast.sh" --root "$SANDBOX" \
+    --input "$CASE17/incoming" --output "$CASE17/output" --work "$CASE17/work" \
+    --config "$CONF" --quiet --keep-work >"$SANDBOX/case17.stdout" 2>&1
+then
+    check "pipeline completed with no llama endpoint" true
+else
+    check "pipeline completed with no llama endpoint" false
+    fail_note "$(tail -n 25 "$SANDBOX/case17.stdout")"
+fi
+
+OUT17="$CASE17/output/ep002"
+check "the silence and transcript cuts are published" \
+    test -s "$OUT17/alice_silence.flac" -a -s "$OUT17/alice_transcript.flac" \
+        -a -s "$OUT17/bob_transcript.flac" -a -s "$OUT17/ep002_transcript_plan.json"
+check "and the speaker transcript, beside them" \
+    test -s "$OUT17/ep002_transcript.json"
+check "but no full edit" bash -c \
+    "[[ ! -e '$OUT17/alice.flac' && ! -e '$OUT17/ep002_plan.json' ]]"
+check "the LLM stage never ran" bash -c \
+    "[[ ! -d '$CASE17/work/ep002/llm' ]] || [[ -z \"\$(ls -A '$CASE17/work/ep002/llm')\" ]]"
+if [[ -s "$OUT17/alice_transcript.flac" && -s "$OUT17/bob_transcript.flac" ]]; then
+    DUR17_A=$(duration_of "$OUT17/alice_transcript.flac")
+    DUR17_B=$(duration_of "$OUT17/bob_transcript.flac")
+    check "both tracks identically long" approx "$DUR17_A" "$DUR17_B" 0.0005
+    check "and as long as case 2's full edit" approx "$DUR17_A" "$DUR2_A" 0.0005
+    fail_note "alice=${DUR17_A}s bob=${DUR17_B}s case2=${DUR2_A}s"
 fi
 
 

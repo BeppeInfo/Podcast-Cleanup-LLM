@@ -2373,6 +2373,21 @@ class TestPipelineFinalizeStage(unittest.TestCase):
         if staged:
             with open(os.path.join(staging, "alice.flac"), "wb") as handle:
                 handle.write(b"rendered audio")
+            with open(os.path.join(staging, "alice_silence.flac"), "wb") as handle:
+                handle.write(b"silence cut")
+            with open(os.path.join(staging, "alice_transcript.flac"), "wb") as handle:
+                handle.write(b"transcript cut")
+        # The transcript cut's own plan and report, in its own tree.
+        os.makedirs(os.path.join(work, "transcript"), exist_ok=True)
+        for name, body in (
+            ("plan.json", json.dumps({
+                "episode_id": "ep", "participants": ["alice"], "duration": 1.0,
+                "cuts": [], "mutes": {"alice": []}, "keep": [[0.0, 1.0]]})),
+            ("edit-report.txt", "the transcript cut's report"),
+        ):
+            with open(os.path.join(work, "transcript", name), "w",
+                      encoding="utf-8") as handle:
+                handle.write(body)
         for name, body in (
             ("plan.json", json.dumps({
                 "episode_id": "ep", "participants": ["alice"], "duration": 1.0,
@@ -2396,6 +2411,14 @@ class TestPipelineFinalizeStage(unittest.TestCase):
                                 log, "ep", sources)
         self.assertEqual(open(os.path.join(out, "alice.flac"), "rb").read(),
                          b"rendered audio")
+        # Every step is published with the full edit, not instead of it.
+        self.assertEqual(open(os.path.join(out, "alice_silence.flac"), "rb").read(),
+                         b"silence cut")
+        self.assertEqual(open(os.path.join(out, "alice_transcript.flac"), "rb").read(),
+                         b"transcript cut")
+        self.assertEqual(
+            open(os.path.join(out, "ep_transcript_edit-report.txt")).read(),
+            "the transcript cut's report")
         for name in ("ep_plan.json", "ep_edit-report.txt", "ep_transcript.json",
                      "ep_transcript.srt", "ep_transcript.txt"):
             self.assertTrue(os.path.isfile(os.path.join(out, name)), name)
@@ -2404,6 +2427,24 @@ class TestPipelineFinalizeStage(unittest.TestCase):
             os.path.join(out, "logs", "alice.audit.jsonl")))
         # Staging was inside the output directory and is gone again.
         self.assertFalse(os.path.exists(staging))
+
+    def test_stopping_at_the_transcript_publishes_it_and_what_came_before(self):
+        work, out, staging, sources = self._episode()
+        # Were the speaker transcript built from the full edit's plan, as it is
+        # on a full run, this would make it fail.
+        os.remove(os.path.join(work, "plan.json"))
+        # And a run that stops here never renders the full edit.
+        os.remove(os.path.join(staging, "alice.flac"))
+        log, _ = self._log(work)
+        pipeline.stage_finalize(
+            work, out, staging, self._settings(STOP_AFTER="transcript",
+                                               KEEP_WORK="1"),
+            log, "ep", sources)
+        published = sorted(n for n in os.listdir(out) if n != "logs")
+        self.assertEqual(published, [
+            "alice_silence.flac", "alice_transcript.flac",
+            "ep_transcript.json", "ep_transcript.srt", "ep_transcript.txt",
+            "ep_transcript_edit-report.txt", "ep_transcript_plan.json"])
 
     def test_keep_inputs_and_keep_work_are_honoured(self):
         work, out, staging, sources = self._episode()
@@ -2518,6 +2559,8 @@ class TestPipelinePlanStage(unittest.TestCase):
                                       "sample_fmt": "s16", "lossless": True}]},
             "words__alice.words.json": {"words": words},
             "asr__alice.loud.json": {"loud": loud},
+            "silence__alice.speech.json": {"detector": "pyannote",
+                                           "speech": [[0.0, 20.0]]},
         })
         plan = pipeline.stage_plan(
             root, self._settings(), runlog.Log(stream=io.StringIO(), colour=False))
@@ -2531,6 +2574,57 @@ class TestPipelinePlanStage(unittest.TestCase):
         for key in ("passthrough", "mutes", "expected_samples",
                     "expected_duration", "sample_rate", "sample_fmt"):
             self.assertIn(key, entry)
+
+    def _one_track(self, heard, detector="pyannote"):
+        """Words every half second across 20s, and a detector map for them."""
+        moments = [n / 2 for n in range(40)]
+        words = [{"i": i, "text": f"w{i}", "start": at, "end": at + 0.4,
+                  "segment": 0} for i, at in enumerate(moments)]
+        files = {
+            "meta.json": {"episode_id": "ep", "duration": 20.0,
+                          "sample_rate": 48000,
+                          "tracks": [{"participant": "alice", "duration": 20.0,
+                                      "sample_rate": 48000, "render_rate": 48000,
+                                      "sample_fmt": "s16", "lossless": True}]},
+            "words__alice.words.json": {"words": words},
+        }
+        if heard is not None:
+            files["silence__alice.speech.json"] = {"detector": detector,
+                                                   "speech": heard}
+        return self._work(**files)
+
+    def _plan(self, root, **over):
+        return pipeline.stage_plan(root, self._settings(**over),
+                                   runlog.Log(stream=io.StringIO(), colour=False))
+
+    def test_the_words_cannot_put_back_speech_the_detector_did_not_hear(self):
+        # Talking throughout, by the words; the detector heard nothing 8-14.
+        plan = self._plan(self._one_track([[0.0, 8.0], [14.0, 20.0]]))
+        cuts = [(c["start"], c["end"]) for c in plan["cuts"]]
+        self.assertEqual(len(cuts), 1)
+        self.assertLess(cuts[0][0], 8.5)
+        self.assertGreater(cuts[0][1], 13.5)
+        self.assertEqual(plan["speech_detector"], "pyannote")
+        self.assertGreater(plan["stats"]["unheard_words_in_cuts"], 0)
+        self.assertTrue(any("where pyannote heard no speech" in w
+                            for w in plan["warnings"]))
+
+    def test_where_the_detector_hears_everything_the_words_decide(self):
+        plan = self._plan(self._one_track([[0.0, 20.0]]))
+        self.assertEqual(plan["cuts"], [])
+        self.assertEqual(plan["stats"]["unheard_words"], 0)
+
+    def test_a_missing_detector_map_is_refused_not_guessed(self):
+        with self.assertRaises(pipeline.StageError) as caught:
+            self._plan(self._one_track(None))
+        self.assertIn("run the silence stage first", str(caught.exception))
+
+    def test_a_map_from_the_other_detector_is_refused(self):
+        root = self._one_track([[0.0, 20.0]], detector="silero")
+        with self.assertRaises(pipeline.StageError) as caught:
+            self._plan(root)
+        self.assertIn("drawn by silero, but WHISPER_VAD_METHOD is pyannote",
+                      str(caught.exception))
 
     def test_clipping_the_speech_map_is_reported(self):
         buf = io.StringIO()
@@ -3491,37 +3585,10 @@ class TestFinalTranscript(unittest.TestCase):
         self.assertIn("think so", text)
 
 
-# --- silence-only outputs -----------------------------------------------------
+# --- the silence cut ----------------------------------------------------------
 
 
-class TestSilenceOnlyConfig(unittest.TestCase):
-    def _valid(self, **over):
-        values = cfg.defaults()
-        values.update(over)
-        cfg.validate(values)
-        return values
-
-    def test_methods_keep_their_order_and_appear_once(self):
-        values = self._valid(SILENCE_ONLY=" silero, level ,silero,,pyannote")
-        self.assertEqual(cfg.silence_only_methods(values),
-                         ["silero", "level", "pyannote"])
-
-    def test_nothing_is_asked_for_by_default(self):
-        self.assertEqual(cfg.silence_only_methods(self._valid()), [])
-
-    def test_an_unknown_method_is_named(self):
-        with self.assertRaises(cfg.ConfigError) as caught:
-            self._valid(SILENCE_ONLY="level,webrtc")
-        self.assertIn("'webrtc'", str(caught.exception))
-
-    def test_no_full_edit_and_no_variants_would_produce_nothing(self):
-        with self.assertRaises(cfg.ConfigError) as caught:
-            self._valid(FULL_EDIT="0")
-        self.assertIn("would produce nothing", str(caught.exception))
-        self._valid(FULL_EDIT="0", SILENCE_ONLY="level")
-
-
-class TestSilenceOnlyPlan(unittest.TestCase):
+class TestSilencePlan(unittest.TestCase):
     def test_the_detector_is_recorded_and_reported(self):
         speech = {"a": [(0.0, 5.0), (12.0, 20.0)]}
         result = planner.build_plan(_meta(["a"], 20.0), speech, {}, {"a": []},
@@ -3536,7 +3603,7 @@ class TestSilenceOnlyPlan(unittest.TestCase):
         speech = {"a": [(0.0, 5.0), (12.0, 20.0)], "b": [(3.0, 6.0)]}
         full = planner.build_plan(_meta(["a", "b"], 20.0), speech, {}, {}, PARAMS)
         only = planner.build_plan(_meta(["a", "b"], 20.0), speech, {},
-                                  {"a": [], "b": []}, PARAMS, detector="level")
+                                  {"a": [], "b": []}, PARAMS, detector="silero")
         self.assertEqual(full["cuts"], only["cuts"])
         self.assertEqual(full["keep"], only["keep"])
 
@@ -3644,14 +3711,8 @@ class TestVoiceActivity(unittest.TestCase):
             wx.VoiceActivity("webrtc", loader=lambda: self.fail("loaded"))
 
 
-class TestSilenceOnlyStage(unittest.TestCase):
-    """The stage end to end: detect, plan, filter, render, verify."""
-
-    # alice sounds 0-3s and bob 7-10s, so the only silence is 3-7s. Padded by
-    # SPEECH_PAD (0.25) the gap is 3.25-6.75, and shortening it to SILENCE_KEEP
-    # (0.4) cuts 3.45-6.55: 3.1s of a 10s episode.
-    SPANS = {"alice.wav": [(0.0, 3.0)], "bob.wav": [(7.0, 10.0)]}
-    CUT = (3.45, 6.55)
+class _TwoTrackEpisode:
+    """alice sounds 0-3s and bob 7-10s of a 10s episode, prepared and on disk."""
 
     def _log(self):
         path = os.path.join(tempfile.mkdtemp(), "run.log")
@@ -3697,9 +3758,19 @@ class TestSilenceOnlyStage(unittest.TestCase):
                        "sample_rate": 16000, "tracks": tracks}, handle)
         return work, os.path.join(root, "staging")
 
+
+class TestSilenceStage(_TwoTrackEpisode, unittest.TestCase):
+    """The stage end to end: detect, plan, filter, render, verify."""
+
+    # alice sounds 0-3s and bob 7-10s, so the only silence is 3-7s. Padded by
+    # SPEECH_PAD (0.25) the gap is 3.25-6.75, and shortening it to SILENCE_KEEP
+    # (0.4) cuts 3.45-6.55: 3.1s of a 10s episode.
+    SPANS = {"alice.wav": [(0.0, 3.0)], "bob.wav": [(7.0, 10.0)]}
+    CUT = (3.45, 6.55)
+
     def _check_rendered(self, work, staging, method):
         plan = json.load(open(os.path.join(
-            pipeline.silence_only_dir(work, method), "plan.json")))
+            pipeline.silence_dir(work), "plan.json")))
         self.assertEqual(plan["detector"], method)
         self.assertEqual(plan["mutes"], {"alice": [], "bob": []})
         silence = [c for c in plan["cuts"] if "silence" in c["reasons"]]
@@ -3707,98 +3778,186 @@ class TestSilenceOnlyStage(unittest.TestCase):
         self.assertAlmostEqual(silence[0]["start"], self.CUT[0], delta=0.05)
         self.assertAlmostEqual(silence[0]["end"], self.CUT[1], delta=0.05)
         for name in ("alice", "bob"):
-            rendered = os.path.join(staging, f"{name}_silence-{method}.flac")
+            rendered = os.path.join(staging, f"{name}_silence.flac")
             self.assertAlmostEqual(
                 pipeline.probe_duration("ffprobe", rendered),
                 10.0 - (self.CUT[1] - self.CUT[0]), delta=0.06)
 
-    def test_level_needs_nothing_but_ffmpeg(self):
-        work, staging = self._episode()
-        log, _ = self._log()
-        done = pipeline.stage_silence_only(
-            work, staging, self._settings(SILENCE_ONLY="level"), log,
-            vad_loader=lambda: self.fail("level must not load a VAD"))
-        self.assertEqual(done, ["level"])
-        self._check_rendered(work, staging, "level")
-        base = pipeline.silence_only_dir(work, "level")
-        self.assertTrue(os.path.isfile(os.path.join(base, "alice.silence.log")))
-        self.assertTrue(os.path.isfile(os.path.join(base, "edit-report.txt")))
-        # Its own threshold, not the chunk splitter's.
-        self.assertIn("noise=-45dB", open(log.path, encoding="utf-8").read())
-
-    def test_a_vad_variant_cuts_where_its_detector_heard_nothing(self):
+    def test_it_cuts_where_the_configured_detector_heard_nothing(self):
         work, staging = self._episode()
         log, _ = self._log()
         kit = _FakeVadKit(self.SPANS)
-        pipeline.stage_silence_only(
-            work, staging, self._settings(SILENCE_ONLY="silero"), log,
+        pipeline.stage_silence(
+            work, staging, self._settings(WHISPER_VAD_METHOD="silero"), log,
             vad_loader=kit)
         self._check_rendered(work, staging, "silero")
+        self.assertEqual([built[0] for built in kit.built], ["silero"])
         # Given the prepared tracks, the audio transcription would be given.
         self.assertEqual(sorted(os.path.basename(p) for p in kit.loaded),
                          ["alice.wav", "bob.wav"])
         speech = json.load(open(os.path.join(
-            pipeline.silence_only_dir(work, "silero"), "bob.speech.json")))
+            pipeline.silence_dir(work), "bob.speech.json")))
         self.assertEqual(speech["speech"], [[7.0, 10.0]])
+        self.assertEqual(speech["detector"], "silero")
+        self.assertTrue(os.path.isfile(os.path.join(
+            pipeline.silence_dir(work), "edit-report.txt")))
 
-    def test_every_variant_asked_for_is_its_own_output(self):
+    def test_one_detector_one_output(self):
         work, staging = self._episode()
-        log, _ = self._log()
-        done = pipeline.stage_silence_only(
-            work, staging, self._settings(SILENCE_ONLY="pyannote,level"), log,
-            vad_loader=_FakeVadKit(self.SPANS))
-        self.assertEqual(done, ["pyannote", "level"])
-        self.assertEqual(sorted(os.listdir(staging)), [
-            "alice_silence-level.flac", "alice_silence-pyannote.flac",
-            "bob_silence-level.flac", "bob_silence-pyannote.flac"])
+        kit = _FakeVadKit(self.SPANS)
+        pipeline.stage_silence(work, staging, self._settings(), self._log()[0],
+                               vad_loader=kit)
+        self.assertEqual([built[0] for built in kit.built], ["pyannote"])
+        self.assertEqual(sorted(os.listdir(staging)),
+                         ["alice_silence.flac", "bob_silence.flac"])
 
-    def test_a_resumed_run_does_not_redo_a_finished_variant(self):
+    def test_a_resumed_run_does_not_redo_it(self):
         work, staging = self._episode()
-        settings = self._settings(SILENCE_ONLY="pyannote")
-        pipeline.stage_silence_only(work, staging, settings, self._log()[0],
-                                    vad_loader=_FakeVadKit(self.SPANS))
-        pipeline.stage_silence_only(
+        settings = self._settings()
+        pipeline.stage_silence(work, staging, settings, self._log()[0],
+                               vad_loader=_FakeVadKit(self.SPANS))
+        pipeline.stage_silence(
             work, staging, settings, self._log()[0],
-            vad_loader=lambda: self.fail("a finished variant was redone"))
+            vad_loader=lambda: self.fail("a finished silence cut was redone"))
 
-    def test_a_plan_over_the_safety_limit_refuses_and_names_the_variant(self):
+    def test_another_detector_is_not_answered_by_the_last_one(self):
+        work, staging = self._episode()
+        pipeline.stage_silence(work, staging, self._settings(), self._log()[0],
+                               vad_loader=_FakeVadKit(self.SPANS))
+        kit = _FakeVadKit(self.SPANS)
+        pipeline.stage_silence(
+            work, staging, self._settings(WHISPER_VAD_METHOD="silero"),
+            self._log()[0], vad_loader=kit)
+        self.assertEqual([built[0] for built in kit.built], ["silero"])
+        self._check_rendered(work, staging, "silero")
+
+    def test_a_plan_over_the_safety_limit_refuses_and_names_the_detector(self):
         work, staging = self._episode()
         # Half a second of speech in ten: nearly all of it would be cut.
         kit = _FakeVadKit({"alice.wav": [(0.0, 0.5)]})
         with self.assertRaises(pipeline.StageError) as caught:
-            pipeline.stage_silence_only(
-                work, staging, self._settings(SILENCE_ONLY="silero"),
+            pipeline.stage_silence(
+                work, staging, self._settings(WHISPER_VAD_METHOD="silero"),
                 self._log()[0], vad_loader=kit)
-        self.assertIn("refusing the silero silence-only output",
-                      str(caught.exception))
+        self.assertIn("refusing the silero silence cut", str(caught.exception))
         self.assertFalse(os.path.exists(staging) and os.listdir(staging))
 
-    def test_a_vad_without_whisperx_says_which_setting_asked_for_it(self):
+    def test_without_whisperx_it_says_which_detector_needed_it(self):
         work, staging = self._episode()
 
         def missing():
             raise wx.WhisperXMissing("whisperx is not installed")
 
         with self.assertRaises(pipeline.StageError) as caught:
-            pipeline.stage_silence_only(
-                work, staging, self._settings(SILENCE_ONLY="pyannote"),
-                self._log()[0], vad_loader=missing)
-        self.assertIn("SILENCE_ONLY=pyannote needs whisperx", str(caught.exception))
+            pipeline.stage_silence(work, staging, self._settings(),
+                                   self._log()[0], vad_loader=missing)
+        self.assertIn("the pyannote VAD needs whisperx", str(caught.exception))
 
 
-class TestSilenceOnlyFinalize(unittest.TestCase):
+class TestTranscriptStage(_TwoTrackEpisode, unittest.TestCase):
+    """The words' cut, with no LLM: plan, filter, render, verify."""
+
+    # Same geometry as the silence stage's, drawn by the words this time: the
+    # detector heard everything, so the transcript alone decides the gap.
+    CUT = (3.45, 6.55)
+
+    def _transcribed(self):
+        work, staging = self._episode()
+        for name, (start, end) in (("alice", (0.0, 3.0)), ("bob", (7.0, 10.0))):
+            moments = [start + n / 2 for n in range(int((end - start) * 2))]
+            words = [{"i": i, "text": f"w{i}", "start": at, "end": at + 0.5,
+                      "segment": 0} for i, at in enumerate(moments)]
+            for leaf, payload in (
+                    (f"words/{name}.words.json", {"words": words}),
+                    (f"silence/{name}.speech.json",
+                     {"detector": "pyannote", "speech": [[0.0, 10.0]]})):
+                path = os.path.join(work, leaf)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+        # An LLM finding the transcript cut must never act on.
+        os.makedirs(os.path.join(work, "llm"), exist_ok=True)
+        with open(os.path.join(work, "llm", "alice.edits.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"edits": [{"first": 2, "last": 3, "kind": "repetition",
+                                  "confidence": 0.99, "start": 1.0, "end": 2.0,
+                                  "text": "w2 w3"}]}, handle)
+        return work, staging
+
+    def test_it_cuts_the_words_silence_and_nothing_the_llm_found(self):
+        work, staging = self._transcribed()
+        pipeline.stage_transcript(work, staging, self._settings(), self._log()[0])
+        plan = json.load(open(os.path.join(
+            pipeline.transcript_dir(work), "plan.json")))
+        self.assertEqual([c["reasons"] for c in plan["cuts"]], [["silence"]])
+        self.assertAlmostEqual(plan["cuts"][0]["start"], self.CUT[0], delta=0.05)
+        self.assertAlmostEqual(plan["cuts"][0]["end"], self.CUT[1], delta=0.05)
+        for name in ("alice", "bob"):
+            rendered = os.path.join(staging, f"{name}_transcript.flac")
+            self.assertAlmostEqual(
+                pipeline.probe_duration("ffprobe", rendered),
+                10.0 - (self.CUT[1] - self.CUT[0]), delta=0.06)
+        # Its own tree: the full edit's plan.json is not written or touched.
+        self.assertFalse(os.path.exists(os.path.join(work, "plan.json")))
+
+    def test_an_unchanged_plan_is_not_rendered_again(self):
+        work, staging = self._transcribed()
+        pipeline.stage_transcript(work, staging, self._settings(), self._log()[0])
+        log, _ = self._log()
+        pipeline.stage_transcript(work, staging, self._settings(), log)
+        self.assertIn("already rendered from this plan",
+                      open(log.path, encoding="utf-8").read())
+
+    def test_a_changed_plan_is(self):
+        work, staging = self._transcribed()
+        pipeline.stage_transcript(work, staging, self._settings(), self._log()[0])
+        log, _ = self._log()
+        pipeline.stage_transcript(work, staging,
+                                  self._settings(SILENCE_KEEP="1.0"), log)
+        self.assertNotIn("already rendered", open(log.path, encoding="utf-8").read())
+
+    def test_a_refusal_names_the_transcript_cut(self):
+        work, staging = self._transcribed()
+        with self.assertRaises(pipeline.StageError) as caught:
+            pipeline.stage_transcript(work, staging,
+                                      self._settings(MAX_CUT_FRACTION="0.1"),
+                                      self._log()[0])
+        self.assertIn("refusing the transcript cut", str(caught.exception))
+
+
+class TestStopAfter(unittest.TestCase):
+    def test_each_step_skips_only_what_comes_after_it(self):
+        for step, expected in (
+                ("silence", {"transcribe", "transcript", "detect", "plan", "render"}),
+                ("transcript", {"detect", "plan", "render"}),
+                ("full", set())):
+            self.assertEqual(set(pipeline.SKIPPED_BY_STOP[step]), expected, step)
+            self.assertTrue(set(pipeline.SKIPPED_BY_STOP[step])
+                            <= set(pipeline.ALL_STAGES))
+
+    def test_full_is_the_default_and_the_others_are_the_only_choices(self):
+        self.assertEqual(cfg.defaults()["STOP_AFTER"], "full")
+        self.assertEqual(cfg.SETTINGS["STOP_AFTER"][2],
+                         ("silence", "transcript", "full"))
+        values = cfg.defaults()
+        values.update(STOP_AFTER="words")
+        with self.assertRaises(cfg.ConfigError):
+            cfg.validate(values)
+
+
+class TestSilenceFinalize(unittest.TestCase):
     def _episode(self, full):
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         work = os.path.join(root, "work", "ep")
         out = os.path.join(root, "output", "ep")
         staging = os.path.join(out, ".staging")
-        base = pipeline.silence_only_dir(work, "level")
+        base = pipeline.silence_dir(work)
         for path in (os.path.join(work, "logs"), base, staging):
             os.makedirs(path, exist_ok=True)
         source = os.path.join(root, "ep_alice.flac")
         open(source, "wb").close()
-        names = ["alice_silence-level.flac"] + (["alice.flac"] if full else [])
+        names = ["alice_silence.flac"] + (["alice.flac"] if full else [])
         for name in names:
             with open(os.path.join(staging, name), "wb") as handle:
                 handle.write(b"rendered")
@@ -3813,15 +3972,15 @@ class TestSilenceOnlyFinalize(unittest.TestCase):
         log = runlog.Log(path=log_path, stream=io.StringIO(), colour=False)
         return work, out, staging, {"alice": source}, log
 
-    def test_without_the_full_edit_only_the_variants_are_published(self):
+    def test_without_the_full_edit_only_the_silence_cut_is_published(self):
         work, out, staging, sources, log = self._episode(full=False)
         settings = cfg.defaults()
-        settings.update(FULL_EDIT="0", SILENCE_ONLY="level", KEEP_WORK="1")
+        settings.update(STOP_AFTER="silence", KEEP_WORK="1")
         # No words directory exists, so building a transcript would fail here.
         pipeline.stage_finalize(work, out, staging, settings, log, "ep", sources)
         self.assertEqual(sorted(n for n in os.listdir(out) if n != "logs"), [
-            "alice_silence-level.flac", "ep_silence-level_edit-report.txt",
-            "ep_silence-level_plan.json"])
+            "alice_silence.flac", "ep_silence_edit-report.txt",
+            "ep_silence_plan.json"])
         self.assertFalse(os.path.exists(sources["alice"]))
 
 

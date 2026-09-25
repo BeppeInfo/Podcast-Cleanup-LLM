@@ -169,15 +169,19 @@ inputs/<episode>_<participant>.<ext>       any format ffmpeg can decode
    ├─ prepare ───→ prep/<p>.wav      16 kHz mono, what Whisper wants
    │               meta.json         durations replaced with measured ones
    │
-   ├─ silence-only → silence-only/<method>/   per SILENCE_ONLY method: <p>.speech.json,
-   │                 plan.json, edit-report.txt, render/, expected.json;
-   │                 output/<ep>/.staging/<p>_silence-<method>.flac, verified
+   ├─ silence ───→ silence/<p>.speech.json   WHISPER_VAD_METHOD's turns, which
+   │                                         the plan stage reads back
+   │               silence/plan.json, edit-report.txt, render/, expected.json
+   │               output/<ep>/.staging/<p>_silence.flac, verified
    │
    ├─ transcribe → words/<p>.words.json   words with timings, and segments
    │                                      (one request per chunk, per track)
    │               asr/<p>.loud.json      the level scan: chunk boundaries, and
    │                                      the only opinion here that is not
    │                                      Whisper's (§8)
+   │
+   ├─ transcript → transcript/plan.json, edit-report.txt, render/, expected.json
+   │               output/<ep>/.staging/<p>_transcript.flac, verified
    │
    ├─ detect ────→ llm/<p>.edits.json     validated findings, word-index based
    │               llm/<p>.audit.jsonl    every response, accepted or not
@@ -749,7 +753,9 @@ for `temperature=0` for the same reason; the port had dropped it.
 WhisperX always runs a VAD — it is how audio is batched, not an option — so the
 question is no longer whether, as it was with whisper-server, but which.
 
-`WHISPER_VAD_METHOD` chooses. `pyannote` is WhisperX's own default and ships its
+`WHISPER_VAD_METHOD` chooses, and it chooses for the whole run: the silence cut,
+the bound on the full edit's map, and what WhisperX transcribes through are all
+this one detector (see below). `pyannote` is WhisperX's own default and ships its
 weights in the package; `silero` is what whisper-server ran, which makes it the
 like-for-like setting when comparing against results from that era, and it
 fetches its model from `torch.hub` on first use.
@@ -769,6 +775,10 @@ file. `WHISPER_VAD_OFFSET` is pyannote's alone — Silero reads the onset and th
 chunk size and ignores it.
 
 ### The transcript is the speech map
+
+*Still true inside the detector's speech. The map is now bounded by the
+`silence` stage's detector as well, which changes some of the reasoning below;
+see [the detector bounds the map](#the-detector-bounds-the-map-and-its-silence-cut-is-published).*
 
 There used to be a `vad` stage: Silero (or ffmpeg's silencedetect) ran over each
 prepared track and produced a speech map, and the plan treated it as one input
@@ -902,48 +912,83 @@ provide. It needs no Silero and no model: ffmpeg was already a hard dependency.
 The lesson worth keeping is narrower than "keep the old check" — it is that a
 transcript cannot be its own witness.
 
-### Silence-only outputs, and what they are for
+### The detector bounds the map, and its silence cut is published
 
-Everything above is an argument about which detector should draw the speech map,
-settled by reasoning about failure modes. `SILENCE_ONLY` settles it by listening
-instead: it renders the episode again with the map drawn by one detector alone —
-`level` (silencedetect), `pyannote` or `silero` — and publishes that beside the
-full edit. Together with the full edit that separates what each layer adds:
-loudness alone, voice detection, and then the transcript and the LLM on top.
+The sections above argue about which detector should draw the speech map. For a
+while `SILENCE_ONLY` answered that by listening instead, rendering extra copies
+of the episode cut by one detector each. That meant several detectors per run,
+none of which the full edit used, and a second setting beside
+`WHISPER_VAD_METHOD` that looked as if it chose the same thing and did not.
 
-**The comparison is only fair if everything but the map is held still**, so
-nothing else is new. Each detector's spans are padded by `SPEECH_PAD` and go
-through `plan.build_plan` with no words and no edits, the same `SILENCE_*`
-settings, the same frame alignment and the same safety rails; the plan records
-which `detector` drew it and the report says so. On a map that agrees, a variant
-cuts exactly what the full plan cuts — selftest case 15 holds `level` to case 2's
-full edit to the sample.
+It is now one detector per run, and the full edit is built on it.
 
-**The VADs are WhisperX's own, stopped one step early.** Inside `transcribe` the
-VAD scores the audio, thresholds the scores into turns, then packs the turns into
-~30s windows for batched decoding. The windows are useless for cutting; the turns
-are exactly what transcription hears through. `whisperx_asr.VoiceActivity`
-repeats the first two steps with the same classes and `WHISPER_VAD_ONSET` /
-`OFFSET` and returns the turns, loading no Whisper model and no aligner.
+**The `silence` stage runs `WHISPER_VAD_METHOD` once**, before transcription,
+over the prepared tracks. `whisperx_asr.VoiceActivity` repeats the first two
+steps of WhisperX's own VAD, with the same classes and `WHISPER_VAD_ONSET` /
+`OFFSET`: score the audio, threshold the scores into turns, and stop before the
+turns are packed into ~30s decode windows, which are useless for cutting. The
+turns are written to `silence/<p>.speech.json`, padded by `SPEECH_PAD`, and
+cut through `plan.build_plan` with no words and no edits, so the same `SILENCE_*`
+arithmetic and the same safety rails. That is rendered and published as
+`<p>_silence`: the episode with silence editing only, before anything the
+transcript or the LLM does.
 
-**It runs before transcription**, as its own stage, because it needs only the
-prepared tracks: on a CPU each VAD took under a second per minute of audio, and a
-variant's refusal (a threshold wrong for these tracks, usually) arrives before
-the hours rather than after. `FULL_EDIT=0` stops there. It then needs no llama
-endpoint, and for `level` alone no whisperx, so a bare checkout can run it.
+**The full edit's map is the words, inside the detector's.** The plan stage
+reads the maps back, refusing if one is missing or was drawn by a different
+detector than the one configured, and intersects each track's word map (still
+clipped by the level scan) with its padded detector map. The words can
+shorten the detector's speech: pyannote's turns bridge the short pauses between
+phrases, and the words leave those exposed. They cannot lengthen it. So the full
+edit cuts everything the silence cut did, plus what the words and the LLM add;
+with the LLM off and a transcript that agrees, the two renders are the same
+length (selftest case 16).
 
-**What it cannot tell you.** Each variant is silence editing only: disfluencies
-stay, and there are no mutes, because both come from words. And `level` inherits
-the fixed-threshold weakness the rest of this section describes — room tone or
-bleed above `SILENCE_ONLY_THRESHOLD` hides a gap, and a laugh or a cough is kept.
-That is the opposite trade from the transcript's map, which is rather the point
-of having both to listen to.
+**What the intersection costs, and the check that watches it.** A word with no
+detector speech anywhere under it now protects nothing, and a silence cut can
+take it. WhisperX decodes windows packed from the same detector's turns, so a
+word can only land there when a window spans two turns and something audible
+sat between them. It is rare, but it is the transcript and the detector
+disagreeing, and the detector wins. `plan.unheard_words` lists such words, and
+the plan warns and counts how many a cut removed (`unheard_words_in_cuts`). It
+warns rather than refusing. Refusing would hand the decision back to the words,
+which is the other design, not a safeguard for this one.
 
-On the 57s sample, at `SPEECH_PAD=0.15`, `SILENCE_MIN_DURATION=0.5` and
-`SILENCE_KEEP=0.15`: `level` removed 5.4%, `silero` 4.4%,
-`pyannote` 1.5%, and the transcript-based map (tiny model, no LLM) 11.8%.
-pyannote's turns bridge the short pauses between phrases that word timings leave
-exposed. One fixture and no listening yet, so a shape rather than a verdict.
+This also undoes one of the tautologies above. With the map made of the words
+alone, asking whether a cut removed words could never fire. With the detector
+bounding it, it can.
+
+**Transcription hears through the same detector, but runs it again.** WhisperX
+is given the same method and thresholds, and runs its VAD inside `transcribe`.
+The turns the silence stage found are not handed to it, because WhisperX 3.8.6
+has no way to accept precomputed turns short of replacing its pipeline's
+internals. The detector runs twice per track, at under a second per minute of
+audio each time on a CPU. If WhisperX grows that entry point, this is the place
+to use it.
+
+**It runs before transcription**, and its plan refuses exactly where the full
+one would. Since the full edit only ever cuts more, a refusal here (usually a
+threshold wrong for these tracks) arrives before the hours rather than after.
+`STOP_AFTER=silence` stops after it and publishes only the silence cut. It
+still needs whisperx, which is what runs the detector.
+
+**The transcript cut is the same idea one layer up.** The `transcript` stage
+runs after transcription and calls the plan stage's own code (`plan_into`) with
+no edits, writing into `transcript/`. It is the full edit with the LLM taken
+away, not an approximation of it, and it is published as `<p>_transcript`.
+Since the LLM only adds cuts, the transcript cut's refusals are a subset of the
+full edit's. `plan.untranscribed_audio`, the one most likely to fire, now stops
+the run before the LLM is asked anything. `STOP_AFTER=transcript` stops there
+and needs no llama endpoint. The plan is rebuilt every time, which is cheap, and
+the render is skipped when the plan is unchanged and the tracks are still
+staged. The speaker transcript follows the last cut published.
+
+**Measured before the change**, on the 57s sample at `SPEECH_PAD=0.15`,
+`SILENCE_MIN_DURATION=0.5` and `SILENCE_KEEP=0.15`: silence cut by
+silencedetect alone removed 5.4%, by silero 4.4%, by pyannote 1.5%, and by the
+transcript-based map (tiny model, no LLM) 11.8%. Bounded by pyannote, the full
+edit can therefore cut no less than 1.5% from silence, and at most what the
+words alone found. One fixture and no listening yet, so a shape rather than a
+verdict.
 
 ### Authenticating to either endpoint
 
@@ -1355,10 +1400,11 @@ logs for inspection.
   claiming silence they ran across. Neither can tell speech from a cough, so
   neither turns the scan into a speech map; the shape of a looping transcript
   remains the only other signal.
-- **Which VAD ran, and how well, is not visible after the fact.** The transcript
-  looks the same either way; a detector that passed silence through shows up only
-  as invented speech in the plan. Switching `WHISPER_VAD_METHOD` between runs and
-  comparing is the only way to tell, and the run log records which was asked for.
+- **How well the VAD did is only partly visible.** A detector that passed silence
+  through shows up as invented speech in the plan; one that missed speech shows up
+  in the silence cut, which is published to be listened to, and as unheard words
+  when the transcript disagrees. Switching `WHISPER_VAD_METHOD` between runs and
+  comparing the silence cuts is the direct way to tell.
 - `SPEECH_PAD` is a single margin for a whole episode, and it is doing two jobs at
   once: absorbing Whisper's timing error and setting how long a gap must be to
   count. A recording where those want different values has no right answer.
@@ -1376,12 +1422,11 @@ authority. The ones whose meaning is easy to get wrong:
 | `INPUT_EXTS` | a discovery filter only; the format never reaches the editing logic |
 | `OUTPUT_CODEC`/`OUTPUT_EXT` | the output format, unrelated to what came in |
 | `RESAMPLE_TO` | empty means a rate mismatch is an error, not that nothing happens |
-| `WHISPER_VAD_METHOD` | which detector decides what speech is; always on, since it is also how whisperx batches the audio |
+| `WHISPER_VAD_METHOD` | the one detector that decides where speech can be: it draws the silence cut, bounds the full edit's map, and is what whisperx batches the audio with |
 | `LLAMA_ENDPOINT` | required unless `LLM_ENABLE=0`; there is no local mode to fall back to, and `127.0.0.1` is how a one-machine install is spelled |
 | `WHISPER_MODEL` | the run's cost, on a CPU; also the ceiling on which disfluencies exist to be found |
 | `SPEECH_PAD` | how far each word is widened before the union that makes the speech map; a gap needs `SILENCE_MIN_DURATION` **plus twice this** to be silence |
-| `SILENCE_ONLY` | extra comparison renders cut on one detector's silence alone; never changes the full edit |
-| `FULL_EDIT` | `0` publishes only the `SILENCE_ONLY` outputs; refused when that list is empty |
+| `STOP_AFTER` | how far the edit goes: `silence`, `transcript` (no llama endpoint) or `full`; every step reached is published |
 | `SPLIT_SILENCE_THRESHOLD` | picks chunk boundaries, and sets how much loud-but-untranscribed audio gets reported; it never decides what is cut |
 | `WHISPER_PROMPT` | conditioning text, not an instruction; empty means Whisper returns fluent prose and the disfluencies never reach the LLM stage at all |
 | `SPEECH_MAP_CLIP` | bounds each word by the level scan when building the speech map; off means a word stretched across silence protects all of it, from both cutting and the other track's disfluencies |
